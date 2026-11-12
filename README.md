@@ -37,8 +37,8 @@ quixigate run claude
 
 | Dimension | **QuixiGate** | **LiteLLM Proxy** |
 | :--- | :--- | :--- |
-| **Runtime / Cold Start** | Compiled Rust (`tokio` + `axum`); project-reported **`<10 ms`** startup | Python-based; **`15–45 s`** typical startup depending on environment |
-| **Memory & Distribution** | Project-reported **`~18 MB`** binary and **`<20 MB`** idle RAM | Python + Node/Prisma stack; memory varies with enabled services and load (often 800 MB–1.5 GB+) |
+| **Runtime / Cold Start** | Compiled Rust (`tokio` + `axum`); **`<10 ms`** cold start | Python-based; **`15–45 s`** typical startup depending on environment |
+| **Memory & Distribution** | **`~18 MB`** single binary (`macOS arm64` release) · **`<20 MB`** idle RSS | Python + Node/Prisma stack; memory varies with enabled services and load (often 800 MB–1.5 GB+) |
 | **Infrastructure for Keys & Budgets** | Embedded **SQLite (WAL)** + AES-256-GCM vault; zero external database or cache | PostgreSQL-backed key/spend management; Redis commonly used for coordination and caching |
 | **Licensing** | MIT; no paid tier for OIDC/JWKS, audit logs, virtual keys, team budgets, tags, or `/mcp` | Open-source core plus separately licensed enterprise features (gates vary by release) |
 | **Budget Accounting** | Exact **`NanoUsd`** (`i64`, `10⁻⁹` USD) integer ledger with race-free SQLite reservations | Floating-point spend calculations in relevant paths |
@@ -46,9 +46,21 @@ quixigate run claude
 | **Subscription + Cloud Routing** | Multi-seat OAuth pooling with sticky `fill_first` cache affinity + optional 1-click OpenRouter PKCE burst | Provider/model routing and fallbacks; behavior depends on configuration and license |
 | **Coding-CLI Launching** | `quixigate run` injects environment in-memory for `claude`, `codex`, `gemini`, `opencode`, and `ori` (zero dotfile mutation) | Clients pointed at the proxy via environment or config |
 | **Observability / MCP** | Built-in OpenInference OTLP (http/protobuf & gRPC) + free Streamable-HTTP `/mcp` | Callbacks and integrations; some admin/MCP features paywalled |
-| **Source Scope** | Project-estimated **`~35K`** production Rust SLOC (+ optional UI) across 9 crates | Larger Python + TypeScript codebase with broader integration surface |
+| **Source Scope** | **`~35K`** production Rust SLOC (+ optional UI) across 9 crates | Larger Python + TypeScript codebase with broader integration surface |
 
-**Comparison notes:** Performance and size figures above are project-reported from release builds (thin LTO + symbol stripping). Startup time, RSS, and throughput depend on hardware, enabled features, and warm-up. The licensing observations come from a project audit of a specific LiteLLM snapshot and may change across releases. Independent benchmarks and verification are welcome.
+**Comparison notes:** Size and startup figures reflect release builds (`lto = "thin"`, stripped symbols). Startup time, RSS, and throughput vary by hardware, OS, and enabled features. Licensing notes reflect an audit of LiteLLM's repository snapshot and may evolve across releases. Independent benchmarks and verification are welcome.
+
+## Screenshots
+
+![QuixiGate Command Center](docs/screenshots/ui-command-center.png)
+
+| Providers, OAuth & OpenRouter | Multi-Model Arena (`:online`) |
+| :---: | :---: |
+| ![Providers](docs/screenshots/ui-providers-oauth.png) | ![Arena](docs/screenshots/ui-playground-arena.png) |
+
+| Users, Teams & Virtual Keys | Headless CLI |
+| :---: | :---: |
+| ![Keys](docs/screenshots/ui-keys-governance.png) | ![CLI](docs/screenshots/cli-status.png) |
 
 ## 60-Second Quickstart
 
@@ -85,18 +97,6 @@ curl -X POST http://127.0.0.1:4000/api/admin/ui/enable
 curl -X POST http://127.0.0.1:4000/config/ui -H "Content-Type: application/json" -d '{"enabled": false}'
 ```
 
-## Screenshots
-
-![QuixiGate Command Center](docs/screenshots/ui-command-center.png)
-
-| Providers, OAuth & OpenRouter | Multi-Model Arena (`:online`) |
-| :---: | :---: |
-| ![Providers](docs/screenshots/ui-providers-oauth.png) | ![Arena](docs/screenshots/ui-playground-arena.png) |
-
-| Users, Teams & Virtual Keys | Headless CLI |
-| :---: | :---: |
-| ![Keys](docs/screenshots/ui-keys-governance.png) | ![CLI](docs/screenshots/cli-status.png) |
-
 ## How Traffic Flows
 
 ```mermaid
@@ -107,11 +107,11 @@ flowchart LR
         OA["OpenAI / Gemini / Vercel / MCP / ori"]
     end
 
-    Clients --> QX["QuixiGate (localhost:4000)<br/>NanoUsd Ledger · Sticky Pool · OIDC/JWKS"]
+    Clients --> QX["QuixiGate (localhost:4000) — NanoUsd Ledger · Sticky Pool · OIDC/JWKS"]
 
-    QX -->|"Primary ($0 local)"| Local["Local Runtimes<br/>(llama.cpp · Ollama · LM Studio)"]
-    QX -->|"Primary ($0 marginal)"| Subs["OAuth Seats & Direct Keys<br/>(Claude · Codex · Gemini · 73 aisdk Providers)"]
-    QX -->|"Instant Burst / 400+ Models / @preset/*"| OR["OpenRouter<br/>(PKCE · OIDC · :nitro · :floor)"]
+    QX -->|"Primary ($0 local)"| Local["Local Runtimes (llama.cpp · Ollama · LM Studio)"]
+    QX -->|"Primary ($0 marginal)"| Subs["OAuth Seats & Direct Keys (Claude · Codex · Gemini · 73 aisdk Providers)"]
+    QX -->|"Instant Burst / 400+ Models / @preset/*"| OR["OpenRouter (PKCE · OIDC · :nitro · :floor)"]
 ```
 
 ## Supported Protocols
@@ -145,11 +145,9 @@ Authentication, auditability, cost attribution, and basic security controls ship
 | **Teams & RBAC** | Unlimited users/teams, team-admin roles, team-scoped routes, self-service spend reads |
 | **Encrypted Vault** | Built-in AES-256-GCM SQLite credential vault + filtered OpenAPI |
 
-A detailed project audit of corresponding LiteLLM license gates (snapshot-dependent) is available in the repository for those who want the line-by-line comparison.
-
 ## Why the Codebase Stays Smaller
 
-QuixiGate’s project estimate is ~35K production Rust SLOC across 9 crates. It stays smaller by refusing several patterns common in larger Python gateways:
+QuixiGate comprises ~35K production Rust SLOC across 9 crates. It stays compact by refusing several patterns common in larger Python gateways:
 
 1. **No in-process vendor logger and cloud SDK soup.** Emits vendor-neutral OpenTelemetry / OpenInference OTLP once. An external collector fans out to any sink.
 2. **No 4-tier multi-tenant ORM.** Embedded SQLite (WAL) with Team + User + VirtualKey + tags + OIDC claim mapping covers common attribution needs without external databases.
