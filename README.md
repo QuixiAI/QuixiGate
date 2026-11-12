@@ -30,7 +30,7 @@ quixigate run claude                # Launch any coding harness with zero dotfil
 | **Codebase Size** | **~35K Rust SLOC** (+ `~8K` optional UI — **~30× smaller**) | **~1.2M LOC** Python + TypeScript |
 | **State & Secrets** | Embedded **SQLite (`WAL`)** + **AES-256-GCM** vault | External Postgres + Prisma + Redis |
 | **Cost Accounting** | Exact **`NanoUsd` (`i64`, $10^{-9}$ USD)** integer ledger | IEEE-754 `Float` drift |
-| **Enterprise Paywalls** | **0** (100% Apache-2.0 / MIT — every security, SSO, budget & MCP feature included) | **251** `not_premium_user` gates in core + **90** `enterprise/` & `ui/` gates |
+| **Enterprise Paywalls** | **0** (100% MIT — every security, SSO, budget & MCP feature included) | **251** `not_premium_user` gates in core + **90** `enterprise/` & `ui/` gates |
 | **Maintenance Surface** | Delegated to Rust `aisdk` + live `/api/v1/models` + OTLP + MCP | 100+ hand-rolled Python provider & SaaS logger scripts |
 
 ---
@@ -106,7 +106,7 @@ When you strip away duplicated CRUD checks, those 341 gates tell a clear archite
 ```mermaid
 flowchart TD
     Audit["LiteLLM Paywall Audit: 341 Total Checks (251 Core + 90 Enterprise/UI = 28 Features)"]
-    Audit --> Free["16 Capabilities: 100% Free in QuixiGate (Apache-2.0 / MIT, ~4.5K Rust SLOC)"]
+    Audit --> Free["16 Capabilities: 100% Free in QuixiGate (MIT, ~4.5K Rust SLOC)"]
     Audit --> Skip["12 Capabilities: Deliberately Skipped SaaS Anti-Patterns (Saves ~1.1M+ LOC)"]
 
     Free --> F1["Security & Auth: OIDC/JWKS SSO, CIDR ACLs, Split-Plane, Audit Logs, Secret Guardrails"]
@@ -120,7 +120,7 @@ flowchart TD
 
 QuixiGate treats authentication, auditability, cost attribution, and security hygiene as baseline open-source infrastructure — never an enterprise upsell:
 
-| Capability | What LiteLLM Does Without an Enterprise Key | What QuixiGate Ships Free (Apache-2.0 / MIT) |
+| Capability | What LiteLLM Does Without an Enterprise Key | What QuixiGate Ships Free (MIT) |
 | :--- | :--- | :--- |
 | **Inbound OIDC / JWKS Bearer SSO** | Rejects OAuth2/JWKS bearer tokens on `/v1/*` (`oauth2_check.py`) & `/mcp` (`user_api_key_auth_mcp.py`); caps UI SSO at **5 users** (`ui_sso.py`) | Native **OIDC Discovery + JWKS** (`RS*`, `PS*`, `ES256`/`ES384`, `EdDSA`), Cloudflare Access fallback, live `kid` rotation, and **unlimited** JIT users/teams/roles |
 | **Immutable Management Audit Logs** | `audit_logs.py` **silently returns early without writing rows** when `premium_user is not True` | Built-in SQLite `audit_logs` table recording every key, credential, route, user, team, and settings mutation + `GET /audit/logs` |
@@ -159,5 +159,5 @@ QuixiGate wasn't shrunk by cutting corners — it stays **~30× smaller** (`~35K
 
 ## License & Status
 
-Licensed under either **Apache-2.0** or **MIT** at your option.
+Licensed under the [MIT License](LICENSE).
 > *Experimental open-source infrastructure — provided as-is without SLA commitments. Contributions welcome at [github.com/QuixiAI/QuixiGate](https://github.com/QuixiAI/QuixiGate).*

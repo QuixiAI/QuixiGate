@@ -45,8 +45,8 @@ jobs:
         run: |
           mkdir -p dist
           cp "target/${{ matrix.target }}/release/quixigate" dist/quixigate
-          cp LICENSE-MIT LICENSE-APACHE README.md dist/
-          tar -C dist -czf "quixigate-${{ matrix.target }}.tar.gz" quixigate LICENSE-MIT LICENSE-APACHE README.md
+          cp LICENSE README.md dist/
+          tar -C dist -czf "quixigate-${{ matrix.target }}.tar.gz" quixigate LICENSE README.md
           if command -v sha256sum >/dev/null 2>&1; then
             sha256sum "quixigate-${{ matrix.target }}.tar.gz" > "quixigate-${{ matrix.target }}.tar.gz.sha256"
           else
