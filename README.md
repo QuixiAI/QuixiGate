@@ -16,6 +16,14 @@ quixigate burst enable              # Optional: auto-burst to OpenRouter when lo
 quixigate run claude                # Launch any coding harness with zero dotfile mutation
 ```
 
+![QuixiGate Command Center — Real-time throughput, OAuth seat quotas, local runtimes, and exact NanoUsd savings](docs/screenshots/ui-command-center.png)
+
+| **Providers, OAuth & OpenRouter Cloud Burst** | **Multi-Model Side-by-Side Arena (`:online` Search)** |
+| :---: | :---: |
+| ![Providers, OAuth & OpenRouter Cloud Burst](docs/screenshots/ui-providers-oauth.png) | ![Multi-Model Side-by-Side Arena](docs/screenshots/ui-playground-arena.png) |
+| **Users, Teams & `sk-qx-…` Virtual Keys** | **Headless CLI (`status`, `burst`, `keys`)** |
+| ![Users, Teams & Virtual Keys](docs/screenshots/ui-keys-governance.png) | ![QuixiGate CLI Status & Governance](docs/screenshots/cli-status.png) |
+
 | | **QuixiGate** | **LiteLLM Proxy** |
 | :--- | :--- | :--- |
 | **Runtime & Footprint** | **1 static Rust binary** (`<20 MB` idle RAM, `<10 ms` start) | Python runtime (`~800 MB+` RAM, `15–45 s` start) |
