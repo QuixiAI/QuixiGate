@@ -15,6 +15,7 @@ Serve OpenAI, Anthropic, Gemini, OpenRouter, Vercel AI SDK, and MCP clients thro
 2. **Fewer services to run** — embedded SQLite (WAL) + AES-256-GCM vault and budgets; no external Postgres or Redis required.
 3. **Governance without a paid tier** — virtual keys, OIDC/JWKS, audit logs, team controls, model restrictions, and hosted `/mcp` all under MIT.
 4. **One local → subscription → cloud path** — auto-discover local runtimes, pool OAuth seats with sticky routing, and optionally burst to OpenRouter on 429/saturation.
+5. **Clean, auditable code** — `~35K` Rust SLOC across 9 focused crates vs. LiteLLM's `~1.2M` LOC (~30× smaller), with zero vendor SDK bloat or in-process SaaS anti-patterns.
 
 ```bash
 # Install (prebuilt release or Cargo fallback)
