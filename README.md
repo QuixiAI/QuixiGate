@@ -1,20 +1,25 @@
 # QuixiGate
 
-**The single-binary Rust AI gateway for local models, coding subscriptions, and instant cloud burst.**
+**QuixiGate is a faster, better alternative to [LiteLLM Proxy](https://github.com/BerriAI/litellm) — written in Rust and shipped as a single `~18 MB` binary.**
 
-Run one `~18 MB` binary on your laptop or server. Point Claude Code, Codex, Gemini CLI, OpenCode, Open WebUI, `ori`, or any SDK at `localhost:4000` — with zero Python virtualenvs, zero Postgres/Redis containers, zero dotfile mutation, and **zero enterprise paywalls**.
+Point Claude Code, Codex CLI, Gemini CLI, OpenCode, Open WebUI, `ori`, or any OpenAI/Anthropic/Gemini SDK at `localhost:4000` (or drop it in front of your team's LiteLLM `/key/*`, `/team/*`, and `/spend/*` workflows) to unify local GPUs, coding subscriptions, and 400+ cloud models with **zero Python virtualenvs, zero Postgres/Redis containers, and zero enterprise paywalls**.
 
-- **Local-First:** Auto-discovers `llama.cpp` (`llama-server`), Ollama, LM Studio, and vLLM with live VRAM/slot awareness (`$0.00` local inference).
-- **Bring Your Subscriptions & Keys:** Pool your existing OAuth seats (Claude, Codex, Gemini, Copilot, xAI) and direct provider keys with sticky prompt-cache affinity and automatic `429` failover.
-- **1-Click Cloud Burst via OpenRouter:** Sign in once (`quixigate login openrouter`) via browser PKCE — no API key copy-pasting — to unlock 400+ models, `@preset/*` routing, `:nitro`/`:floor` modifiers, and automatic cloud overflow (`quixigate burst enable`) when local GPUs or subscription quotas saturate.
+## Why QuixiGate Is Faster & Better Than LiteLLM
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/QuixiAI/QuixiGate/main/install.sh | sh
-quixigate serve                     # Cold-starts in <10ms on :4000 (<20 MB RAM)
-quixigate login openrouter          # Optional: 1-click browser PKCE (or connect local/OAuth)
-quixigate burst enable              # Optional: auto-burst to OpenRouter when local/sub hits 429
-quixigate run claude                # Launch any coding harness with zero dotfile mutation
-```
+| Dimension | **QuixiGate** | **LiteLLM Proxy** |
+| :--- | :--- | :--- |
+| **Cold Start & Proxy Overhead** | **`<10 ms`** start · sub-millisecond Rust (`tokio` + `axum`) streaming pass-through | **`15–45 s`** Python import/startup · GIL & async event-loop overhead under load |
+| **Memory & Binary Footprint** | **1 static `~18 MB` binary** · **`<20 MB` idle RAM** | Python + Node/Prisma runtime · **`~800 MB–1.5 GB+` RAM** |
+| **Infrastructure Dependencies** | **Zero** — embedded **SQLite (`WAL`)** + **AES-256-GCM** credential vault in one file | Requires external **PostgreSQL + Prisma migrations + Redis** for keys, budgets & multi-worker routing |
+| **Enterprise Paywalls** | **0** — 100% **MIT** (OIDC/JWKS SSO, audit logs, tags, key rotation, CIDR ACLs & `/mcp` all free) | **341 license gates** (**251** `not_premium_user` checks in core + **90** across `enterprise/` & `ui/`) |
+| **Cost & Budget Precision** | Exact **`NanoUsd` (`i64`, `10⁻⁹` USD)** integer ledger + race-free atomic SQLite reservations | IEEE-754 floating-point math (rounding drift) + eventual-consistency budget checks |
+| **Local Model Intelligence** | **Zero-config auto-discovery** of `llama-server`, Ollama, LM Studio, MLX & vLLM with live VRAM/slot checks | Manual YAML static endpoints per local model |
+| **Subscriptions + Cloud Burst** | **Multi-seat OAuth pool** (`fill_first` sticky cache affinity) + **1-click OpenRouter PKCE** `:nitro` burst on `429` | Paid API keys first; no unified local → OAuth seat → 1-click OpenRouter PKCE burst waterfall |
+| **Client & Harness Launching** | **`quixigate run`** (`claude`, `codex`, `gemini`, `opencode`, `ori`) injects env in-memory (**zero dotfile mutation**) | Manual shell env exports or config-file edits per tool |
+| **Observability & Agent Tools** | Built-in **OpenInference OTLP** (`http/protobuf` & `gRPC`) + free Streamable-HTTP **`/mcp`** server | 150+ in-process vendor SDK callbacks in the hot path + paywalled `@require_enterprise_license` admin MCP |
+| **Codebase & Attack Surface** | **`~35K` Rust SLOC** (+ `~8K` optional UI — **~30× smaller**, memory-safe, `0` npm vulnerabilities) | **`~1.2M` LOC** Python + TypeScript monolith |
+
+## Screenshots
 
 ![QuixiGate Command Center — Real-time throughput, OAuth seat quotas, local runtimes, and exact NanoUsd savings](docs/screenshots/ui-command-center.png)
 
@@ -24,14 +29,13 @@ quixigate run claude                # Launch any coding harness with zero dotfil
 | **Users, Teams & `sk-qx-…` Virtual Keys** | **Headless CLI (`status`, `burst`, `keys`)** |
 | ![Users, Teams & Virtual Keys](docs/screenshots/ui-keys-governance.png) | ![QuixiGate CLI Status & Governance](docs/screenshots/cli-status.png) |
 
-| | **QuixiGate** | **LiteLLM Proxy** |
-| :--- | :--- | :--- |
-| **Runtime & Footprint** | **1 static Rust binary** (`<20 MB` idle RAM, `<10 ms` start) | Python runtime (`~800 MB+` RAM, `15–45 s` start) |
-| **Codebase Size** | **~35K Rust SLOC** (+ `~8K` optional UI — **~30× smaller**) | **~1.2M LOC** Python + TypeScript |
-| **State & Secrets** | Embedded **SQLite (`WAL`)** + **AES-256-GCM** vault | External Postgres + Prisma + Redis |
-| **Cost Accounting** | Exact **`NanoUsd` (`i64`, $10^{-9}$ USD)** integer ledger | IEEE-754 `Float` drift |
-| **Enterprise Paywalls** | **0** (100% MIT — every security, SSO, budget & MCP feature included) | **251** `not_premium_user` gates in core + **90** `enterprise/` & `ui/` gates |
-| **Maintenance Surface** | Delegated to Rust `aisdk` + live `/api/v1/models` + OTLP + MCP | 100+ hand-rolled Python provider & SaaS logger scripts |
+```bash
+curl -fsSL https://raw.githubusercontent.com/QuixiAI/QuixiGate/main/install.sh | sh
+quixigate serve                     # Cold-starts in <10ms on :4000 (<20 MB RAM)
+quixigate login openrouter          # Optional: 1-click browser PKCE (or connect local/OAuth)
+quixigate burst enable              # Optional: auto-burst to OpenRouter when local/sub hits 429
+quixigate run claude                # Launch any coding harness with zero dotfile mutation
+```
 
 ---
 
