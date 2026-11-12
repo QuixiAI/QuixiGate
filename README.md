@@ -1,8 +1,15 @@
 # QuixiGate
 
-**QuixiGate is a faster, better alternative to [LiteLLM Proxy](https://github.com/BerriAI/litellm) — written in Rust and shipped as a single `~18 MB` binary.**
+Similar to [LiteLLM Proxy](https://github.com/BerriAI/litellm), **QuixiGate is a self-hosted, polyglot LLM gateway and AI service multiplexer** that lets you run and govern your own unified AI endpoint — rebuilt from the ground up in Rust as a single `~18 MB` binary to be dramatically faster, lighter, and free of enterprise paywalls.
 
-Point Claude Code, Codex CLI, Gemini CLI, OpenCode, Open WebUI, `ori`, or any OpenAI/Anthropic/Gemini SDK at `localhost:4000` (or drop it in front of your team's LiteLLM `/key/*`, `/team/*`, and `/spend/*` workflows) to unify local GPUs, coding subscriptions, and 400+ cloud models with **zero Python virtualenvs, zero Postgres/Redis containers, and zero enterprise paywalls**.
+Instead of wiring every CLI, IDE, SDK, and agent to dozens of separate provider URLs, credentials, and billing dashboards, you run `quixigate serve` once and point everything at `localhost:4000` (or your team's gateway host):
+
+- **Speak Every AI Wire Protocol on One Port:** Simultaneously accepts OpenAI Chat Completions (`/v1/chat/completions`), OpenAI Responses + WebSockets (`/v1/responses`), Anthropic Messages (`/v1/messages`), Google Gemini (`/v1beta/models/*`), OpenRouter (`/api/v1/*`), Vercel AI SDK streams (`/api/chat`), and Streamable-HTTP MCP (`/mcp`) — translating schemas, tool calls, extended thinking/reasoning blocks, and `:online` web search across incompatible backends on the fly.
+- **Multiplex Local GPUs, Coding Subscriptions & Cloud APIs:** Pools three upstream tiers behind smart routing aliases (`fast-coder`, `~anthropic/claude-sonnet-latest:nitro`, `@preset/*`):
+  1. **Local Runtimes (`$0`):** Zero-config auto-discovery for `llama.cpp` (`llama-server`), Ollama, LM Studio, Apple MLX, and vLLM with live port and VRAM/slot awareness.
+  2. **OAuth Subscriptions (`$0` marginal):** Multi-seat credential pooling for Claude Pro/Max, ChatGPT Plus/Pro/Codex, Gemini, GitHub Copilot, and SuperGrok — using sticky `fill_first` routing to preserve prompt caches and drain paid-for seats before touching metered API keys.
+  3. **73+ Direct Cloud APIs & 1-Click OpenRouter Burst:** Native Rust adapters (via `aisdk`) plus 1-click browser PKCE sign-in to OpenRouter's 400+ model catalog, with automatic `429` / saturation cloud-burst failover.
+- **Govern Keys, Exact Budgets, Auth & Traces Without External Infra:** Mints `sk-qx-…` virtual keys for users, teams, and coding harnesses (`quixigate run claude` / `codex` / `gemini` / `opencode` / `ori` with zero dotfile mutation), enforces race-free **`NanoUsd` (`10⁻⁹` USD)** integer budgets and RPM/TPM limits, encrypts upstream secrets in an embedded **SQLite (`WAL`) + AES-256-GCM** vault, authenticates OIDC/JWKS SSO tokens, emits **OpenInference OTLP** traces, and implements LiteLLM-compatible `/key/*`, `/user/*`, `/team/*`, and `/spend/*` management endpoints — all in `<20 MB` of RAM with **zero** Postgres/Redis dependencies.
 
 ## Why QuixiGate Is Faster & Better Than LiteLLM
 
