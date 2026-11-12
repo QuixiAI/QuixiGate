@@ -1,0 +1,59 @@
+[package]
+name = "quixigate-proxy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Polyglot HTTP/SSE/WebSocket AI gateway, OIDC/JWKS SSO, MCP server, and optional embedded UI for QuixiGate"
+
+[features]
+default = ["ui", "subscription-oauth"]
+ui = ["dep:rust-embed", "dep:mime_guess"]
+subscription-oauth = [
+    "quixigate-auth/subscription-oauth",
+    "quixigate-providers/subscription-oauth",
+    "quixigate-router/subscription-oauth",
+]
+
+[dependencies]
+quixigate-core.workspace = true
+quixigate-vault.workspace = true
+quixigate-db.workspace = true
+quixigate-auth.workspace = true
+quixigate-providers.workspace = true
+quixigate-router.workspace = true
+quixigate-telemetry.workspace = true
+aisdk.workspace = true
+anyhow.workspace = true
+axum.workspace = true
+base64.workspace = true
+bytes.workspace = true
+chrono.workspace = true
+dashmap.workspace = true
+futures.workspace = true
+http.workspace = true
+mime_guess = { workspace = true, optional = true }
+parking_lot.workspace = true
+rand.workspace = true
+reqwest.workspace = true
+ring.workspace = true
+rust-embed = { workspace = true, optional = true }
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml_ng.workspace = true
+sha2.workspace = true
+subtle.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+tower.workspace = true
+tower-http.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+opentelemetry-proto.workspace = true
+prost.workspace = true
+tempfile.workspace = true
+tokio-tungstenite.workspace = true

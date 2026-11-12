@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  ui:
+    name: UI (TypeCheck, Vitest & Bundle)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ui
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+      - run: npm ci
+      - run: npm audit --omit=dev
+      - run: npm test
+      - run: npm run build
+
+  rust:
+    name: Rust (Clippy, Feature Matrix & E2E Suite)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy (default features)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Clippy (API & Local Only feature profile)
+        run: cargo clippy -p quixigate --no-default-features --features ui -- -D warnings
+      - name: Clippy (with demo upstreams feature)
+        run: cargo clippy -p quixigate --features demo -- -D warnings
+      - name: Workspace Unit & E2E Tests
+        run: cargo test --workspace

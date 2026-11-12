@@ -1,0 +1,46 @@
+[package]
+name = "quixigate-router"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Multi-seat sticky router, OpenRouter catalog sync, guardrails, and SSRF-safe web search/fetch tools for QuixiGate"
+
+[features]
+default = ["subscription-oauth"]
+subscription-oauth = [
+    "quixigate-auth/subscription-oauth",
+    "quixigate-providers/subscription-oauth",
+]
+
+[dependencies]
+quixigate-core.workspace = true
+quixigate-db.workspace = true
+quixigate-auth.workspace = true
+quixigate-providers.workspace = true
+aisdk.workspace = true
+anyhow.workspace = true
+arc-swap.workspace = true
+blake3.workspace = true
+chrono.workspace = true
+dashmap.workspace = true
+flate2.workspace = true
+futures.workspace = true
+moka.workspace = true
+parking_lot.workspace = true
+rand.workspace = true
+regex.workspace = true
+reqwest.workspace = true
+schemars.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+axum.workspace = true
+quixigate-vault.workspace = true
+tempfile.workspace = true

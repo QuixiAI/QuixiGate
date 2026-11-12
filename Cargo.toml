@@ -1,0 +1,166 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/quixigate-core",
+    "crates/quixigate-vault",
+    "crates/quixigate-db",
+    "crates/quixigate-auth",
+    "crates/quixigate-providers",
+    "crates/quixigate-router",
+    "crates/quixigate-telemetry",
+    "crates/quixigate-proxy",
+    "crates/quixigate",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+authors = ["QuixiAI Contributors"]
+repository = "https://github.com/QuixiAI/QuixiGate"
+homepage = "https://github.com/QuixiAI/QuixiGate"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+
+[workspace.dependencies]
+quixigate-core = { path = "crates/quixigate-core" }
+quixigate-vault = { path = "crates/quixigate-vault" }
+quixigate-db = { path = "crates/quixigate-db" }
+quixigate-auth = { path = "crates/quixigate-auth", default-features = false }
+quixigate-providers = { path = "crates/quixigate-providers", default-features = false }
+quixigate-router = { path = "crates/quixigate-router", default-features = false }
+quixigate-telemetry = { path = "crates/quixigate-telemetry" }
+quixigate-proxy = { path = "crates/quixigate-proxy", default-features = false }
+
+aisdk = { version = "0.6.4", default-features = false, features = [
+    "language-model-request",
+    "embedding-model-request",
+    "axum",
+    "302ai",
+    "abacus",
+    "aihubmix",
+    "alibaba",
+    "alibaba-cn",
+    "amazon-bedrock",
+    "anthropic",
+    "bailing",
+    "baseten",
+    "berget",
+    "chutes",
+    "cloudflare-ai-gateway",
+    "cloudflare-workers-ai",
+    "cortecs",
+    "deepseek",
+    "fastrouter",
+    "fireworks-ai",
+    "firmware",
+    "friendli",
+    "github-copilot",
+    "github-models",
+    "google",
+    "groq",
+    "helicone",
+    "huggingface",
+    "iflowcn",
+    "inception",
+    "inference",
+    "io-net",
+    "jiekou",
+    "kuae-cloud-coding-plan",
+    "llama",
+    "lmstudio",
+    "lucidquery",
+    "mistral",
+    "moark",
+    "modelscope",
+    "moonshotai",
+    "moonshotai-cn",
+    "morph",
+    "nano-gpt",
+    "nebius",
+    "nova",
+    "novita-ai",
+    "nvidia",
+    "ollama-cloud",
+    "openai",
+    "openaichatcompletions",
+    "openaicompatible",
+    "opencode",
+    "openrouter",
+    "ovhcloud",
+    "poe",
+    "privatemode-ai",
+    "requesty",
+    "scaleway",
+    "siliconflow",
+    "siliconflow-cn",
+    "stackit",
+    "stepfun",
+    "submodel",
+    "synthetic",
+    "togetherai",
+    "upstage",
+    "vercel",
+    "vultr",
+    "wandb",
+    "xai",
+    "xiaomi",
+    "zai",
+    "zai-coding-plan",
+    "zenmux",
+    "zhipuai",
+    "zhipuai-coding-plan",
+] }
+
+aes-gcm = "0.10"
+anyhow = "1.0"
+arc-swap = "1.7"
+argon2 = { version = "0.5", features = ["std"] }
+async-trait = "0.1"
+axum = { version = "0.8", features = ["ws", "macros", "json", "http2"] }
+base64 = "0.22"
+blake3 = "1.5"
+bytes = "1.8"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4.5", features = ["derive", "env"] }
+dashmap = "6.1"
+directories = "6.0"
+flate2 = "1.0"
+futures = "0.3"
+hex = "0.4"
+http = "1.1"
+inquire = "0.7"
+mime_guess = "2.0"
+moka = { version = "0.12", features = ["future"] }
+open = "5.3"
+opentelemetry-proto = { version = "0.28", default-features = false, features = ["trace", "gen-tonic-messages", "with-serde"] }
+parking_lot = "0.12"
+prost = "0.13"
+rand = "0.8"
+regex = "1.11"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "http2"] }
+ring = "0.17"
+rusqlite = { version = "0.33", features = ["bundled"] }
+rust-embed = { version = "8.5", features = ["interpolate-folder-path"] }
+schemars = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml_ng = "0.10"
+sha2 = "0.10"
+subtle = "2.6"
+tempfile = "3.14"
+thiserror = "2.0"
+tokio = { version = "1.42", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync", "process", "signal", "fs"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
+toml = "0.8"
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = ["cors", "trace", "compression-gzip", "limit"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+url = "2.5"
+uuid = { version = "1.11", features = ["v4", "serde"] }
+zeroize = { version = "1.8", features = ["derive"] }

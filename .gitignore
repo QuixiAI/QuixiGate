@@ -1,0 +1,16 @@
+/target
+/.reference
+/.quixigate
+/ui/node_modules
+/ui/.vite
+/ui/coverage
+*.db
+*.db-shm
+*.db-wal
+vault.key
+*.key
+*.pem
+.env
+.env.*
+!.env.example
+.DS_Store
