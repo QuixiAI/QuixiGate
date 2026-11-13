@@ -17,10 +17,21 @@ Serve OpenAI, Anthropic, Gemini, OpenRouter, Vercel AI SDK, and MCP clients thro
 4. **One local → subscription → cloud path** — auto-discover local runtimes, pool OAuth seats with sticky routing, and optionally burst to OpenRouter on 429/saturation.
 5. **Clean, auditable code** — `~44K` Rust SLOC across 9 focused crates vs. LiteLLM's `~1.2M` LOC (~27× smaller), with zero vendor SDK bloat or in-process SaaS anti-patterns.
 
-```bash
-# Install (prebuilt release or Cargo fallback)
-curl -fsSL https://raw.githubusercontent.com/QuixiAI/QuixiGate/main/install.sh | sh
+**macOS & Linux:**
 
+```bash
+curl -fsSL https://raw.githubusercontent.com/QuixiAI/QuixiGate/main/install.sh | sh
+```
+
+**Windows (PowerShell):**
+
+```powershell
+irm https://raw.githubusercontent.com/QuixiAI/QuixiGate/main/install.ps1 | iex
+```
+
+**Start & run:**
+
+```bash
 # Start the gateway
 quixigate serve
 
@@ -32,7 +43,7 @@ quixigate burst enable
 quixigate run claude
 ```
 
-> The installer places the binary in `~/.local/bin` by default. Add that directory to `PATH` if needed. You can inspect [`install.sh`](install.sh) or download a release binary directly from [Releases](https://github.com/QuixiAI/QuixiGate/releases/latest). Local inference requires a running model server (or a configured upstream).
+> Both installers verify SHA-256 checksums, install to `/usr/local/bin/quixigate` on macOS & Linux (`%LOCALAPPDATA%\Programs\QuixiGate\bin\quixigate.exe` — or `C:\Program Files\QuixiGate\bin` when elevated — on Windows), and fall back to `cargo install` if needed. Inspect [`install.sh`](install.sh), [`install.ps1`](install.ps1), or download macOS, Linux, and Windows archives directly from [Releases](https://github.com/QuixiAI/QuixiGate/releases/latest). Local inference requires a running model server (or a configured upstream).
 
 ## QuixiGate vs. LiteLLM Proxy
 
@@ -50,7 +61,7 @@ quixigate run claude
 | **LiteLLM API Compatibility** | **997 / 997** LiteLLM routes accounted for: live data/control-plane parity + actionable `400` DIY migration guidance on excluded SaaS/RAG routes | Reference surface |
 | **Source Scope** | **`~44K`** production Rust SLOC (+ optional UI) across 9 crates | Larger Python + TypeScript codebase with broader integration surface |
 
-**Comparison notes:** Size and startup figures reflect release builds (`lto = "thin"`, stripped symbols). Startup time, RSS, and throughput vary by hardware, OS, and enabled features. Licensing notes reflect an audit of LiteLLM's repository snapshot and may evolve across releases. Independent benchmarks and verification are welcome.
+**Comparison notes:** Size and startup figures reflect release builds (`lto = "fat"`, `mimalloc`, stripped symbols). Startup time, RSS, and throughput vary by hardware, OS, and enabled features. Licensing notes reflect an audit of LiteLLM's repository snapshot and may evolve across releases. Independent benchmarks and verification are welcome.
 
 ## Screenshots
 

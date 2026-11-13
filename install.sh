@@ -4,7 +4,6 @@
 set -eu
 
 REPO="${QUIXIGATE_REPO:-QuixiAI/QuixiGate}"
-INSTALL_DIR="${QUIXIGATE_INSTALL_DIR:-$HOME/.local/bin}"
 VERSION="${QUIXIGATE_VERSION:-latest}"
 
 log() {
@@ -31,7 +30,41 @@ case "$ARCH" in
   *)             ARCH_TRIPLE="" ;;
 esac
 
-mkdir -p "$INSTALL_DIR"
+# Resolve production install target:
+# 1. Explicit QUIXIGATE_INSTALL_DIR override if set
+# 2. /usr/local/bin (standard macOS & Linux FHS path — directly if writable/root, or via sudo when available)
+# 3. $HOME/.local/bin fallback for unprivileged headless environments without sudo
+USE_SUDO=0
+if [ -n "${QUIXIGATE_INSTALL_DIR:-}" ]; then
+  INSTALL_DIR="$QUIXIGATE_INSTALL_DIR"
+elif [ -d "/usr/local/bin" ] && [ -w "/usr/local/bin" ]; then
+  INSTALL_DIR="/usr/local/bin"
+elif [ "$(id -u)" -eq 0 ]; then
+  INSTALL_DIR="/usr/local/bin"
+elif command -v sudo >/dev/null 2>&1 && { sudo -n true 2>/dev/null || sh -c ': </dev/tty' 2>/dev/null; }; then
+  INSTALL_DIR="/usr/local/bin"
+  USE_SUDO=1
+else
+  INSTALL_DIR="$HOME/.local/bin"
+fi
+
+install_binary() {
+  src="$1"
+  chmod 0755 "$src"
+  if [ "$USE_SUDO" -eq 1 ]; then
+    log "Installing quixigate to ${INSTALL_DIR}/quixigate (sudo required)..."
+    sudo mkdir -p "$INSTALL_DIR"
+    sudo install -m 0755 "$src" "${INSTALL_DIR}/quixigate"
+  else
+    mkdir -p "$INSTALL_DIR"
+    cp "$src" "${INSTALL_DIR}/quixigate.tmp.$$"
+    chmod 0755 "${INSTALL_DIR}/quixigate.tmp.$$"
+    mv "${INSTALL_DIR}/quixigate.tmp.$$" "${INSTALL_DIR}/quixigate"
+  fi
+}
+
+TMP_DIR="$(mktemp -d)"
+trap 'rm -rf "$TMP_DIR"' EXIT INT TERM
 
 installed_prebuilt=0
 if [ -n "$OS_TRIPLE" ] && [ -n "$ARCH_TRIPLE" ] && command -v curl >/dev/null 2>&1 && command -v tar >/dev/null 2>&1; then
@@ -42,9 +75,6 @@ if [ -n "$OS_TRIPLE" ] && [ -n "$ARCH_TRIPLE" ] && command -v curl >/dev/null 2>
   else
     BASE_URL="https://github.com/${REPO}/releases/download/${VERSION}"
   fi
-
-  TMP_DIR="$(mktemp -d)"
-  trap 'rm -rf "$TMP_DIR"' EXIT INT TERM
 
   if curl -fsSL "${BASE_URL}/${ARCHIVE}" -o "${TMP_DIR}/${ARCHIVE}" 2>/dev/null; then
     if curl -fsSL "${BASE_URL}/${ARCHIVE}.sha256" -o "${TMP_DIR}/${ARCHIVE}.sha256" 2>/dev/null; then
@@ -61,8 +91,7 @@ if [ -n "$OS_TRIPLE" ] && [ -n "$ARCH_TRIPLE" ] && command -v curl >/dev/null 2>
 
     tar -xzf "${TMP_DIR}/${ARCHIVE}" -C "$TMP_DIR"
     [ -f "${TMP_DIR}/quixigate" ] || err "Archive ${ARCHIVE} did not contain quixigate binary"
-    chmod +x "${TMP_DIR}/quixigate"
-    mv "${TMP_DIR}/quixigate" "${INSTALL_DIR}/quixigate"
+    install_binary "${TMP_DIR}/quixigate"
     installed_prebuilt=1
     log "Installed prebuilt quixigate (${TARGET}) to ${INSTALL_DIR}/quixigate"
   fi
@@ -73,11 +102,10 @@ if [ "$installed_prebuilt" -eq 0 ]; then
     err "No prebuilt release found for ${OS}/${ARCH} and 'cargo' is not installed. Install Rust via https://rustup.rs first."
   fi
   log "Building quixigate from source via cargo (https://github.com/${REPO})..."
-  cargo install --git "https://github.com/${REPO}.git" --locked --root "${TMP_CARGO_ROOT:-$HOME/.cargo}" quixigate
-  if [ "$INSTALL_DIR" != "${TMP_CARGO_ROOT:-$HOME/.cargo}/bin" ] && [ -f "${TMP_CARGO_ROOT:-$HOME/.cargo}/bin/quixigate" ]; then
-    cp "${TMP_CARGO_ROOT:-$HOME/.cargo}/bin/quixigate" "${INSTALL_DIR}/quixigate"
-    chmod +x "${INSTALL_DIR}/quixigate"
-  fi
+  CARGO_STAGE="${TMP_CARGO_ROOT:-$TMP_DIR/cargo-root}"
+  cargo install --git "https://github.com/${REPO}.git" --locked --root "$CARGO_STAGE" quixigate
+  [ -f "${CARGO_STAGE}/bin/quixigate" ] || err "cargo install did not produce quixigate binary"
+  install_binary "${CARGO_STAGE}/bin/quixigate"
   log "Installed quixigate to ${INSTALL_DIR}/quixigate"
 fi
 
