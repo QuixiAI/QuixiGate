@@ -15,7 +15,7 @@ Serve OpenAI, Anthropic, Gemini, OpenRouter, Vercel AI SDK, and MCP clients thro
 2. **Fewer services to run** — embedded SQLite (WAL) + AES-256-GCM vault and budgets; no external Postgres or Redis required.
 3. **Governance without a paid tier** — virtual keys, OIDC/JWKS, audit logs, team controls, model restrictions, and hosted `/mcp` all under MIT.
 4. **One local → subscription → cloud path** — auto-discover local runtimes, pool OAuth seats with sticky routing, and optionally burst to OpenRouter on 429/saturation.
-5. **Clean, auditable code** — `~35K` Rust SLOC across 9 focused crates vs. LiteLLM's `~1.2M` LOC (~30× smaller), with zero vendor SDK bloat or in-process SaaS anti-patterns.
+5. **Clean, auditable code** — `~44K` Rust SLOC across 9 focused crates vs. LiteLLM's `~1.2M` LOC (~27× smaller), with zero vendor SDK bloat or in-process SaaS anti-patterns.
 
 ```bash
 # Install (prebuilt release or Cargo fallback)
@@ -47,7 +47,8 @@ quixigate run claude
 | **Subscription + Cloud Routing** | Multi-seat OAuth pooling with sticky `fill_first` cache affinity + optional 1-click OpenRouter PKCE burst | Provider/model routing and fallbacks; behavior depends on configuration and license |
 | **Coding-CLI Launching** | `quixigate run` injects environment in-memory for `claude`, `codex`, `gemini`, `opencode`, and `ori` (zero dotfile mutation) | Clients pointed at the proxy via environment or config |
 | **Observability / MCP** | Built-in OpenInference OTLP (http/protobuf & gRPC) + free Streamable-HTTP `/mcp` | Callbacks and integrations; some admin/MCP features paywalled |
-| **Source Scope** | **`~35K`** production Rust SLOC (+ optional UI) across 9 crates | Larger Python + TypeScript codebase with broader integration surface |
+| **LiteLLM API Compatibility** | **997 / 997** LiteLLM routes accounted for: live data/control-plane parity + actionable `400` DIY migration guidance on excluded SaaS/RAG routes | Reference surface |
+| **Source Scope** | **`~44K`** production Rust SLOC (+ optional UI) across 9 crates | Larger Python + TypeScript codebase with broader integration surface |
 
 **Comparison notes:** Size and startup figures reflect release builds (`lto = "thin"`, stripped symbols). Startup time, RSS, and throughput vary by hardware, OS, and enabled features. Licensing notes reflect an audit of LiteLLM's repository snapshot and may evolve across releases. Independent benchmarks and verification are welcome.
 
@@ -89,7 +90,7 @@ quixigate run ori --model @preset/code-reviewer
 
 ### 3. Management API and optional UI
 
-All operations are API-driven, including LiteLLM-compatible `/key/*`, `/user/*`, `/team/*`, `/spend/*`, `/audit/logs`, and `/openapi.json`. Loopback and local Docker containers work out of the box. Remote access uses `sk-qx-…` virtual keys or OIDC/JWKS bearer tokens. `QUIXIGATE_MASTER_KEY` / `LITELLM_MASTER_KEY` and `x-litellm-*` headers are accepted as aliases.
+All operations are API-driven, including full LiteLLM-compatible control-plane parity (`/key/*`, `/user/*`, `/customer/*` & `/end_user/*`, `/team/*`, `/budget/*`, `/tag/*`, `/access_group/*`, `/fallback*`, `/model/*`, `/credentials*`, `/v1/mcp/server*`, `/spend/*`, `/global/*`, `/audit/logs`, `/public/*`, and `/openapi.json`). Loopback and local Docker containers work out of the box. Remote access uses `sk-qx-…` virtual keys or OIDC/JWKS bearer tokens. `QUIXIGATE_MASTER_KEY` / `LITELLM_MASTER_KEY`, Azure `api-key`, and `x-litellm-*` headers are accepted natively.
 
 Toggle the embedded Command Center live:
 
@@ -119,13 +120,14 @@ flowchart LR
 
 | Client Wire Protocol | Endpoint | Notes |
 | :--- | :--- | :--- |
-| **OpenAI Chat Completions** | `POST /v1/chat/completions` | Streaming SSE, tools, `:online` search, JSON schema, `mock_response` |
-| **OpenAI Responses** | `POST /v1/responses` + **WebSocket** | Native Codex CLI WebSocket & SSE streaming |
-| **Anthropic Messages** | `POST /v1/messages`, `/count_tokens` | Native Claude Code thinking & tool blocks |
-| **Google Gemini** | `POST /v1beta/models/{model}:{action}` | `generateContent` & `streamGenerateContent` |
+| **OpenAI Chat & Legacy Completions** | `POST /v1/chat/completions`, `POST /v1/completions` | Streaming SSE, tools, `:online` search, JSON schema, Azure `/openai/deployments/{model}/*`, Cursor `/cursor/*` |
+| **OpenAI Responses** | `POST /v1/responses` + **WebSocket** | Native Codex CLI WebSocket & SSE streaming + `/input_tokens` & `/compact` |
+| **Multimodal, Rerank & Search** | `/v1/embeddings`, `/v1/images/*`, `/v1/audio/*`, `/v1/moderations`, `/v1/rerank`, `/v1/search*` | Image gen/edits, TTS & Whisper STT, local+upstream moderation, Cohere/Jina rerank, 6-engine web search |
+| **Anthropic Messages** | `POST /v1/messages`, `/count_tokens` | Native Claude Code thinking & tool blocks (+ unprefixed `/messages`) |
+| **Google Gemini** | `POST /v1beta/models/{model}:{action}` | `generateContent`, `streamGenerateContent` & `countTokens` |
 | **OpenRouter API Surface** | `/api/v1/{models,presets,credits,key,...}` | Drop-in compatibility for `ori` & OpenRouter SDKs |
 | **Vercel AI SDK** | `POST /api/chat` | Data Stream Protocol (`VercelUIStream`) |
-| **Hosted MCP Server** | `POST /mcp`, `GET /mcp`, `DELETE /mcp` | Streamable-HTTP JSON-RPC 2.0 (`web_search`, `web_fetch`, models, spend, audit) |
+| **Hosted MCP & REST Bridge** | `/mcp`, `/v1/mcp/server*`, `/mcp-rest/tools/*` | Streamable-HTTP JSON-RPC 2.0 (`web_search`, `web_fetch`, models, spend, audit) + external MCP registry |
 
 ## Governance Features Included Under MIT
 
@@ -148,13 +150,13 @@ Authentication, auditability, cost attribution, and basic security controls ship
 
 ## Why the Codebase Stays Smaller
 
-QuixiGate comprises ~35K production Rust SLOC across 9 crates. It stays compact by refusing several patterns common in larger Python gateways:
+QuixiGate comprises ~44K production Rust SLOC across 9 crates. It stays compact by refusing several patterns common in larger Python gateways:
 
 1. **No in-process vendor logger and cloud SDK soup.** Emits vendor-neutral OpenTelemetry / OpenInference OTLP once. An external collector fans out to any sink.
-2. **No 4-tier multi-tenant ORM.** Embedded SQLite (WAL) with Team + User + VirtualKey + tags + OIDC claim mapping covers common attribution needs without external databases.
+2. **No 4-tier multi-tenant ORM.** Embedded SQLite (WAL) with Team + User + VirtualKey + EndUser + Budgets + Tags + AccessGroups + OIDC claim mapping covers governance without external databases.
 3. **No external secret-manager or cloud-moderation sidecars.** Container/systemd environment injection + embedded AES-256-GCM vault + local secret/keyword scanner.
 4. **No hand-maintained provider glue or static pricing.** Upstream adapters live in the Rust [`aisdk`](https://crates.io/crates/aisdk) crate; capabilities and pricing are synced live from `models.dev` and OpenRouter.
-5. **Strict proxy scope.** Not an all-in-one SaaS. No bundled RAG, vector stores, OCR/video pipelines, fine-tuning orchestrators, or custom Slackbots.
+5. **Strict proxy scope — with actionable migration guidance instead of blind `404`s.** Not an all-in-one SaaS: no bundled RAG, vector stores, OCR/video pipelines, SCIM sync, or fine-tuning orchestrators. If an existing LiteLLM client calls one of those intentionally excluded routes (all **997** LiteLLM routes are tested in CI), QuixiGate returns a fast-fail `400 Bad Request` (`type: "unsupported_litellm_endpoint"`, `x-should-retry: false`) explaining *why* it stays out of the proxy, the native QuixiGate alternative, and step-by-step instructions to implement equivalent functionality cleanly.
 
 ## Build Profiles
 
