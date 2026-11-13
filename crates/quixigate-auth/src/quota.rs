@@ -47,7 +47,16 @@ pub async fn poll_and_save_quota(
                 access, account_id, ..
             },
             _,
-        ) => fetch_codex_quota(http, &endpoints.codex_wham_usage_url, access, account_id, now).await,
+        ) => {
+            fetch_codex_quota(
+                http,
+                &endpoints.codex_wham_usage_url,
+                access,
+                account_id,
+                now,
+            )
+            .await
+        }
         (CredentialSecret::AnthropicSetupToken { token }, _) => {
             fetch_claude_quota(http, &endpoints.anthropic_oauth_usage_url, token, now).await
         }
@@ -117,9 +126,10 @@ async fn fetch_codex_quota(
         if !win.is_object() {
             continue;
         }
-        let secs = win["limit_window_seconds"]
-            .as_i64()
-            .unwrap_or(if primary { 18_000 } else { 86_400 });
+        let secs =
+            win["limit_window_seconds"]
+                .as_i64()
+                .unwrap_or(if primary { 18_000 } else { 86_400 });
         let hours = ((secs as f64) / 3600.0).round() as i64;
         let reset_at_sec = win["reset_at"].as_i64();
         let label = if primary || hours < 24 {
@@ -350,7 +360,11 @@ async fn fetch_openrouter_credits(
         if let Some(limit) = kd["limit"].as_f64().filter(|&l| l > 0.0) {
             let key_used = kd["usage"]
                 .as_f64()
-                .or_else(|| kd["limit_remaining"].as_f64().map(|rem| (limit - rem).max(0.0)))
+                .or_else(|| {
+                    kd["limit_remaining"]
+                        .as_f64()
+                        .map(|rem| (limit - rem).max(0.0))
+                })
                 .unwrap_or(0.0);
             windows.push(QuotaWindow {
                 label: "Key Limit".to_owned(),

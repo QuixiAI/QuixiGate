@@ -24,6 +24,7 @@ use aisdk::core::{
 use cache::{CachedGeneration, CachedToolCall, ResponseCache};
 use catalog::{CatalogModel, ModelCatalog};
 use futures::{Stream, StreamExt};
+use pool::{DispatchCandidate, PoolSelector, record_upstream_failure};
 use quixigate_auth::refresh::CredentialRefresher;
 use quixigate_core::{
     AuthKind, CredentialSecret, ModelRoute, ModelSpec, NanoUsd, QuixigateError, Result,
@@ -33,7 +34,6 @@ use quixigate_providers::{
     AnyLanguageModel, EmbeddingOutput, LocalRuntimeScanner, ModelBuildRequest, embed_texts,
     instantiate_model,
 };
-use pool::{DispatchCandidate, PoolSelector, record_upstream_failure};
 use schemars::Schema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -103,8 +103,14 @@ pub enum RoutedStreamEvent {
     ReasoningStart,
     ReasoningDelta(String),
     ReasoningEnd,
-    ToolCallStart { id: String, name: String },
-    ToolCallDelta { id: String, delta: String },
+    ToolCallStart {
+        id: String,
+        name: String,
+    },
+    ToolCallDelta {
+        id: String,
+        delta: String,
+    },
     ToolCallReady(ToolCallInfo),
     ServerToolResult {
         id: String,
@@ -146,6 +152,18 @@ pub struct RoutedStream {
     pub fallback_attempts: u32,
     pub cache_hit: bool,
     pub events: Pin<Box<dyn Stream<Item = RoutedStreamEvent> + Send>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ResolvedHttpCandidate {
+    pub provider_id: String,
+    pub upstream_model: String,
+    pub base_url: String,
+    pub api_key: Option<String>,
+    pub auth_kind: AuthKind,
+    pub credential_id: Option<String>,
+    pub extra_headers: HashMap<String, String>,
+    pub route: Option<ModelRoute>,
 }
 
 #[derive(Debug, Clone)]
@@ -238,14 +256,174 @@ impl GatewayRouter {
         &self.refresher
     }
 
-    pub async fn execute_web_search(&self, query: &str, max_results: usize) -> std::result::Result<Value, String> {
-        let creds = self.resolve_web_search_credentials().await;
-        self.web_search_engine.search(query, max_results, &creds).await
+    pub fn inference_http(&self) -> &reqwest::Client {
+        &self.inference_http
     }
 
-    pub async fn execute_web_fetch(&self, url: &str, max_chars: usize) -> std::result::Result<Value, String> {
+    pub fn pool(&self) -> &PoolSelector {
+        &self.pool
+    }
+
+    /// Resolves ordered OpenAI/REST-compatible HTTP candidates with fresh credentials, base URLs,
+    /// and provider attribution headers for multimodal (`images`, `audio`), `moderations`, and `rerank` endpoints.
+    pub async fn resolve_http_candidates(
+        &self,
+        requested_model: &str,
+    ) -> Result<Vec<ResolvedHttpCandidate>> {
+        let spec = ModelSpec::parse(requested_model);
+        let settings = self.db.get_settings()?;
+        let route = self.db.get_model_route(&spec.base_model)?;
+        if route.as_ref().is_some_and(|r| r.blocked) {
+            return Err(QuixigateError::Forbidden(format!(
+                "model '{requested_model}' is currently blocked"
+            )));
+        }
+        let creds = self.db.list_credentials()?;
+        let candidates = self.pool.resolve_candidates(
+            &spec,
+            route.as_ref(),
+            &creds,
+            &self.catalog,
+            &self.local_scanner,
+            &settings,
+        );
+        let mut out = Vec::with_capacity(candidates.len());
+        for cand in &candidates {
+            let (api_key, auth_kind, cred_id, cred_base) = if let Some(cred) = &cand.credential {
+                match self.refresher.ensure_fresh(&cred.id).await {
+                    Ok((fresh_rec, secret)) => {
+                        let key = match secret {
+                            CredentialSecret::ApiKey { key } => Some(key),
+                            CredentialSecret::AnthropicSetupToken { token } => Some(token),
+                            CredentialSecret::Codex { access, .. }
+                            | CredentialSecret::Xai { access, .. }
+                            | CredentialSecret::GeminiCli { access, .. }
+                            | CredentialSecret::QwenPortal { access, .. }
+                            | CredentialSecret::MiniMaxPortal { access, .. }
+                            | CredentialSecret::Chutes { access, .. }
+                            | CredentialSecret::GitHubCopilot { access, .. }
+                            | CredentialSecret::OpenRouterOidc { access, .. } => Some(access),
+                            CredentialSecret::LocalNoauth => None,
+                        };
+                        (
+                            key,
+                            fresh_rec.auth_kind,
+                            Some(fresh_rec.id),
+                            fresh_rec.base_url,
+                        )
+                    }
+                    Err(_) => continue,
+                }
+            } else {
+                (
+                    self.local_scanner.api_key_for(&cand.provider_id),
+                    AuthKind::LocalNoauth,
+                    None,
+                    None,
+                )
+            };
+            let default_base = match cand.provider_id.as_str() {
+                "openai" | "openai-codex" => "https://api.openai.com/v1",
+                "openrouter" => "https://openrouter.ai/api/v1",
+                "anthropic" | "anthropic-token" => "https://api.anthropic.com/v1",
+                "google" | "google-gemini-cli" => {
+                    "https://generativelanguage.googleapis.com/v1beta/openai"
+                }
+                "mistral" => "https://api.mistral.ai/v1",
+                "cohere" => "https://api.cohere.com/v2",
+                "jina" => "https://api.jina.ai/v1",
+                "voyage" | "voyageai" => "https://api.voyageai.com/v1",
+                "groq" => "https://api.groq.com/openai/v1",
+                "deepgram" => "https://api.deepgram.com/v1",
+                "elevenlabs" => "https://api.elevenlabs.io/v1",
+                "togetherai" | "together" => "https://api.together.xyz/v1",
+                "fireworks-ai" | "fireworks" => "https://api.fireworks.ai/inference/v1",
+                "xai" | "xai-oauth" => "https://api.x.ai/v1",
+                "deepseek" => "https://api.deepseek.com/v1",
+                "ollama" => "http://127.0.0.1:11434/v1",
+                "lmstudio" | "lm-studio" => "http://127.0.0.1:1234/v1",
+                "llamacpp" | "llama.cpp" | "llama-cpp" | "llama-server" => {
+                    "http://127.0.0.1:8080/v1"
+                }
+                "mlx" => "http://127.0.0.1:8085/v1",
+                "vllm" => "http://127.0.0.1:8000/v1",
+                _ => "https://api.openai.com/v1",
+            };
+            let raw_base = cand
+                .base_url_override
+                .as_deref()
+                .or(cred_base.as_deref())
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or(default_base)
+                .trim_end_matches('/');
+            let has_path = raw_base
+                .split_once("://")
+                .is_some_and(|(_, rest)| rest.contains('/'));
+            let base_url = if has_path {
+                raw_base.to_owned()
+            } else if cand.provider_id.eq_ignore_ascii_case("cohere") {
+                format!("{raw_base}/v2")
+            } else {
+                format!("{raw_base}/v1")
+            };
+            let mut extra_headers = HashMap::new();
+            if cand.provider_id.eq_ignore_ascii_case("openrouter") {
+                extra_headers.insert(
+                    "HTTP-Referer".to_owned(),
+                    settings.openrouter_app_url.clone(),
+                );
+                extra_headers.insert("X-Title".to_owned(), settings.openrouter_app_title.clone());
+            }
+            out.push(ResolvedHttpCandidate {
+                provider_id: cand.provider_id.clone(),
+                upstream_model: cand.upstream_model.clone(),
+                base_url,
+                api_key,
+                auth_kind,
+                credential_id: cred_id,
+                extra_headers,
+                route: route.clone(),
+            });
+        }
+        Ok(out)
+    }
+
+    pub async fn execute_web_search(
+        &self,
+        query: &str,
+        max_results: usize,
+    ) -> std::result::Result<Value, String> {
+        self.execute_web_search_with_tool(query, max_results, None)
+            .await
+    }
+
+    pub async fn execute_web_search_with_tool(
+        &self,
+        query: &str,
+        max_results: usize,
+        provider_pin: Option<&str>,
+    ) -> std::result::Result<Value, String> {
+        let mut creds = self.resolve_web_search_credentials().await;
+        if let Some(pin) = provider_pin
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && *s != "auto")
+        {
+            creds.provider_pin = Some(pin.to_ascii_lowercase());
+        }
+        self.web_search_engine
+            .search(query, max_results, &creds)
+            .await
+    }
+
+    pub async fn execute_web_fetch(
+        &self,
+        url: &str,
+        max_chars: usize,
+    ) -> std::result::Result<Value, String> {
         let creds = self.resolve_web_search_credentials().await;
-        self.web_search_engine.fetch_url(url, max_chars, &creds).await
+        self.web_search_engine
+            .fetch_url(url, max_chars, &creds)
+            .await
     }
 
     pub fn list_available_models(&self) -> Vec<CatalogModel> {
@@ -253,7 +431,10 @@ impl GatewayRouter {
         let openrouter_connected = self
             .db
             .list_credentials()
-            .map(|cs| cs.iter().any(|c| c.enabled && c.provider_id == "openrouter"))
+            .map(|cs| {
+                cs.iter()
+                    .any(|c| c.enabled && c.provider_id == "openrouter")
+            })
             .unwrap_or(false);
         self.catalog
             .list_models_with_context(&locals, openrouter_connected)
@@ -261,9 +442,19 @@ impl GatewayRouter {
 
     /// Estimates worst-case paid `NanoUsd` before upstream dispatch for zero-race budget reservation.
     /// If the first healthy candidate is an OAuth subscription seat or local runtime, reserves `$0`.
-    pub fn estimate_preflight_budget(&self, requested_model: &str, est_input_tokens: u64, max_out: u64) -> Result<(u64, NanoUsd)> {
+    pub fn estimate_preflight_budget(
+        &self,
+        requested_model: &str,
+        est_input_tokens: u64,
+        max_out: u64,
+    ) -> Result<(u64, NanoUsd)> {
         let spec = ModelSpec::parse(requested_model);
         let route = self.db.get_model_route(&spec.base_model)?;
+        if route.as_ref().is_some_and(|r| r.blocked) {
+            return Err(QuixigateError::Forbidden(format!(
+                "model '{requested_model}' is currently blocked"
+            )));
+        }
         let creds = self.db.list_credentials()?;
         let settings = self.db.get_settings()?;
         let candidates = self.pool.resolve_candidates(
@@ -304,12 +495,19 @@ impl GatewayRouter {
         let settings = self.db.get_settings()?;
         guardrails::apply_request_guardrails(&mut req, &settings)?;
         let route = self.db.get_model_route(&spec.base_model)?;
+        if route.as_ref().is_some_and(|r| r.blocked) {
+            return Err(QuixigateError::Forbidden(format!(
+                "model '{}' is currently blocked",
+                req.requested_model
+            )));
+        }
 
         let use_cache = req
             .cache_preference
             .unwrap_or(settings.cache_enabled_default)
             && !spec.online;
-        let cache_key = use_cache.then(|| ResponseCache::compute_key(&cache_fingerprint(&spec, &req)));
+        let cache_key =
+            use_cache.then(|| ResponseCache::compute_key(&cache_fingerprint(&spec, &req)));
 
         if let Some(key) = &cache_key
             && let Some(hit) = self.cache.get(key).await
@@ -367,7 +565,9 @@ impl GatewayRouter {
             &settings,
         );
         if candidates.is_empty() {
-            return Err(QuixigateError::NoAvailableRoute(req.requested_model.clone()));
+            return Err(QuixigateError::NoAvailableRoute(
+                req.requested_model.clone(),
+            ));
         }
 
         let (all_tools, server_tools_map) = self
@@ -390,13 +590,8 @@ impl GatewayRouter {
             };
             let (mut model, auth_kind, cred_id) = prepared;
 
-            match run_non_streaming_steps(
-                &mut model,
-                &cand_req,
-                &cand_tools,
-                &cand_server_tools,
-            )
-            .await
+            match run_non_streaming_steps(&mut model, &cand_req, &cand_tools, &cand_server_tools)
+                .await
             {
                 Ok(step_out) => {
                     if let Some(cid) = &cred_id {
@@ -409,8 +604,9 @@ impl GatewayRouter {
                             "ollama" | "lmstudio" | "llamacpp" | "vllm" | "mlx"
                         )
                     {
-                        let tps = (duration_ms > 0)
-                            .then(|| (step_out.output_tokens as f64) / (duration_ms as f64 / 1000.0));
+                        let tps = (duration_ms > 0).then(|| {
+                            (step_out.output_tokens as f64) / (duration_ms as f64 / 1000.0)
+                        });
                         self.local_scanner
                             .record_performance(&cand.provider_id, None, tps);
                     }
@@ -505,12 +701,19 @@ impl GatewayRouter {
         let settings = self.db.get_settings()?;
         guardrails::apply_request_guardrails(&mut req, &settings)?;
         let route = self.db.get_model_route(&spec.base_model)?;
+        if route.as_ref().is_some_and(|r| r.blocked) {
+            return Err(QuixigateError::Forbidden(format!(
+                "model '{}' is currently blocked",
+                req.requested_model
+            )));
+        }
 
         let use_cache = req
             .cache_preference
             .unwrap_or(settings.cache_enabled_default)
             && !spec.online;
-        let cache_key = use_cache.then(|| ResponseCache::compute_key(&cache_fingerprint(&spec, &req)));
+        let cache_key =
+            use_cache.then(|| ResponseCache::compute_key(&cache_fingerprint(&spec, &req)));
 
         if let Some(key) = &cache_key
             && let Some(hit) = self.cache.get(key).await
@@ -600,7 +803,9 @@ impl GatewayRouter {
             &settings,
         );
         if candidates.is_empty() {
-            return Err(QuixigateError::NoAvailableRoute(req.requested_model.clone()));
+            return Err(QuixigateError::NoAvailableRoute(
+                req.requested_model.clone(),
+            ));
         }
 
         let (all_tools, server_tools_map) = self
@@ -699,6 +904,11 @@ impl GatewayRouter {
         let spec = ModelSpec::parse(requested_model);
         let settings = self.db.get_settings()?;
         let route = self.db.get_model_route(&spec.base_model)?;
+        if route.as_ref().is_some_and(|r| r.blocked) {
+            return Err(QuixigateError::Forbidden(format!(
+                "model '{requested_model}' is currently blocked"
+            )));
+        }
         let creds = self.db.list_credentials()?;
         let candidates = self.pool.resolve_candidates(
             &spec,
@@ -782,7 +992,8 @@ impl GatewayRouter {
             }
         }
 
-        Err(last_err.unwrap_or_else(|| QuixigateError::NoAvailableRoute(requested_model.to_owned())))
+        Err(last_err
+            .unwrap_or_else(|| QuixigateError::NoAvailableRoute(requested_model.to_owned())))
     }
 
     async fn prepare_tools(
@@ -930,7 +1141,10 @@ impl GatewayRouter {
 
         if let Some(cred) = &cand.credential {
             let (fresh_rec, secret) = self.refresher.ensure_fresh(&cred.id).await?;
-            let base = cand.base_url_override.clone().or(fresh_rec.base_url.clone());
+            let base = cand
+                .base_url_override
+                .clone()
+                .or(fresh_rec.base_url.clone());
             let model = instantiate_model(ModelBuildRequest {
                 provider_id: cand.provider_id.clone(),
                 model_name: cand.upstream_model.clone(),
@@ -987,9 +1201,11 @@ impl GatewayRouter {
         let explicit_tools_support = cat
             .as_ref()
             .and_then(|c| c.provider_supports_tools.get(&cand.provider_id).copied());
-        let explicit_reasoning_support = cat
-            .as_ref()
-            .and_then(|c| c.provider_supports_reasoning.get(&cand.provider_id).copied());
+        let explicit_reasoning_support = cat.as_ref().and_then(|c| {
+            c.provider_supports_reasoning
+                .get(&cand.provider_id)
+                .copied()
+        });
 
         let mut cand_req = req.clone();
         if cand.provider_id == "openrouter" && explicit_reasoning_support == Some(false) {
@@ -1037,7 +1253,10 @@ impl GatewayRouter {
             aisdk::Error::ApiError {
                 status_code,
                 details,
-            } => (status_code.map(|s| s.as_u16()).unwrap_or(502), details.clone()),
+            } => (
+                status_code.map(|s| s.as_u16()).unwrap_or(502),
+                details.clone(),
+            ),
             other => (502, other.to_string()),
         };
         QuixigateError::Upstream {
@@ -1225,7 +1444,8 @@ impl StreamDriver {
                     }
                 }
                 Some(Err(err)) => {
-                    self.ready.push_back(RoutedStreamEvent::Error(err.to_string()));
+                    self.ready
+                        .push_back(RoutedStreamEvent::Error(err.to_string()));
                     self.current_stream = None;
                     self.finish_all().await;
                 }
@@ -1245,19 +1465,22 @@ impl StreamDriver {
                         );
                         let ctx = ToolContext::new(opts);
                         for call in calls {
-                            self.conversation.push(Message::Assistant(AssistantMessage::new(
-                                LanguageModelResponseContentType::ToolCall(call.clone()),
-                                None,
-                            )));
-                            let out_str = if let Some(t) = self.server_tools_map.get(&call.tool.name)
-                            {
-                                t.execute
-                                    .call(ctx.clone(), call.input.clone())
-                                    .await
-                                    .unwrap_or_else(|e| json!({ "error": e.to_string() }).to_string())
-                            } else {
-                                "{}".to_owned()
-                            };
+                            self.conversation
+                                .push(Message::Assistant(AssistantMessage::new(
+                                    LanguageModelResponseContentType::ToolCall(call.clone()),
+                                    None,
+                                )));
+                            let out_str =
+                                if let Some(t) = self.server_tools_map.get(&call.tool.name) {
+                                    t.execute
+                                        .call(ctx.clone(), call.input.clone())
+                                        .await
+                                        .unwrap_or_else(|e| {
+                                            json!({ "error": e.to_string() }).to_string()
+                                        })
+                                } else {
+                                    "{}".to_owned()
+                                };
                             self.ready.push_back(RoutedStreamEvent::ServerToolResult {
                                 id: call.tool.id.clone(),
                                 name: call.tool.name.clone(),
@@ -1283,7 +1506,8 @@ impl StreamDriver {
                                 self.current_stream = Some(next_s);
                             }
                             Err(e) => {
-                                self.ready.push_back(RoutedStreamEvent::Error(e.to_string()));
+                                self.ready
+                                    .push_back(RoutedStreamEvent::Error(e.to_string()));
                                 self.finish_all().await;
                             }
                         }
@@ -1384,7 +1608,8 @@ impl StreamDriver {
                         if self.server_tools_map.contains_key(&tc.tool.name) {
                             self.pending_server_calls.push(tc);
                         } else {
-                            self.ready.push_back(RoutedStreamEvent::ToolCallReady(tc.clone()));
+                            self.ready
+                                .push_back(RoutedStreamEvent::ToolCallReady(tc.clone()));
                             self.client_tool_calls.push(tc);
                         }
                     }

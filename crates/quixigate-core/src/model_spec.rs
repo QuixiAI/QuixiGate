@@ -27,7 +27,9 @@ impl ModelSpec {
     pub fn parse(raw: &str) -> Self {
         let trimmed = raw.trim();
         let (before_pin, pinned_target) = match trimmed.rsplit_once('@') {
-            Some((left, right)) if !left.is_empty() && !right.is_empty() && !right.contains('/') => {
+            Some((left, right))
+                if !left.is_empty() && !right.is_empty() && !right.contains('/') =>
+            {
                 (left, Some(right.trim().to_owned()))
             }
             _ => (trimmed, None),
@@ -105,7 +107,10 @@ mod tests {
         assert!(spec.nitro);
         assert!(!spec.floor);
         assert!(!spec.free_only);
-        assert_eq!(spec.split_vendor(), (Some("anthropic"), "claude-sonnet-4-5"));
+        assert_eq!(
+            spec.split_vendor(),
+            (Some("anthropic"), "claude-sonnet-4-5")
+        );
     }
 
     #[test]

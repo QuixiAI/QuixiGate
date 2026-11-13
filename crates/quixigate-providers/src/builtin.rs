@@ -10,13 +10,11 @@ use aisdk::core::capabilities::{
     StructuredOutputSupport, TextInputSupport, TextOutputSupport, ToolCallSupport,
     VideoInputSupport, VideoOutputSupport,
 };
-use aisdk::core::language_model::{
-    LanguageModelOptions, LanguageModelResponse, ProviderStream,
-};
+use aisdk::core::language_model::{LanguageModelOptions, LanguageModelResponse, ProviderStream};
 use aisdk::core::{DynamicModel, LanguageModel, Tool};
 use async_trait::async_trait;
-use quixigate_core::{CredentialSecret, QuixigateError, Result};
 use parking_lot::Mutex;
+use quixigate_core::{CredentialSecret, QuixigateError, Result};
 use serde_json::{Value, json};
 
 #[cfg(feature = "subscription-oauth")]
@@ -143,7 +141,10 @@ impl LanguageModel for AnyLanguageModel {
         self.inner.generate_text_box(options).await
     }
 
-    async fn stream_text(&mut self, options: LanguageModelOptions) -> aisdk::Result<ProviderStream> {
+    async fn stream_text(
+        &mut self,
+        options: LanguageModelOptions,
+    ) -> aisdk::Result<ProviderStream> {
         self.inner.stream_text_box(options).await
     }
 }
@@ -625,24 +626,26 @@ pub async fn embed_texts(
     let mut req = http.post(&url).header("Content-Type", "application/json");
     if provider_id.eq_ignore_ascii_case("openrouter") {
         req = req
-            .header("HTTP-Referer", quixigate_core::brand::DEFAULT_OPENROUTER_APP_URL)
-            .header("X-Title", quixigate_core::brand::DEFAULT_OPENROUTER_APP_TITLE);
+            .header(
+                "HTTP-Referer",
+                quixigate_core::brand::DEFAULT_OPENROUTER_APP_URL,
+            )
+            .header(
+                "X-Title",
+                quixigate_core::brand::DEFAULT_OPENROUTER_APP_TITLE,
+            );
     }
     if let Some(k) = api_key.filter(|s| !s.trim().is_empty()) {
         req = req.bearer_auth(k);
     }
-    let resp = req
-        .json(&payload)
-        .send()
-        .await
-        .map_err(|e| {
-            let (st, why) = crate::describe_reqwest_error(&e);
-            QuixigateError::Upstream {
-                status: st.map(|s| s.as_u16()).unwrap_or(502),
-                provider: provider_id.to_owned(),
-                message: format!("embeddings request failed: {why}"),
-            }
-        })?;
+    let resp = req.json(&payload).send().await.map_err(|e| {
+        let (st, why) = crate::describe_reqwest_error(&e);
+        QuixigateError::Upstream {
+            status: st.map(|s| s.as_u16()).unwrap_or(502),
+            provider: provider_id.to_owned(),
+            message: format!("embeddings request failed: {why}"),
+        }
+    })?;
     let status = resp.status();
     let val: Value = resp.json().await.unwrap_or_default();
     if !status.is_success() {

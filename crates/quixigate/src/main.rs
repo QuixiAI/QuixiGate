@@ -12,12 +12,12 @@ use std::time::Duration;
 use anyhow::{Context, bail};
 use clap::{Parser, Subcommand};
 use directories::BaseDirs;
+#[cfg(feature = "subscription-oauth")]
+use quixigate_auth::providers::validate_anthropic_setup_token;
 use quixigate_auth::providers::{
     OPENROUTER_OIDC_TOKEN_URL, exchange_openrouter_oidc_token, inspect_openrouter_account,
     openrouter_base_url_for_region,
 };
-#[cfg(feature = "subscription-oauth")]
-use quixigate_auth::providers::validate_anthropic_setup_token;
 use quixigate_auth::quota::{QuotaEndpoints, poll_and_save_quota};
 use quixigate_auth::refresh::CredentialRefresher;
 use quixigate_auth::{OAuthWizardManager, StartOAuthRequest, WizardStatus};
@@ -67,7 +67,11 @@ enum Commands {
         #[arg(long)]
         no_trust_containers: bool,
         /// Additional CIDR/IP ranges permitted without an API key when `--require-auth` is not set (e.g. `100.64.0.0/10`).
-        #[arg(long = "trusted-cidr", value_delimiter = ',', env = "QUIXIGATE_TRUSTED_CIDRS")]
+        #[arg(
+            long = "trusted-cidr",
+            value_delimiter = ',',
+            env = "QUIXIGATE_TRUSTED_CIDRS"
+        )]
         trusted_cidrs: Vec<String>,
         /// Master Key for remote & admin management (falls back to `LITELLM_MASTER_KEY`; auto-generated and printed to stdout if unset).
         #[arg(long, env = "QUIXIGATE_MASTER_KEY")]
@@ -354,8 +358,8 @@ fn assemble_gateway_state(
     }
     let telemetry = TelemetryHub::new();
     let quota_endpoints = build_quota_endpoints();
-    let wizard =
-        OAuthWizardManager::new(db.clone(), refresher).with_quota_endpoints(quota_endpoints.clone());
+    let wizard = OAuthWizardManager::new(db.clone(), refresher)
+        .with_quota_endpoints(quota_endpoints.clone());
     AppState::new(db, router, telemetry, wizard, bound_loopback)
         .with_quota_endpoints(quota_endpoints)
 }
@@ -464,9 +468,15 @@ async fn main() -> anyhow::Result<()> {
             key,
             args,
         } => {
-            let code =
-                cmd_run(&data_dir, &agent, &gateway, model.as_deref(), key.as_deref(), &args)
-                    .await?;
+            let code = cmd_run(
+                &data_dir,
+                &agent,
+                &gateway,
+                model.as_deref(),
+                key.as_deref(),
+                &args,
+            )
+            .await?;
             if code != 0 {
                 std::process::exit(code);
             }
@@ -529,7 +539,10 @@ fn resolve_ui_override(cli_ui: bool, cli_no_ui: bool) -> Option<bool> {
 }
 
 fn resolve_master_key(cli_or_quixigate_env: Option<&str>) -> (String, bool) {
-    if let Some(k) = cli_or_quixigate_env.map(str::trim).filter(|k| !k.is_empty()) {
+    if let Some(k) = cli_or_quixigate_env
+        .map(str::trim)
+        .filter(|k| !k.is_empty())
+    {
         return (k.to_owned(), false);
     }
     if let Ok(litellm_key) = std::env::var("LITELLM_MASTER_KEY") {
@@ -569,7 +582,11 @@ async fn cmd_serve(
             settings.trust_local_containers = false;
             changed = true;
         }
-        for cidr in trusted_cidrs.iter().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        for cidr in trusted_cidrs
+            .iter()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+        {
             if !settings.trusted_cidrs.iter().any(|c| c == cidr) {
                 settings.trusted_cidrs.push(cidr.to_owned());
                 changed = true;
@@ -605,7 +622,10 @@ async fn cmd_serve(
     // If OpenRouter is connected, hydrate live `/models` pricing & `@preset/*` presets on boot.
     if db
         .list_credentials()
-        .map(|cs| cs.iter().any(|c| c.enabled && c.provider_id == "openrouter"))
+        .map(|cs| {
+            cs.iter()
+                .any(|c| c.enabled && c.provider_id == "openrouter")
+        })
         .unwrap_or(false)
     {
         let boot_state = state.clone();
@@ -914,14 +934,14 @@ async fn login_openrouter(db: Database, mut opts: LoginOptions) -> anyhow::Resul
             .await?;
             let refresher = CredentialRefresher::new(db.clone());
             let _ = poll_and_save_quota(&db, &refresher, &cred.id, &build_quota_endpoints()).await;
-            let bearer = db
-                .get_credential_with_secret(&cred.id)
-                .ok()
-                .and_then(|(_, sec)| match sec {
-                    CredentialSecret::ApiKey { key } => Some(key),
-                    CredentialSecret::OpenRouterOidc { access, .. } => Some(access),
-                    _ => None,
-                });
+            let bearer =
+                db.get_credential_with_secret(&cred.id)
+                    .ok()
+                    .and_then(|(_, sec)| match sec {
+                        CredentialSecret::ApiKey { key } => Some(key),
+                        CredentialSecret::OpenRouterOidc { access, .. } => Some(access),
+                        _ => None,
+                    });
             let (model_cnt, preset_cnt) = catalog
                 .sync_openrouter(&http, &effective_base_url, bearer.as_deref())
                 .await
@@ -961,16 +981,13 @@ async fn login_openrouter(db: Database, mut opts: LoginOptions) -> anyhow::Resul
                 bail!("OpenRouter API key cannot be empty");
             }
             let account = inspect_openrouter_account(&http, &effective_base_url, &raw_key).await?;
-            let lbl = opts
-                .label
-                .or(account.key_label.clone())
-                .unwrap_or_else(|| {
-                    if mode == "env" {
-                        "OpenRouter (Env Key)".to_owned()
-                    } else {
-                        "OpenRouter (API Key)".to_owned()
-                    }
-                });
+            let lbl = opts.label.or(account.key_label.clone()).unwrap_or_else(|| {
+                if mode == "env" {
+                    "OpenRouter (Env Key)".to_owned()
+                } else {
+                    "OpenRouter (API Key)".to_owned()
+                }
+            });
             let rec = db.upsert_credential(
                 None,
                 "openrouter",
@@ -1036,11 +1053,10 @@ async fn login_openrouter(db: Database, mut opts: LoginOptions) -> anyhow::Resul
             let policy = match opts.federation_policy_id.clone() {
                 Some(p) => Some(p),
                 None if opts.oidc_token.is_none() && opts.oidc_token_env.is_none() => {
-                    let entered = inquire::Text::new(
-                        "Federation Policy ID (optional, press Enter to skip):",
-                    )
-                    .prompt()
-                    .unwrap_or_default();
+                    let entered =
+                        inquire::Text::new("Federation Policy ID (optional, press Enter to skip):")
+                            .prompt()
+                            .unwrap_or_default();
                     (!entered.trim().is_empty()).then(|| entered.trim().to_owned())
                 }
                 None => None,
@@ -1102,7 +1118,8 @@ async fn cmd_login(db: Database, mut opts: LoginOptions) -> anyhow::Result<()> {
     let raw_provider = match opts.provider.take() {
         Some(p) if !p.trim().is_empty() => p,
         _ => {
-            let local_pillar = "Local Runtime (llama.cpp, Ollama, LM Studio, MLX, vLLM — $0 local inference)";
+            let local_pillar =
+                "Local Runtime (llama.cpp, Ollama, LM Studio, MLX, vLLM — $0 local inference)";
             #[cfg(feature = "subscription-oauth")]
             let oauth_pillar: Option<&str> = Some(
                 "OAuth Subscription (ChatGPT/Codex, Claude Setup Token, Gemini CLI, Copilot, Grok, Qwen, MiniMax, Chutes)",
@@ -1110,21 +1127,23 @@ async fn cmd_login(db: Database, mut opts: LoginOptions) -> anyhow::Result<()> {
             #[cfg(not(feature = "subscription-oauth"))]
             let oauth_pillar: Option<&str> = None;
             let or_pillar = "OpenRouter (Browser PKCE, OIDC Workload Identity, API Key, or OPENROUTER_API_KEY env)";
-            let direct_pillar = "Direct Cloud API Key (OpenAI, Anthropic, Google, xAI, DeepSeek, Groq, ...)";
+            let direct_pillar =
+                "Direct Cloud API Key (OpenAI, Anthropic, Google, xAI, DeepSeek, Groq, ...)";
             let mut pillars: Vec<&str> = vec![local_pillar];
             if let Some(op) = oauth_pillar {
                 pillars.push(op);
             }
             pillars.push(or_pillar);
             pillars.push(direct_pillar);
-            let chosen = inquire::Select::new(
-                "Choose a provider pillar to connect to QuixiGate:",
-                pillars,
-            )
-            .prompt()?;
+            let chosen =
+                inquire::Select::new("Choose a provider pillar to connect to QuixiGate:", pillars)
+                    .prompt()?;
             if chosen == local_pillar {
                 let runtimes = [
-                    ("llamacpp", "llama.cpp Server (default http://127.0.0.1:8080)"),
+                    (
+                        "llamacpp",
+                        "llama.cpp Server (default http://127.0.0.1:8080)",
+                    ),
                     ("ollama", "Ollama (default http://127.0.0.1:11434)"),
                     ("lmstudio", "LM Studio (default http://127.0.0.1:1234)"),
                     ("mlx", "Apple MLX Server (default http://127.0.0.1:8081)"),
@@ -1147,11 +1166,12 @@ async fn cmd_login(db: Database, mut opts: LoginOptions) -> anyhow::Result<()> {
                     }
                 }
                 if opts.api_key.is_none() {
-                    let maybe_key =
-                        inquire::Password::new("Optional --api-key (press Enter if unauthenticated):")
-                            .without_confirmation()
-                            .prompt()
-                            .unwrap_or_default();
+                    let maybe_key = inquire::Password::new(
+                        "Optional --api-key (press Enter if unauthenticated):",
+                    )
+                    .without_confirmation()
+                    .prompt()
+                    .unwrap_or_default();
                     if !maybe_key.trim().is_empty() {
                         opts.api_key = Some(maybe_key.trim().to_owned());
                     } else {
@@ -1178,7 +1198,10 @@ async fn cmd_login(db: Database, mut opts: LoginOptions) -> anyhow::Result<()> {
                 #[cfg(feature = "subscription-oauth")]
                 {
                     let subs = [
-                        ("openai-codex", "ChatGPT Plus / Pro / Codex (PKCE / Device Code)"),
+                        (
+                            "openai-codex",
+                            "ChatGPT Plus / Pro / Codex (PKCE / Device Code)",
+                        ),
                         ("anthropic-token", "Claude Pro / Max (claude setup-token)"),
                         ("google-gemini-cli", "Google Gemini CLI / Code Assist"),
                         ("github-copilot", "GitHub Copilot (Device Code)"),
@@ -1202,8 +1225,10 @@ async fn cmd_login(db: Database, mut opts: LoginOptions) -> anyhow::Result<()> {
             } else if chosen == or_pillar {
                 "openrouter".to_owned()
             } else {
-                let p = inquire::Text::new("Provider ID (e.g. openai, anthropic, google, groq, deepseek):")
-                    .prompt()?;
+                let p = inquire::Text::new(
+                    "Provider ID (e.g. openai, anthropic, google, groq, deepseek):",
+                )
+                .prompt()?;
                 if opts.api_key.is_none() && !opts.from_env {
                     let entered = inquire::Password::new("Paste API key:")
                         .without_confirmation()
@@ -1245,7 +1270,9 @@ async fn cmd_login(db: Database, mut opts: LoginOptions) -> anyhow::Result<()> {
     }
 
     if let Some(raw_key) = opts.api_key {
-        let lbl = opts.label.unwrap_or_else(|| format!("{provider_id} API key"));
+        let lbl = opts
+            .label
+            .unwrap_or_else(|| format!("{provider_id} API key"));
         let default_prio = if is_local_prov { 50 } else { 200 };
         let rec = db.upsert_credential(
             None,
@@ -1270,7 +1297,9 @@ async fn cmd_login(db: Database, mut opts: LoginOptions) -> anyhow::Result<()> {
     if provider_id == "anthropic-token" || opts.setup_token.is_some() {
         #[cfg(not(feature = "subscription-oauth"))]
         {
-            bail!("Consumer subscription OAuth ('anthropic-token') is disabled in this build (compiled without `subscription-oauth`)");
+            bail!(
+                "Consumer subscription OAuth ('anthropic-token') is disabled in this build (compiled without `subscription-oauth`)"
+            );
         }
         #[cfg(feature = "subscription-oauth")]
         {
@@ -1281,7 +1310,9 @@ async fn cmd_login(db: Database, mut opts: LoginOptions) -> anyhow::Result<()> {
                     .prompt()?,
             };
             let secret = validate_anthropic_setup_token(&tok)?;
-            let lbl = opts.label.unwrap_or_else(|| "Claude Setup Token".to_owned());
+            let lbl = opts
+                .label
+                .unwrap_or_else(|| "Claude Setup Token".to_owned());
             let rec = db.upsert_credential(
                 None,
                 "anthropic-token",
@@ -1362,7 +1393,10 @@ async fn cmd_status(data_dir: &Path, vault: &Vault, db: &Database) -> anyhow::Re
         } else {
             "offline".to_owned()
         };
-        println!("  {:<18} {:<30} {}", rt.display_name, rt.base_url, state_str);
+        println!(
+            "  {:<18} {:<30} {}",
+            rt.display_name, rt.base_url, state_str
+        );
     }
 
     let oauth_seats: Vec<_> = creds
@@ -1371,7 +1405,9 @@ async fn cmd_status(data_dir: &Path, vault: &Vault, db: &Database) -> anyhow::Re
         .collect();
     println!("\n2. OAuth Subscriptions ({}):", oauth_seats.len());
     if oauth_seats.is_empty() {
-        println!("  (none configured — run `quixigate login` to add ChatGPT/Claude/Gemini/Copilot)");
+        println!(
+            "  (none configured — run `quixigate login` to add ChatGPT/Claude/Gemini/Copilot)"
+        );
     } else {
         for c in &oauth_seats {
             let quotas = c
@@ -1399,7 +1435,9 @@ async fn cmd_status(data_dir: &Path, vault: &Vault, db: &Database) -> anyhow::Re
         .collect();
     println!("\n3. OpenRouter ({}):", openrouter_seats.len());
     if openrouter_seats.is_empty() {
-        println!("  (not connected — optional; run `quixigate login openrouter` for PKCE / OIDC / API key)");
+        println!(
+            "  (not connected — optional; run `quixigate login openrouter` for PKCE / OIDC / API key)"
+        );
     } else {
         for c in &openrouter_seats {
             let credits = c
@@ -1418,7 +1456,11 @@ async fn cmd_status(data_dir: &Path, vault: &Vault, db: &Database) -> anyhow::Re
                 .unwrap_or_else(|| "active".to_owned());
             println!(
                 "  #{:<3} {:<24} {:<18} [{:?}] {}",
-                c.priority, c.label, c.auth_kind.as_str(), c.status, credits
+                c.priority,
+                c.label,
+                c.auth_kind.as_str(),
+                c.status,
+                credits
             );
         }
     }
@@ -1428,7 +1470,10 @@ async fn cmd_status(data_dir: &Path, vault: &Vault, db: &Database) -> anyhow::Re
         .filter(|c| c.provider_id != "openrouter" && !c.auth_kind.is_zero_marginal_cost())
         .collect();
     if !direct_api_seats.is_empty() {
-        println!("\nDirect Cloud & Custom Seats ({}):", direct_api_seats.len());
+        println!(
+            "\nDirect Cloud & Custom Seats ({}):",
+            direct_api_seats.len()
+        );
         for c in &direct_api_seats {
             println!(
                 "  #{:<3} {:<24} {:<18} [{:?}]",
@@ -1603,7 +1648,9 @@ async fn cmd_models(
                 .as_deref()
                 .filter(|u| !u.trim().is_empty())
                 .unwrap_or(openrouter_base_url_for_region(None));
-            let _ = catalog.sync_openrouter(&http, base, bearer.as_deref()).await;
+            let _ = catalog
+                .sync_openrouter(&http, base, bearer.as_deref())
+                .await;
         }
     }
 
@@ -1622,7 +1669,11 @@ async fn cmd_models(
     let base_count = routable_models.len().saturating_sub(preset_count);
     println!(
         "Catalog Summary: {base_count} models · {preset_count} @presets{}",
-        if all { " (full reference catalog)" } else { " (routable across active seats & local runtimes)" }
+        if all {
+            " (full reference catalog)"
+        } else {
+            " (routable across active seats & local runtimes)"
+        }
     );
 
     if !routes.is_empty() {
@@ -1796,13 +1847,13 @@ fn cmd_config(db: &Database, action: ConfigAction) -> anyhow::Result<()> {
         ConfigAction::Import { path, format } => {
             let raw = std::fs::read_to_string(&path)
                 .with_context(|| format!("cannot read {}", path.display()))?;
-            let ext_fmt = format.or_else(|| {
-                path.extension()
-                    .and_then(|e| e.to_str())
-                    .map(str::to_owned)
-            });
+            let ext_fmt =
+                format.or_else(|| path.extension().and_then(|e| e.to_str()).map(str::to_owned));
             let count = db.import_config(&raw, ext_fmt.as_deref())?;
-            println!("Imported {count} configuration items from {}.", path.display());
+            println!(
+                "Imported {count} configuration items from {}.",
+                path.display()
+            );
         }
     }
     Ok(())
@@ -1818,7 +1869,10 @@ async fn cmd_doctor(data_dir: &Path, port: u16) -> anyhow::Result<()> {
     if roundtrip.as_slice() != b"quixigate-doctor-check" {
         bail!("Vault AEAD self-test failed!");
     }
-    println!("  [OK] Vault AES-256-GCM AEAD round-trip verified ({})", vault.source().as_str());
+    println!(
+        "  [OK] Vault AES-256-GCM AEAD round-trip verified ({})",
+        vault.source().as_str()
+    );
 
     #[cfg(unix)]
     {
@@ -1906,7 +1960,10 @@ async fn cmd_burst(db: &Database, action: BurstAction, gateway_url: &str) -> any
         "{} Cloud Burst: {state_label}",
         quixigate_core::brand::BRAND_NAME
     );
-    println!("  Burst Fallback Model : {}", settings.openrouter_burst_model);
+    println!(
+        "  Burst Fallback Model : {}",
+        settings.openrouter_burst_model
+    );
     println!("  OpenRouter Seats     : {or_seats} connected");
     println!(
         "  Attribution Headers  : X-Title: {} | HTTP-Referer: {}",

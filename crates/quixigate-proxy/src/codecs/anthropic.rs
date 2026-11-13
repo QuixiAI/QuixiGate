@@ -24,12 +24,17 @@ use crate::auth::authenticate_inference;
 use crate::codecs::common::*;
 use crate::state::{ApiError, ApiResult, AppState};
 
-fn parse_anthropic_canonical(body: &Value, headers: &HeaderMap) -> quixigate_core::Result<CanonicalRequest> {
+fn parse_anthropic_canonical(
+    body: &Value,
+    headers: &HeaderMap,
+) -> quixigate_core::Result<CanonicalRequest> {
     let requested_model = body["model"]
         .as_str()
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .ok_or_else(|| QuixigateError::Validation("missing 'model' in Anthropic request".to_owned()))?
+        .ok_or_else(|| {
+            QuixigateError::Validation("missing 'model' in Anthropic request".to_owned())
+        })?
         .to_owned();
 
     let system = match &body["system"] {
@@ -109,9 +114,8 @@ fn parse_anthropic_canonical(body: &Value, headers: &HeaderMap) -> quixigate_cor
                     match b["type"].as_str() {
                         Some("tool_result") => {
                             if !user_text.is_empty() {
-                                messages.push(Message::User(UserMessage::new(
-                                    user_text.join("\n"),
-                                )));
+                                messages
+                                    .push(Message::User(UserMessage::new(user_text.join("\n"))));
                                 user_text.clear();
                             }
                             let id = b["tool_use_id"].as_str().unwrap_or("toolu_1").to_owned();
@@ -303,7 +307,13 @@ pub async fn handle_messages(
                 let oi_tools = gen_out
                     .tool_calls
                     .iter()
-                    .map(|tc| (tc.tool.id.clone(), tc.tool.name.clone(), tc.input.to_string()))
+                    .map(|tc| {
+                        (
+                            tc.tool.id.clone(),
+                            tc.tool.name.clone(),
+                            tc.input.to_string(),
+                        )
+                    })
                     .collect();
 
                 finalize_request_accounting(
@@ -462,18 +472,19 @@ pub async fn handle_messages(
             let mut completed_summary = None;
             let mut stream_err = None;
 
-            let close_open = |tx: &tokio::sync::mpsc::Sender<std::result::Result<Event, Infallible>>,
-                              idx: usize| {
-                let stop = json!({ "type": "content_block_stop", "index": idx });
-                let tx = tx.clone();
-                async move {
-                    let _ = tx
-                        .send(Ok(Event::default()
-                            .event("content_block_stop")
-                            .data(stop.to_string())))
-                        .await;
-                }
-            };
+            let close_open =
+                |tx: &tokio::sync::mpsc::Sender<std::result::Result<Event, Infallible>>,
+                 idx: usize| {
+                    let stop = json!({ "type": "content_block_stop", "index": idx });
+                    let tx = tx.clone();
+                    async move {
+                        let _ = tx
+                            .send(Ok(Event::default()
+                                .event("content_block_stop")
+                                .data(stop.to_string())))
+                            .await;
+                    }
+                };
 
             while let Some(ev) = events.next().await {
                 match ev {
@@ -657,9 +668,7 @@ pub async fn handle_messages(
                             "error": { "type": "api_error", "message": err_msg }
                         });
                         let _ = tx
-                            .send(Ok(Event::default()
-                                .event("error")
-                                .data(err_ev.to_string())))
+                            .send(Ok(Event::default().event("error").data(err_ev.to_string())))
                             .await;
                         break;
                     }
@@ -672,7 +681,13 @@ pub async fn handle_messages(
                 let oi_tools = sum
                     .tool_calls
                     .iter()
-                    .map(|tc| (tc.tool.id.clone(), tc.tool.name.clone(), tc.input.to_string()))
+                    .map(|tc| {
+                        (
+                            tc.tool.id.clone(),
+                            tc.tool.name.clone(),
+                            tc.input.to_string(),
+                        )
+                    })
                     .collect();
                 finalize_request_accounting(
                     &state_bg,

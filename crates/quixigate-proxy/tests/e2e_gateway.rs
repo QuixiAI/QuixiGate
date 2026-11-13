@@ -17,6 +17,8 @@ use axum::{Json, Router};
 use futures::{SinkExt, StreamExt};
 use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
 use opentelemetry_proto::tonic::common::v1::any_value;
+use parking_lot::Mutex;
+use prost::Message as ProstMessage;
 use quixigate_auth::OAuthWizardManager;
 use quixigate_auth::quota::QuotaEndpoints;
 use quixigate_auth::refresh::{CredentialRefresher, RefreshEndpoints};
@@ -29,8 +31,6 @@ use quixigate_router::GatewayRouter;
 use quixigate_router::catalog::ModelCatalog;
 use quixigate_telemetry::TelemetryHub;
 use quixigate_vault::Vault;
-use parking_lot::Mutex;
-use prost::Message as ProstMessage;
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use tokio::net::TcpListener;
@@ -84,8 +84,8 @@ async fn spawn_test_gateway(
         router = router.with_web_search_url(format!("{}/search", u.trim_end_matches("/v1")));
     }
     let telemetry = TelemetryHub::new();
-    let wizard =
-        OAuthWizardManager::new(db.clone(), refresher).with_quota_endpoints(quota_endpoints.clone());
+    let wizard = OAuthWizardManager::new(db.clone(), refresher)
+        .with_quota_endpoints(quota_endpoints.clone());
     let state = AppState::new(db.clone(), router, telemetry, wizard, true)
         .with_quota_endpoints(quota_endpoints);
 
@@ -113,91 +113,93 @@ async fn e2e_all_ingress_protocols_and_websockets() {
     // Pure-Rust mock upstream speaking OpenAI Chat Completions (JSON + SSE + tool calls),
     // Anthropic Messages (JSON + SSE), Embeddings, and Ollama discovery.
     let chat_handler = |Json(body): Json<Value>| async move {
-                let stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
-                let has_tools = body
-                    .get("tools")
-                    .and_then(Value::as_array)
-                    .map(|a| !a.is_empty())
-                    .unwrap_or(false);
+        let stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
+        let has_tools = body
+            .get("tools")
+            .and_then(Value::as_array)
+            .map(|a| !a.is_empty())
+            .unwrap_or(false);
 
-                if has_tools && !stream {
-                    return Json(json!({
-                        "id": "chatcmpl-tool-1",
-                        "object": "chat.completion",
-                        "created": 1735689600,
-                        "model": "gpt-5",
-                        "choices": [{
-                            "index": 0,
-                            "message": {
-                                "role": "assistant",
-                                "content": null,
-                                "tool_calls": [{
-                                    "id": "call_weather_1",
-                                    "type": "function",
-                                    "function": {
-                                        "name": "get_weather",
-                                        "arguments": "{\"city\":\"San Francisco\"}"
-                                    }
-                                }]
-                            },
-                            "finish_reason": "tool_calls"
-                        }],
-                        "usage": { "prompt_tokens": 20, "completion_tokens": 12, "total_tokens": 32 }
-                    }))
+        if has_tools && !stream {
+            return Json(json!({
+                "id": "chatcmpl-tool-1",
+                "object": "chat.completion",
+                "created": 1735689600,
+                "model": "gpt-5",
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": null,
+                        "tool_calls": [{
+                            "id": "call_weather_1",
+                            "type": "function",
+                            "function": {
+                                "name": "get_weather",
+                                "arguments": "{\"city\":\"San Francisco\"}"
+                            }
+                        }]
+                    },
+                    "finish_reason": "tool_calls"
+                }],
+                "usage": { "prompt_tokens": 20, "completion_tokens": 12, "total_tokens": 32 }
+            }))
+            .into_response();
+        }
+
+        if stream {
+            let has_tool_result = body["messages"]
+                .as_array()
+                .map(|arr| arr.iter().any(|m| m["role"].as_str() == Some("tool")))
+                .unwrap_or(false);
+            let offered_online = body["tools"]
+                .as_array()
+                .map(|arr| {
+                    arr.iter()
+                        .any(|t| t["function"]["name"].as_str() == Some("quixigate_web_search"))
+                })
+                .unwrap_or(false);
+            if offered_online && !has_tool_result {
+                let tool_sse = concat!(
+                    "data: {\"id\":\"c_tool\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt-5\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"tool_calls\":[{\"index\":0,\"id\":\"call_ws_1\",\"type\":\"function\",\"function\":{\"name\":\"quixigate_web_search\",\"arguments\":\"{\\\"query\\\":\\\"quixigate\\\"}\"}}]},\"finish_reason\":null}]}\n\n",
+                    "data: {\"id\":\"c_tool\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt-5\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":18,\"completion_tokens\":9,\"total_tokens\":27}}\n\n",
+                    "data: [DONE]\n\n"
+                );
+                return (
+                    StatusCode::OK,
+                    [("content-type", "text/event-stream")],
+                    tool_sse,
+                )
                     .into_response();
-                }
+            }
+            let sse = concat!(
+                "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt-5\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"reasoning_content\":\"Thinking step.\"},\"finish_reason\":null}]}\n\n",
+                "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt-5\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello \"},\"finish_reason\":null}]}\n\n",
+                "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt-5\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Polyglot!\"},\"finish_reason\":null}]}\n\n",
+                "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt-5\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":15,\"completion_tokens\":8,\"total_tokens\":23}}\n\n",
+                "data: [DONE]\n\n"
+            );
+            return (StatusCode::OK, [("content-type", "text/event-stream")], sse).into_response();
+        }
 
-                if stream {
-                    let has_tool_result = body["messages"]
-                        .as_array()
-                        .map(|arr| arr.iter().any(|m| m["role"].as_str() == Some("tool")))
-                        .unwrap_or(false);
-                    let offered_online = body["tools"]
-                        .as_array()
-                        .map(|arr| {
-                            arr.iter().any(|t| {
-                                t["function"]["name"].as_str() == Some("quixigate_web_search")
-                            })
-                        })
-                        .unwrap_or(false);
-                    if offered_online && !has_tool_result {
-                        let tool_sse = concat!(
-                            "data: {\"id\":\"c_tool\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt-5\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"tool_calls\":[{\"index\":0,\"id\":\"call_ws_1\",\"type\":\"function\",\"function\":{\"name\":\"quixigate_web_search\",\"arguments\":\"{\\\"query\\\":\\\"quixigate\\\"}\"}}]},\"finish_reason\":null}]}\n\n",
-                            "data: {\"id\":\"c_tool\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt-5\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":18,\"completion_tokens\":9,\"total_tokens\":27}}\n\n",
-                            "data: [DONE]\n\n"
-                        );
-                        return (StatusCode::OK, [("content-type", "text/event-stream")], tool_sse)
-                            .into_response();
-                    }
-                    let sse = concat!(
-                        "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt-5\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"reasoning_content\":\"Thinking step.\"},\"finish_reason\":null}]}\n\n",
-                        "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt-5\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello \"},\"finish_reason\":null}]}\n\n",
-                        "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt-5\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Polyglot!\"},\"finish_reason\":null}]}\n\n",
-                        "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"gpt-5\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":15,\"completion_tokens\":8,\"total_tokens\":23}}\n\n",
-                        "data: [DONE]\n\n"
-                    );
-                    return (StatusCode::OK, [("content-type", "text/event-stream")], sse)
-                        .into_response();
-                }
-
-                Json(json!({
-                    "id": "chatcmpl-1",
-                    "object": "chat.completion",
-                    "created": 1735689600,
-                    "model": "gpt-5",
-                    "choices": [{
-                        "index": 0,
-                        "message": {
-                            "role": "assistant",
-                            "reasoning_content": "Quick check.",
-                            "content": "Hello Polyglot!"
-                        },
-                        "finish_reason": "stop"
-                    }],
-                    "usage": { "prompt_tokens": 14, "completion_tokens": 6, "total_tokens": 20 }
-                }))
-                .into_response()
-            };
+        Json(json!({
+            "id": "chatcmpl-1",
+            "object": "chat.completion",
+            "created": 1735689600,
+            "model": "gpt-5",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "reasoning_content": "Quick check.",
+                    "content": "Hello Polyglot!"
+                },
+                "finish_reason": "stop"
+            }],
+            "usage": { "prompt_tokens": 14, "completion_tokens": 6, "total_tokens": 20 }
+        }))
+        .into_response()
+    };
 
     let upstream = Router::new()
         .route("/v1/chat/completions", post(chat_handler))
@@ -350,10 +352,9 @@ async fn e2e_all_ingress_protocols_and_websockets() {
     assert!(resp_sse.contains("response.completed"));
 
     // 4. OpenAI `/v1/responses` WebSocket (`GET /v1/responses`)
-    let (mut ws, _) =
-        tokio_tungstenite::connect_async(format!("{}/v1/responses", gw.ws_url))
-            .await
-            .unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("{}/v1/responses", gw.ws_url))
+        .await
+        .unwrap();
     ws.send(WsMessage::Text(
         json!({
             "type": "response.create",
@@ -382,7 +383,10 @@ async fn e2e_all_ingress_protocols_and_websockets() {
             }
         }
     }
-    assert!(saw_delta && saw_completed, "WebSocket /v1/responses did not complete");
+    assert!(
+        saw_delta && saw_completed,
+        "WebSocket /v1/responses did not complete"
+    );
 
     // 5. Anthropic `/v1/messages` (SSE) & `/v1/messages/count_tokens`
     let ant_sse = http
@@ -774,19 +778,19 @@ async fn e2e_nanousd_budgets_rate_limits_cache_key_rotation_auth_and_openinferen
     let spans_sink = captured_spans.clone();
 
     let paid_chat = || async {
-                Json(json!({
-                    "id": "chatcmpl-paid",
-                    "object": "chat.completion",
-                    "created": 1735689600,
-                    "model": "gpt-5",
-                    "choices": [{
-                        "index": 0,
-                        "message": { "role": "assistant", "content": "Paid completion OK" },
-                        "finish_reason": "stop"
-                    }],
-                    "usage": { "prompt_tokens": 1000, "completion_tokens": 1000, "total_tokens": 2000 }
-                }))
-            };
+        Json(json!({
+            "id": "chatcmpl-paid",
+            "object": "chat.completion",
+            "created": 1735689600,
+            "model": "gpt-5",
+            "choices": [{
+                "index": 0,
+                "message": { "role": "assistant", "content": "Paid completion OK" },
+                "finish_reason": "stop"
+            }],
+            "usage": { "prompt_tokens": 1000, "completion_tokens": 1000, "total_tokens": 2000 }
+        }))
+    };
     let upstream = Router::new()
         .route("/v1/chat/completions", post(paid_chat))
         .route("/chat/completions", post(paid_chat))
@@ -884,7 +888,10 @@ async fn e2e_nanousd_budgets_rate_limits_cache_key_rotation_auth_and_openinferen
 
     // 3. Configure Arize Phoenix OTLP preset + enable response cache via Admin REST API
     let preset_res = http
-        .post(format!("{}/api/admin/telemetry/phoenix-preset", gw.base_url))
+        .post(format!(
+            "{}/api/admin/telemetry/phoenix-preset",
+            gw.base_url
+        ))
         .header("cookie", &cookie_pair)
         .json(&json!({
             "phoenix_ui_url": upstream_url,
@@ -948,7 +955,11 @@ async fn e2e_nanousd_budgets_rate_limits_cache_key_rotation_auth_and_openinferen
         .unwrap();
     assert_eq!(r1.status(), StatusCode::OK);
     assert_eq!(
-        r1.headers().get("x-quixigate-cache").unwrap().to_str().unwrap(),
+        r1.headers()
+            .get("x-quixigate-cache")
+            .unwrap()
+            .to_str()
+            .unwrap(),
         "MISS"
     );
 
@@ -966,7 +977,11 @@ async fn e2e_nanousd_budgets_rate_limits_cache_key_rotation_auth_and_openinferen
         .unwrap();
     assert_eq!(r2.status(), StatusCode::OK);
     assert_eq!(
-        r2.headers().get("x-quixigate-cache").unwrap().to_str().unwrap(),
+        r2.headers()
+            .get("x-quixigate-cache")
+            .unwrap()
+            .to_str()
+            .unwrap(),
         "HIT"
     );
 
@@ -1053,10 +1068,7 @@ async fn e2e_llamacpp_server_router_and_instance_discovery_aliases_load_control_
     let captured_sink = captured_bodies.clone();
 
     let check_llama_auth = |headers: &HeaderMap| -> bool {
-        headers
-            .get("authorization")
-            .and_then(|v| v.to_str().ok())
-            == Some("Bearer llama-key-99")
+        headers.get("authorization").and_then(|v| v.to_str().ok()) == Some("Bearer llama-key-99")
     };
 
     let llama_server = Router::new()
@@ -1292,7 +1304,10 @@ async fn e2e_llamacpp_server_router_and_instance_discovery_aliases_load_control_
 
     // 4. Test Router load / unload endpoints via `/api/admin/local-runtimes/llamacpp/{load,unload}`
     let after_load: Vec<Value> = http
-        .post(format!("{}/api/admin/local-runtimes/llamacpp/load", gw.base_url))
+        .post(format!(
+            "{}/api/admin/local-runtimes/llamacpp/load",
+            gw.base_url
+        ))
         .json(&json!({ "model": "nomic-embed-text-v1.5.Q8_0.gguf" }))
         .send()
         .await
@@ -1361,7 +1376,10 @@ async fn e2e_llamacpp_server_router_and_instance_discovery_aliases_load_control_
         .unwrap();
     assert!(equiv_nanos > 0, "local savings equivalent must be tracked");
     let chat_json: Value = chat_resp.json().await.unwrap();
-    assert_eq!(chat_json["choices"][0]["message"]["content"], "llama.cpp OK");
+    assert_eq!(
+        chat_json["choices"][0]["message"]["content"],
+        "llama.cpp OK"
+    );
     assert_eq!(
         chat_json["choices"][0]["message"]["reasoning_content"],
         "Local GGUF reasoning"
@@ -1375,7 +1393,10 @@ async fn e2e_llamacpp_server_router_and_instance_discovery_aliases_load_control_
         assert_eq!(sent["model"], "ggml-org/Qwen3-Coder-30B-GGUF:Q4_K_M");
         assert_eq!(sent["top_k"], json!(40));
         assert_eq!(sent["messages"][1]["role"], "assistant");
-        assert_eq!(sent["messages"][1]["reasoning_content"], "Prior turn thought");
+        assert_eq!(
+            sent["messages"][1]["reasoning_content"],
+            "Prior turn thought"
+        );
         assert_eq!(
             sent["messages"][1]["tool_calls"][0]["function"]["name"],
             "read_status"
@@ -1538,11 +1559,26 @@ async fn e2e_optional_ui_loopback_vs_remote_auth_and_litellm_management_api() {
     // - Browser Direct Connections (`Origin: http://localhost:3333`)
     let docker_bridge_peer: SocketAddr = "172.17.0.2:49152".parse().unwrap();
     for (peer, host_hdr, auth_hdr, origin_hdr) in [
-        (local_peer, "host.docker.internal:4000", Some("Bearer "), None),
-        (local_peer, "host.docker.internal:4000", Some("Bearer none"), None),
+        (
+            local_peer,
+            "host.docker.internal:4000",
+            Some("Bearer "),
+            None,
+        ),
+        (
+            local_peer,
+            "host.docker.internal:4000",
+            Some("Bearer none"),
+            None,
+        ),
         (docker_bridge_peer, "host.docker.internal:4000", None, None),
         (docker_bridge_peer, "172.17.0.1:4000", None, None),
-        (local_peer, "localhost:4000", None, Some("http://localhost:3333")),
+        (
+            local_peer,
+            "localhost:4000",
+            None,
+            Some("http://localhost:3333"),
+        ),
     ] {
         let mut req_builder = Request::builder()
             .uri("/v1/models")
@@ -1806,7 +1842,11 @@ async fn e2e_optional_ui_loopback_vs_remote_auth_and_litellm_management_api() {
         assert_eq!(ui_ephemeral["runtime_override"], json!(true));
         assert_eq!(ui_ephemeral["persisted_ui_enabled"], json!(false));
         assert_eq!(
-            http.get(format!("{base}/ui")).send().await.unwrap().status(),
+            http.get(format!("{base}/ui"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
             StatusCode::OK
         );
 
@@ -2213,7 +2253,8 @@ async fn e2e_optional_ui_loopback_vs_remote_auth_and_litellm_management_api() {
 }
 
 #[tokio::test]
-async fn e2e_three_coequal_pillars_and_optional_openrouter_oidc_presets_exact_cost_and_disconnect() {
+async fn e2e_three_coequal_pillars_and_optional_openrouter_oidc_presets_exact_cost_and_disconnect()
+{
     let or_captured: Arc<Mutex<Vec<(HeaderMap, Value)>>> = Arc::new(Mutex::new(Vec::new()));
     let or_sink = or_captured.clone();
 
@@ -2500,7 +2541,11 @@ async fn e2e_three_coequal_pillars_and_optional_openrouter_oidc_presets_exact_co
     assert!(!ids_before.iter().any(|id| id.starts_with("@preset/")));
     assert!(!ids_before.iter().any(|id| id.starts_with('~')));
     assert!(!ids_before.iter().any(|id| id == "openrouter/auto"));
-    assert!(!ids_before.iter().any(|id| id == "openrouter-lab/aurora-coder-v1"));
+    assert!(
+        !ids_before
+            .iter()
+            .any(|id| id == "openrouter-lab/aurora-coder-v1")
+    );
 
     // 2. Connect OpenRouter via RFC 8693 OIDC Workload Identity (`/api/admin/openrouter/connect`)
     let connect_res: Value = http
@@ -2522,10 +2567,7 @@ async fn e2e_three_coequal_pillars_and_optional_openrouter_oidc_presets_exact_co
     assert_eq!(connect_res["mode"], json!("connected"));
     assert_eq!(connect_res["synced_presets"], json!(2));
     assert_eq!(connect_res["account"]["remaining_credits"], json!(42.5));
-    let or_cred_id = connect_res["credential"]["id"]
-        .as_str()
-        .unwrap()
-        .to_owned();
+    let or_cred_id = connect_res["credential"]["id"].as_str().unwrap().to_owned();
 
     // 3. `/api/v1/presets` and `/v1/models` now surface `@preset/*`, `openrouter/auto`, `~*-latest`, and synced OpenRouter models!
     let presets_after: Value = http
@@ -2553,10 +2595,22 @@ async fn e2e_three_coequal_pillars_and_optional_openrouter_oidc_presets_exact_co
         .filter_map(|m| m["id"].as_str().map(str::to_owned))
         .collect();
     assert!(ids_after.iter().any(|id| id == "@preset/code-reviewer"));
-    assert!(ids_after.iter().any(|id| id == "@preset/inbound-classifier"));
+    assert!(
+        ids_after
+            .iter()
+            .any(|id| id == "@preset/inbound-classifier")
+    );
     assert!(ids_after.iter().any(|id| id == "openrouter/auto"));
-    assert!(ids_after.iter().any(|id| id == "~anthropic/claude-opus-latest"));
-    assert!(ids_after.iter().any(|id| id == "openrouter-lab/aurora-coder-v1"));
+    assert!(
+        ids_after
+            .iter()
+            .any(|id| id == "~anthropic/claude-opus-latest")
+    );
+    assert!(
+        ids_after
+            .iter()
+            .any(|id| id == "openrouter-lab/aurora-coder-v1")
+    );
 
     // Verify per-token pricing conversion (`0.00000055` per token -> `$0.55 / 1M` = `550_000_000` nanos/1M)
     let ds_entry = models_after["data"]
@@ -2611,7 +2665,10 @@ async fn e2e_three_coequal_pillars_and_optional_openrouter_oidc_presets_exact_co
         "0"
     );
     let oauth_json: Value = oauth_resp.json().await.unwrap();
-    assert_eq!(oauth_json["choices"][0]["message"]["content"], "OAuth Pillar OK");
+    assert_eq!(
+        oauth_json["choices"][0]["message"]["content"],
+        "OAuth Pillar OK"
+    );
 
     // 5. OpenRouter `@preset/code-reviewer` via `/api/v1/chat/completions` alias with `provider` routing prefs
     //    + exact `usage.cost` (`$0.00425` -> `4_250_000` NanoUsd) + concrete `resolved_model`!
@@ -2694,7 +2751,11 @@ async fn e2e_three_coequal_pillars_and_optional_openrouter_oidc_presets_exact_co
     // 6b. 1-Click Cloud Burst (`POST /api/admin/burst/enable`): when an OAuth seat (`allow_api_overflow = false`)
     //     hits a 429 cooldown, Cloud Burst seamlessly overflows onto OpenRouter; disabling Burst restores strict isolation!
     gw.db
-        .record_credential_cooldown("codex_oauth_pillar", quixigate_core::now_ms() + 60_000, "429 quota")
+        .record_credential_cooldown(
+            "codex_oauth_pillar",
+            quixigate_core::now_ms() + 60_000,
+            "429 quota",
+        )
         .unwrap();
 
     // Before enabling Burst: `codex_seat` has `allow_api_overflow = false`, so `openai/gpt-5-mini` does NOT spill to paid cloud
@@ -2707,7 +2768,10 @@ async fn e2e_three_coequal_pillars_and_optional_openrouter_oidc_presets_exact_co
         .send()
         .await
         .unwrap();
-    assert_eq!(blocked_before_burst.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        blocked_before_burst.status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
 
     // Enable Cloud Burst in one API call -> same request now bursts seamlessly to OpenRouter!
     let burst_on: Value = http
@@ -2767,13 +2831,19 @@ async fn e2e_three_coequal_pillars_and_optional_openrouter_oidc_presets_exact_co
         .iter()
         .find(|l| l["requested_model"] == json!("~anthropic/claude-opus-latest:nitro"))
         .expect("streamed OpenRouter request must be logged");
-    assert_eq!(stream_log["resolved_model"], json!("anthropic/claude-opus-4-6"));
+    assert_eq!(
+        stream_log["resolved_model"],
+        json!("anthropic/claude-opus-4-6")
+    );
     assert_eq!(stream_log["cost_nanos"], json!(1_500_000));
 
     // 7. Disconnect OpenRouter -> `@preset/*` and OpenRouter-only models immediately disappear,
     //    while Local Ollama + OAuth Codex remain routable!
     let del_or = http
-        .delete(format!("{}/api/admin/credentials/{or_cred_id}", gw.base_url))
+        .delete(format!(
+            "{}/api/admin/credentials/{or_cred_id}",
+            gw.base_url
+        ))
         .send()
         .await
         .unwrap();
@@ -2805,7 +2875,11 @@ async fn e2e_three_coequal_pillars_and_optional_openrouter_oidc_presets_exact_co
         .collect();
     assert!(!ids_after_del.iter().any(|id| id.starts_with("@preset/")));
     assert!(!ids_after_del.iter().any(|id| id == "openrouter/auto"));
-    assert!(ids_after_del.iter().any(|id| id == "ollama/qwen2.5-coder:7b"));
+    assert!(
+        ids_after_del
+            .iter()
+            .any(|id| id == "ollama/qwen2.5-coder:7b")
+    );
     assert!(ids_after_del.iter().any(|id| id == "openai/gpt-5-mini"));
 }
 
@@ -4058,9 +4132,7 @@ async fn e2e_inbound_oidc_jwks_discovery_es256_eddsa_rotation_team_mapping_and_m
     use base64::Engine;
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use ring::rand::SystemRandom;
-    use ring::signature::{
-        ECDSA_P256_SHA256_FIXED_SIGNING, EcdsaKeyPair, Ed25519KeyPair, KeyPair,
-    };
+    use ring::signature::{ECDSA_P256_SHA256_FIXED_SIGNING, EcdsaKeyPair, Ed25519KeyPair, KeyPair};
 
     let rng = SystemRandom::new();
 
@@ -4515,8 +4587,8 @@ async fn e2e_custom_sk_qx_key_generation_tags_no_log_and_mcp_tools() {
     let telemetry = TelemetryHub::new();
     let wizard = OAuthWizardManager::new(db.clone(), refresher);
     let master_key = "sk-qx-master-custom-e2e-999";
-    let state = AppState::new(db.clone(), router, telemetry, wizard, true)
-        .with_master_key(master_key);
+    let state =
+        AppState::new(db.clone(), router, telemetry, wizard, true).with_master_key(master_key);
     let gw_url = spawn_axum(build_router(state)).await;
     let http = reqwest::Client::new();
 
@@ -4532,7 +4604,10 @@ async fn e2e_custom_sk_qx_key_generation_tags_no_log_and_mcp_tools() {
         .await
         .unwrap();
     let qx_token = minted_qx["key"].as_str().unwrap();
-    assert!(qx_token.starts_with("sk-qx-"), "expected sk-qx- prefix, got {qx_token}");
+    assert!(
+        qx_token.starts_with("sk-qx-"),
+        "expected sk-qx- prefix, got {qx_token}"
+    );
 
     // 2. Custom `sk-qx-...` token on `POST /key/generate` authenticates cleanly under strict auth
     let custom_token = "sk-qx-custom-team-token-abcdef123456";

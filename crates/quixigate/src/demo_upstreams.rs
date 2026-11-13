@@ -15,14 +15,14 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures::stream;
 use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
+use parking_lot::Mutex;
+use prost::Message as ProstMessage;
 use quixigate_core::{
     AuthKind, CredentialSecret, ModelRoute, PoolStrategy, QuotaSnapshot, QuotaWindow, RouteTarget,
     now_ms,
 };
 use quixigate_db::Database;
 use quixigate_vault::Vault;
-use parking_lot::Mutex;
-use prost::Message as ProstMessage;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
@@ -168,6 +168,7 @@ pub fn seed_demo_data_dir(data_dir: &Path, upstream_port: u16) -> anyhow::Result
         ],
         pool_strategy: PoolStrategy::FillFirst,
         allow_paid_overflow: true,
+        blocked: false,
         input_nanos_per_m: None,
         output_nanos_per_m: None,
         cache_read_nanos_per_m: None,
@@ -205,7 +206,10 @@ pub async fn run_demo_servers(
         .route("/codex/responses", post(handle_mock_codex_responses))
         .route("/wham/usage", get(handle_mock_wham_usage))
         .route("/api/oauth/usage", get(handle_mock_anthropic_usage))
-        .route("/v1internal:retrieveUserQuota", post(handle_mock_gemini_quota))
+        .route(
+            "/v1internal:retrieveUserQuota",
+            post(handle_mock_gemini_quota),
+        )
         .route("/api/v1/credits", get(handle_mock_openrouter_credits))
         .route("/api/tags", get(handle_mock_ollama_tags))
         .route("/api/ps", get(handle_mock_ollama_ps))
@@ -589,8 +593,12 @@ async fn handle_mock_codex_responses(Json(body): Json<Value>) -> Response {
 
     let s = stream::unfold(events.into_iter(), |mut iter| async move {
         tokio::time::sleep(Duration::from_millis(18)).await;
-        iter.next()
-            .map(|(ev, d)| (Ok::<Event, Infallible>(Event::default().event(ev).data(d.to_string())), iter))
+        iter.next().map(|(ev, d)| {
+            (
+                Ok::<Event, Infallible>(Event::default().event(ev).data(d.to_string())),
+                iter,
+            )
+        })
     });
     Sse::new(s).into_response()
 }
@@ -763,8 +771,12 @@ async fn handle_mock_anthropic_messages(Json(body): Json<Value>) -> Response {
 
     let s = stream::unfold(events.into_iter(), |mut iter| async move {
         tokio::time::sleep(Duration::from_millis(16)).await;
-        iter.next()
-            .map(|(ev, d)| (Ok::<Event, Infallible>(Event::default().event(ev).data(d.to_string())), iter))
+        iter.next().map(|(ev, d)| {
+            (
+                Ok::<Event, Infallible>(Event::default().event(ev).data(d.to_string())),
+                iter,
+            )
+        })
     });
     Sse::new(s).into_response()
 }

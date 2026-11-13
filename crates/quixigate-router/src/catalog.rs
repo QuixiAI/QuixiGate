@@ -82,7 +82,13 @@ impl ModelCatalog {
 
     /// Refreshes the catalog from `https://models.dev/api.json` (or custom URL) atomically.
     pub async fn sync_from_url(&self, http: &reqwest::Client, url: &str) -> anyhow::Result<usize> {
-        let val: Value = http.get(url).send().await?.error_for_status()?.json().await?;
+        let val: Value = http
+            .get(url)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
         let mut snap = parse_models_dev_json(&val);
         insert_openrouter_meta_models(&mut snap.by_canonical, true);
         let count = snap.by_canonical.len();
@@ -187,9 +193,8 @@ impl ModelCatalog {
                 .as_u64()
                 .unwrap_or(16_384);
             let params = item["supported_parameters"].as_array();
-            let has_param = |p: &str| {
-                params.is_some_and(|arr| arr.iter().any(|v| v.as_str() == Some(p)))
-            };
+            let has_param =
+                |p: &str| params.is_some_and(|arr| arr.iter().any(|v| v.as_str() == Some(p)));
             // When `supported_parameters` is explicitly present, honor it strictly; otherwise default true
             let supports_tools =
                 params.is_none_or(|_| has_param("tools") || has_param("tool_choice"));
@@ -398,13 +403,11 @@ impl ModelCatalog {
 
         let base = preset.underlying_model.as_deref().and_then(|um| {
             let low = um.trim().to_ascii_lowercase();
-            snap.by_canonical
-                .get(&low)
-                .or_else(|| {
-                    snap.bare_to_canonical
-                        .get(&low)
-                        .and_then(|c| snap.by_canonical.get(c))
-                })
+            snap.by_canonical.get(&low).or_else(|| {
+                snap.bare_to_canonical
+                    .get(&low)
+                    .and_then(|c| snap.by_canonical.get(c))
+            })
         });
 
         let desc = match (&preset.description, &preset.underlying_model) {
@@ -885,10 +888,7 @@ fn parse_models_dev_json(root: &Value) -> CatalogSnapshot {
                     canonical_id: canonical_id.clone(),
                     bare_id: bare_id.clone(),
                     author: author.clone(),
-                    display_name: m["name"]
-                        .as_str()
-                        .unwrap_or(&bare_id)
-                        .to_owned(),
+                    display_name: m["name"].as_str().unwrap_or(&bare_id).to_owned(),
                     description: m["description"].as_str().map(str::to_owned),
                     family: m["family"].as_str().map(str::to_owned),
                     providers: BTreeMap::new(),
@@ -1059,7 +1059,9 @@ mod tests {
                 }),
             );
 
-        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;

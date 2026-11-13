@@ -157,7 +157,9 @@ impl Vault {
     /// Decrypts a vault envelope and verifies both the GCM tag and `aad`.
     pub fn decrypt(&self, aad: &str, envelope: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
         if envelope.len() < 1 + NONCE_LEN + 16 {
-            return Err(QuixigateError::Vault("encrypted envelope is truncated".to_owned()));
+            return Err(QuixigateError::Vault(
+                "encrypted envelope is truncated".to_owned(),
+            ));
         }
         if envelope[0] != VERSION_V1 {
             return Err(QuixigateError::Vault(format!(
@@ -300,13 +302,21 @@ mod tests {
         let blob = vault.encrypt_json("cred_1", &secret).unwrap();
 
         // Wrong credential_id AAD fails authentication!
-        assert!(vault.decrypt_json::<CredentialSecret>("cred_2", &blob).is_err());
+        assert!(
+            vault
+                .decrypt_json::<CredentialSecret>("cred_2", &blob)
+                .is_err()
+        );
 
         // Bit flip in ciphertext fails authentication!
         let mut tampered = blob.clone();
         let last = tampered.len() - 1;
         tampered[last] ^= 0x01;
-        assert!(vault.decrypt_json::<CredentialSecret>("cred_1", &tampered).is_err());
+        assert!(
+            vault
+                .decrypt_json::<CredentialSecret>("cred_1", &tampered)
+                .is_err()
+        );
 
         // Matching AAD succeeds.
         let decoded: CredentialSecret = vault.decrypt_json("cred_1", &blob).unwrap();

@@ -76,11 +76,7 @@ impl PoolSelector {
                 targets.push((t.credential_id.clone(), prov, parsed.base_model));
             }
         } else {
-            targets.push((
-                None,
-                spec.pinned_target.clone(),
-                spec.base_model.clone(),
-            ));
+            targets.push((None, spec.pinned_target.clone(), spec.base_model.clone()));
         }
 
         let local_statuses = local_scanner.list_statuses();
@@ -252,7 +248,10 @@ impl PoolSelector {
                 && !out.iter().any(|c| c.provider_id == "openrouter")
             {
                 let mut extra_burst = Vec::new();
-                for cred in credentials.iter().filter(|c| c.enabled && c.provider_id == "openrouter") {
+                for cred in credentials
+                    .iter()
+                    .filter(|c| c.enabled && c.provider_id == "openrouter")
+                {
                     let burst_upstream = apply_openrouter_modifiers(burst_fallback_model, spec);
                     if cred.is_healthy_for(Some(&burst_upstream), now) {
                         extra_burst.push(DispatchCandidate {
@@ -471,7 +470,10 @@ fn credential_serves_model(
     }
     if pid == "github-copilot" {
         if let Some(author) = explicit_prefix {
-            return matches!(author, "openai" | "anthropic" | "google" | "xai" | "github-copilot");
+            return matches!(
+                author,
+                "openai" | "anthropic" | "google" | "xai" | "github-copilot"
+            );
         }
         return true;
     }
@@ -673,7 +675,8 @@ pub fn record_upstream_failure(
         .iter()
         .any(|m| lower.contains(m));
     if is_entitlement {
-        let _ = db.record_model_cooldown(&cred.id, upstream_model, now + MODEL_ENTITLEMENT_BENCH_MS);
+        let _ =
+            db.record_model_cooldown(&cred.id, upstream_model, now + MODEL_ENTITLEMENT_BENCH_MS);
         return (status, details, retry_after_secs);
     }
 

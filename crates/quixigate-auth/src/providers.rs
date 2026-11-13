@@ -190,7 +190,9 @@ pub enum PollOutcome {
 pub fn validate_anthropic_setup_token(raw: &str) -> Result<CredentialSecret> {
     let cleaned: String = raw.chars().filter(|c| !c.is_whitespace()).collect();
     if cleaned.is_empty() {
-        return Err(QuixigateError::Validation("Anthropic setup token is empty".to_owned()));
+        return Err(QuixigateError::Validation(
+            "Anthropic setup token is empty".to_owned(),
+        ));
     }
     if !cleaned.starts_with(ANTHROPIC_SETUP_TOKEN_PREFIX) {
         return Err(QuixigateError::Validation(format!(
@@ -302,12 +304,12 @@ async fn codex_token_request(
             message: format!("{code}: {desc}"),
         });
     }
-    let access = body["access_token"]
-        .as_str()
-        .ok_or_else(|| QuixigateError::Validation("Codex response missing access_token".to_owned()))?;
-    let refresh = body["refresh_token"]
-        .as_str()
-        .ok_or_else(|| QuixigateError::Validation("Codex response missing refresh_token".to_owned()))?;
+    let access = body["access_token"].as_str().ok_or_else(|| {
+        QuixigateError::Validation("Codex response missing access_token".to_owned())
+    })?;
+    let refresh = body["refresh_token"].as_str().ok_or_else(|| {
+        QuixigateError::Validation("Codex response missing refresh_token".to_owned())
+    })?;
     let expires_in = body["expires_in"].as_u64().unwrap_or(3600);
     let account_id = flow::jwt_payload(access)
         .and_then(|claims| {
@@ -388,9 +390,14 @@ pub async fn poll_codex_device_once(
     let verifier = done["code_verifier"]
         .as_str()
         .ok_or_else(|| QuixigateError::Validation("missing code_verifier".to_owned()))?;
-    let secret =
-        exchange_codex_code(http, oauth_token_url, code, verifier, CODEX_DEVICE_REDIRECT_URI)
-            .await?;
+    let secret = exchange_codex_code(
+        http,
+        oauth_token_url,
+        code,
+        verifier,
+        CODEX_DEVICE_REDIRECT_URI,
+    )
+    .await?;
     Ok(PollOutcome::Authorized {
         secret,
         base_url: Some(CODEX_DEFAULT_BASE_URL.to_owned()),
@@ -425,8 +432,12 @@ pub async fn start_xai_device_flow(
         .await
         .map_err(|e| QuixigateError::Validation(format!("invalid xAI discovery JSON: {e}")))?;
 
-    let device_endpoint = trusted_xai_url(&disc["device_authorization_endpoint"], allow_loopback_for_test)?;
-    let token_endpoint = trusted_xai_url(&disc["token_endpoint"], allow_loopback_for_test)?.to_owned();
+    let device_endpoint = trusted_xai_url(
+        &disc["device_authorization_endpoint"],
+        allow_loopback_for_test,
+    )?;
+    let token_endpoint =
+        trusted_xai_url(&disc["token_endpoint"], allow_loopback_for_test)?.to_owned();
 
     let start: Value = http
         .post(device_endpoint)
@@ -722,9 +733,9 @@ pub async fn exchange_github_for_copilot(
                 .to_owned(),
         });
     }
-    let token = data["token"]
-        .as_str()
-        .ok_or_else(|| QuixigateError::Validation("Copilot token response missing 'token'".to_owned()))?;
+    let token = data["token"].as_str().ok_or_else(|| {
+        QuixigateError::Validation("Copilot token response missing 'token'".to_owned())
+    })?;
     let expires_at = data["expires_at"]
         .as_i64()
         .unwrap_or_else(|| (now_ms() / 1000) + 1800);
@@ -838,12 +849,7 @@ pub async fn complete_gemini_login(
     let refresh = body["refresh_token"].as_str().unwrap_or_default();
     let expires_in = body["expires_in"].as_u64().unwrap_or(3600);
 
-    let email = match http
-        .get(userinfo_url)
-        .bearer_auth(access)
-        .send()
-        .await
-    {
+    let email = match http.get(userinfo_url).bearer_auth(access).send().await {
         Ok(r) if r.status().is_success() => r
             .json::<Value>()
             .await
@@ -940,9 +946,9 @@ pub async fn refresh_gemini_token(
                 .to_owned(),
         });
     }
-    let access = body["access_token"]
-        .as_str()
-        .ok_or_else(|| QuixigateError::Validation("Google refresh missing access_token".to_owned()))?;
+    let access = body["access_token"].as_str().ok_or_else(|| {
+        QuixigateError::Validation("Google refresh missing access_token".to_owned())
+    })?;
     let next_refresh = body["refresh_token"].as_str().unwrap_or(refresh);
     let expires_in = body["expires_in"].as_u64().unwrap_or(3600);
 
@@ -994,8 +1000,14 @@ pub async fn exchange_openrouter_code(
 ) -> Result<CredentialSecret> {
     let resp = http
         .post(keys_url)
-        .header("HTTP-Referer", quixigate_core::brand::DEFAULT_OPENROUTER_APP_URL)
-        .header("X-Title", quixigate_core::brand::DEFAULT_OPENROUTER_APP_TITLE)
+        .header(
+            "HTTP-Referer",
+            quixigate_core::brand::DEFAULT_OPENROUTER_APP_URL,
+        )
+        .header(
+            "X-Title",
+            quixigate_core::brand::DEFAULT_OPENROUTER_APP_TITLE,
+        )
         .json(&json!({
             "code": code,
             "code_verifier": verifier,
@@ -1021,7 +1033,9 @@ pub async fn exchange_openrouter_code(
         .as_str()
         .or_else(|| body["data"]["key"].as_str())
         .filter(|k| !k.trim().is_empty())
-        .ok_or_else(|| QuixigateError::Validation("OpenRouter response missing 'key'".to_owned()))?;
+        .ok_or_else(|| {
+            QuixigateError::Validation("OpenRouter response missing 'key'".to_owned())
+        })?;
     Ok(CredentialSecret::ApiKey {
         key: key.trim().to_owned(),
     })
@@ -1048,10 +1062,7 @@ pub async fn exchange_openrouter_oidc_token(
             "urn:ietf:params:oauth:grant-type:token-exchange",
         ),
         ("subject_token", trimmed_subject),
-        (
-            "subject_token_type",
-            "urn:ietf:params:oauth:token-type:jwt",
-        ),
+        ("subject_token_type", "urn:ietf:params:oauth:token-type:jwt"),
     ];
     let clean_policy = federation_policy_id
         .map(str::trim)
@@ -1066,7 +1077,9 @@ pub async fn exchange_openrouter_oidc_token(
         .form(&form)
         .send()
         .await
-        .map_err(|e| QuixigateError::Internal(format!("OpenRouter OIDC token exchange failed: {e}")))?;
+        .map_err(|e| {
+            QuixigateError::Internal(format!("OpenRouter OIDC token exchange failed: {e}"))
+        })?;
     let status = resp.status();
     let body: Value = resp.json().await.unwrap_or_default();
     if !status.is_success() {
@@ -1128,8 +1141,14 @@ pub async fn inspect_openrouter_account(
     let key_resp = http
         .get(&key_url)
         .bearer_auth(bearer_token.trim())
-        .header("HTTP-Referer", quixigate_core::brand::DEFAULT_OPENROUTER_APP_URL)
-        .header("X-Title", quixigate_core::brand::DEFAULT_OPENROUTER_APP_TITLE)
+        .header(
+            "HTTP-Referer",
+            quixigate_core::brand::DEFAULT_OPENROUTER_APP_URL,
+        )
+        .header(
+            "X-Title",
+            quixigate_core::brand::DEFAULT_OPENROUTER_APP_TITLE,
+        )
         .send()
         .await
         .map_err(|e| QuixigateError::Internal(format!("OpenRouter key inspection failed: {e}")))?;
@@ -1141,7 +1160,10 @@ pub async fn inspect_openrouter_account(
         validated = true;
         let body: Value = key_resp.json().await.unwrap_or_default();
         let d = &body["data"];
-        info.key_label = d["label"].as_str().filter(|s| !s.is_empty()).map(str::to_owned);
+        info.key_label = d["label"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
         info.key_limit = d["limit"].as_f64();
         info.key_limit_remaining = d["limit_remaining"].as_f64();
         info.key_usage = d["usage"].as_f64();
@@ -1273,7 +1295,10 @@ pub async fn poll_qwen_device_once(
         .unwrap_or_default();
 
     if let Some(access) = data["access_token"].as_str() {
-        let refresh = data["refresh_token"].as_str().unwrap_or_default().to_owned();
+        let refresh = data["refresh_token"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
         let expires_in = data["expires_in"].as_u64().unwrap_or(3600);
         let resource_url = data["resource_url"].as_str().map(str::to_owned);
         return Ok(PollOutcome::Authorized {
@@ -1293,7 +1318,9 @@ pub async fn poll_qwen_device_once(
     match data["error"].as_str().unwrap_or("") {
         "authorization_pending" => Ok(PollOutcome::Pending),
         "slow_down" => Ok(PollOutcome::SlowDown),
-        other => Err(QuixigateError::Validation(format!("Qwen device flow failed: {other}"))),
+        other => Err(QuixigateError::Validation(format!(
+            "Qwen device flow failed: {other}"
+        ))),
     }
 }
 
@@ -1319,12 +1346,15 @@ pub async fn refresh_qwen_token(
         return Err(QuixigateError::Upstream {
             status: status.as_u16(),
             provider: "qwen-portal".to_owned(),
-            message: data["error"].as_str().unwrap_or("Qwen refresh failed").to_owned(),
+            message: data["error"]
+                .as_str()
+                .unwrap_or("Qwen refresh failed")
+                .to_owned(),
         });
     }
-    let access = data["access_token"]
-        .as_str()
-        .ok_or_else(|| QuixigateError::Validation("Qwen refresh missing access_token".to_owned()))?;
+    let access = data["access_token"].as_str().ok_or_else(|| {
+        QuixigateError::Validation("Qwen refresh missing access_token".to_owned())
+    })?;
     let next_refresh = data["refresh_token"].as_str().unwrap_or(refresh);
     let expires_in = data["expires_in"].as_u64().unwrap_or(3600);
     Ok(CredentialSecret::QwenPortal {
@@ -1401,7 +1431,9 @@ pub async fn start_minimax_flow(
             .to_owned(),
         verification_uri: data["verification_uri"]
             .as_str()
-            .ok_or_else(|| QuixigateError::Validation("MiniMax missing verification_uri".to_owned()))?
+            .ok_or_else(|| {
+                QuixigateError::Validation("MiniMax missing verification_uri".to_owned())
+            })?
             .to_owned(),
         verifier,
         interval_secs: interval_secs(&data["interval"]).max(2),
@@ -1538,7 +1570,10 @@ pub async fn exchange_chutes_code(
         return Err(QuixigateError::Upstream {
             status: status.as_u16(),
             provider: "chutes".to_owned(),
-            message: body["error"].as_str().unwrap_or("Chutes exchange rejected").to_owned(),
+            message: body["error"]
+                .as_str()
+                .unwrap_or("Chutes exchange rejected")
+                .to_owned(),
         });
     }
     let access = body["access_token"]
@@ -1604,12 +1639,15 @@ pub async fn refresh_chutes_token(
         return Err(QuixigateError::Upstream {
             status: status.as_u16(),
             provider: "chutes".to_owned(),
-            message: body["error"].as_str().unwrap_or("Chutes refresh rejected").to_owned(),
+            message: body["error"]
+                .as_str()
+                .unwrap_or("Chutes refresh rejected")
+                .to_owned(),
         });
     }
-    let access = body["access_token"]
-        .as_str()
-        .ok_or_else(|| QuixigateError::Validation("Chutes refresh missing access_token".to_owned()))?;
+    let access = body["access_token"].as_str().ok_or_else(|| {
+        QuixigateError::Validation("Chutes refresh missing access_token".to_owned())
+    })?;
     let next_refresh = body["refresh_token"].as_str().unwrap_or(refresh);
     let expires_in = body["expires_in"].as_u64().unwrap_or(3600);
     Ok(CredentialSecret::Chutes {

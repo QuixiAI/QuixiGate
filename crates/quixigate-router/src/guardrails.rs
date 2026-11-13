@@ -84,7 +84,10 @@ pub fn redact_secrets_in_str(text: &str) -> String {
     for pat in secret_patterns() {
         if pat.regex.is_match(&current) {
             let replacement = format!("[REDACTED:{}]", pat.kind);
-            current = pat.regex.replace_all(&current, replacement.as_str()).into_owned();
+            current = pat
+                .regex
+                .replace_all(&current, replacement.as_str())
+                .into_owned();
         }
     }
     current

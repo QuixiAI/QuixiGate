@@ -5,7 +5,10 @@
 pub mod admin;
 pub mod auth;
 pub mod codecs;
+pub mod litellm_inference;
 pub mod litellm_mgmt;
+pub mod litellm_mgmt_ext;
+pub mod litellm_unsupported;
 pub mod mcp;
 pub mod oidc;
 pub mod openapi;
@@ -14,7 +17,7 @@ pub mod state;
 use axum::Json;
 use axum::Router;
 use axum::extract::{DefaultBodyLimit, Path, State};
-use axum::http::{StatusCode, Uri};
+use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use serde_json::json;
@@ -86,6 +89,8 @@ pub fn build_router(state: AppState) -> Router {
                 .post(mcp::handle_mcp_post)
                 .delete(mcp::handle_mcp_delete),
         )
+        .merge(litellm_inference::router())
+        .method_not_allowed_fallback(litellm_unsupported::method_not_allowed_handler)
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             auth::enforce_inference_plane_enabled,
@@ -95,7 +100,10 @@ pub fn build_router(state: AppState) -> Router {
     let admin_routes = Router::new()
         .route("/api/admin/openapi.json", get(openapi::handle_openapi_json))
         .route("/api/admin/auth/status", get(admin::get_auth_status))
-        .route("/api/admin/auth/bootstrap", post(admin::post_auth_bootstrap))
+        .route(
+            "/api/admin/auth/bootstrap",
+            post(admin::post_auth_bootstrap),
+        )
         .route("/api/admin/auth/login", post(admin::post_auth_login))
         .route("/api/admin/auth/logout", post(admin::post_auth_logout))
         .route("/api/admin/auth/password", post(admin::post_auth_password))
@@ -106,7 +114,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/admin/spend/export", get(admin::get_spend_export))
         .route("/api/admin/spend/reset", post(admin::post_spend_reset))
         .route("/api/admin/audit-logs", get(admin::get_audit_logs))
-        .route("/api/admin/audit-logs/{id}", get(admin::get_audit_log_by_id))
+        .route(
+            "/api/admin/audit-logs/{id}",
+            get(admin::get_audit_log_by_id),
+        )
         .route("/api/admin/providers", get(admin::get_providers_catalog))
         .route(
             "/api/admin/credentials",
@@ -299,6 +310,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/ui", get(serve_ui_index))
         .route("/ui/", get(serve_ui_index))
         .route("/ui/{*path}", get(serve_ui_subpath))
+        .method_not_allowed_fallback(litellm_unsupported::method_not_allowed_handler)
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             auth::enforce_admin_plane_enabled,
@@ -314,10 +326,17 @@ pub fn build_router(state: AppState) -> Router {
         .merge(inference_routes)
         .merge(control_plane_routes)
         .route("/health", get(codecs::misc::handle_liveness))
-        .route("/health/liveness", get(codecs::misc::handle_liveness))
-        .route("/health/readiness", get(codecs::misc::handle_readiness))
+        .route(
+            "/health/liveness",
+            get(codecs::misc::handle_liveness).options(litellm_mgmt_ext::options_ok),
+        )
+        .route(
+            "/health/readiness",
+            get(codecs::misc::handle_readiness).options(litellm_mgmt_ext::options_ok),
+        )
         .route("/metrics", get(codecs::misc::handle_prometheus_metrics))
-        .fallback(fallback_not_found)
+        .method_not_allowed_fallback(litellm_unsupported::method_not_allowed_handler)
+        .fallback(litellm_unsupported::fallback_handler)
         .layer(DefaultBodyLimit::max(512 * 1024 * 1024))
         .with_state(state)
         .layer(axum::middleware::from_fn_with_state(
@@ -348,21 +367,6 @@ async fn handle_robots_txt(State(state): State<AppState>) -> Response {
         .into_response()
 }
 
-async fn fallback_not_found(uri: Uri) -> Response {
-    (
-        StatusCode::NOT_FOUND,
-        Json(json!({
-            "type": "error",
-            "error": {
-                "message": format!("route '{}' not found", uri.path()),
-                "type": "not_found_error",
-                "code": "not_found"
-            }
-        })),
-    )
-        .into_response()
-}
-
 fn ui_disabled_response() -> Response {
     (
         StatusCode::NOT_FOUND,
@@ -385,10 +389,7 @@ async fn serve_ui_index(State(state): State<AppState>) -> Response {
     serve_ui_asset("index.html")
 }
 
-async fn serve_ui_subpath(
-    State(state): State<AppState>,
-    Path(subpath): Path<String>,
-) -> Response {
+async fn serve_ui_subpath(State(state): State<AppState>, Path(subpath): Path<String>) -> Response {
     if !state.is_ui_enabled() {
         return ui_disabled_response();
     }

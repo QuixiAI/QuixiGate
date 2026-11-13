@@ -18,7 +18,7 @@ use quixigate_auth::providers::{
 use quixigate_auth::quota::poll_and_save_quota;
 use quixigate_core::{
     AuditLogEntry, AuthKind, BudgetWindow, CredentialRecord, CredentialSecret, GatewaySettings,
-    LocalEndpointConfig, ModelRoute, NanoUsd, OtlpProtocol, QuixigateError, PoolStrategy,
+    LocalEndpointConfig, ModelRoute, NanoUsd, OtlpProtocol, PoolStrategy, QuixigateError,
     RouteTarget, SpendReportRow, User, UserRole, VirtualKey, now_ms,
 };
 use quixigate_db::{AuthenticatedPrincipal, Database, LogFilter};
@@ -664,7 +664,12 @@ pub async fn patch_credential(
     Json(req): Json<PatchCredentialRequest>,
 ) -> ApiResult<Json<CredentialRecord>> {
     let _principal = authenticate_admin(&state, &headers, true)?;
-    if let Some(raw_key) = req.api_key.as_deref().map(str::trim).filter(|k| !k.is_empty()) {
+    if let Some(raw_key) = req
+        .api_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|k| !k.is_empty())
+    {
         state.db.update_credential_secret(
             &id,
             &CredentialSecret::ApiKey {
@@ -720,7 +725,15 @@ pub async fn delete_credential(
         .ok()
         .and_then(|c| serde_json::to_value(c).ok());
     state.db.delete_credential(&id)?;
-    record_audit(&state, &principal, "delete", "credentials", &id, before, None);
+    record_audit(
+        &state,
+        &principal,
+        "delete",
+        "credentials",
+        &id,
+        before,
+        None,
+    );
     sync_local_scanner_from_db(&state.db, state.router.local_scanner());
     reconcile_openrouter_presets_on_cred_change(&state);
     Ok(Json(json!({ "deleted": true, "id": id })))
@@ -852,7 +865,10 @@ pub fn reconcile_openrouter_presets_on_cred_change(state: &AppState) {
     let has_openrouter = state
         .db
         .list_credentials()
-        .map(|cs| cs.iter().any(|c| c.enabled && c.provider_id == "openrouter"))
+        .map(|cs| {
+            cs.iter()
+                .any(|c| c.enabled && c.provider_id == "openrouter")
+        })
         .unwrap_or(false);
     if !has_openrouter {
         state.router.catalog().clear_presets();
@@ -1002,7 +1018,9 @@ pub async fn post_openrouter_connect(
                 .oauth_wizard
                 .start_flow(StartOAuthRequest {
                     provider_id: "openrouter".to_owned(),
-                    label: req.label.or_else(|| Some("OpenRouter (Browser PKCE)".to_owned())),
+                    label: req
+                        .label
+                        .or_else(|| Some("OpenRouter (Browser PKCE)".to_owned())),
                     priority: Some(req.priority.unwrap_or(200)),
                     region: req.region,
                     ..Default::default()
@@ -1316,6 +1334,7 @@ pub async fn post_route(
         targets: req.targets,
         pool_strategy: req.pool_strategy,
         allow_paid_overflow: req.allow_paid_overflow.unwrap_or(true),
+        blocked: existing.as_ref().is_some_and(|r| r.blocked),
         input_nanos_per_m: req.input_nanos_per_m,
         output_nanos_per_m: req.output_nanos_per_m,
         cache_read_nanos_per_m: req.cache_read_nanos_per_m,
@@ -1325,13 +1344,20 @@ pub async fn post_route(
             .and_then(|r| r.created_by.clone())
             .or_else(|| Some(principal.user.id.clone())),
         updated_by: Some(principal.user.id.clone()),
-        created_at_ms: existing.as_ref().and_then(|r| r.created_at_ms).or(Some(now)),
+        created_at_ms: existing
+            .as_ref()
+            .and_then(|r| r.created_at_ms)
+            .or(Some(now)),
         updated_at_ms: now,
     })?;
     record_audit(
         &state,
         &principal,
-        if existing.is_some() { "update" } else { "create" },
+        if existing.is_some() {
+            "update"
+        } else {
+            "create"
+        },
         "routes",
         &route.alias,
         existing.and_then(|e| serde_json::to_value(e).ok()),
@@ -1414,6 +1440,7 @@ pub async fn put_or_patch_route(
             .allow_paid_overflow
             .or_else(|| existing.as_ref().map(|r| r.allow_paid_overflow))
             .unwrap_or(true),
+        blocked: existing.as_ref().is_some_and(|r| r.blocked),
         input_nanos_per_m: match req.input_nanos_per_m {
             Some(v) => v,
             None => existing.as_ref().and_then(|r| r.input_nanos_per_m),
@@ -1432,13 +1459,20 @@ pub async fn put_or_patch_route(
             .and_then(|r| r.created_by.clone())
             .or_else(|| Some(principal.user.id.clone())),
         updated_by: Some(principal.user.id.clone()),
-        created_at_ms: existing.as_ref().and_then(|r| r.created_at_ms).or(Some(now)),
+        created_at_ms: existing
+            .as_ref()
+            .and_then(|r| r.created_at_ms)
+            .or(Some(now)),
         updated_at_ms: now,
     })?;
     record_audit(
         &state,
         &principal,
-        if existing.is_some() { "update" } else { "create" },
+        if existing.is_some() {
+            "update"
+        } else {
+            "create"
+        },
         "routes",
         &route.alias,
         existing.and_then(|e| serde_json::to_value(e).ok()),
@@ -1563,7 +1597,12 @@ pub async fn post_local_runtime(
     }
     state.db.update_settings(&settings)?;
 
-    if let Some(raw_key) = req.api_key.as_deref().map(str::trim).filter(|k| !k.is_empty()) {
+    if let Some(raw_key) = req
+        .api_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|k| !k.is_empty())
+    {
         let existing_cred_id = state
             .db
             .list_credentials()?
@@ -1867,7 +1906,9 @@ pub async fn post_team(
                 (uid, m.role)
             })
             .collect();
-        team = state.db.add_team_members_with_roles(&team.id, &with_roles)?;
+        team = state
+            .db
+            .add_team_members_with_roles(&team.id, &with_roles)?;
     }
     if !req.tags.is_empty() || model_budgets.is_some() {
         team = state.db.set_team_policy(
@@ -1933,11 +1974,10 @@ pub async fn patch_team(
         req.member_ids.as_deref(),
     )?;
     if req.tags.is_some() || model_budgets.is_some() {
-        updated = state.db.set_team_policy(
-            &updated.id,
-            req.tags.as_deref(),
-            model_budgets.as_ref(),
-        )?;
+        updated =
+            state
+                .db
+                .set_team_policy(&updated.id, req.tags.as_deref(), model_budgets.as_ref())?;
     }
     record_audit(
         &state,
@@ -2102,10 +2142,12 @@ pub async fn get_key_by_id(
         .as_ref()
         .is_some_and(|k| k.id == vk.id);
     if !is_own && !matches!(principal.user.role, UserRole::Admin | UserRole::Viewer) {
-        let is_team_adm = vk
-            .team_id
-            .as_deref()
-            .is_some_and(|tid| state.db.is_team_admin(tid, &principal.user.id).unwrap_or(false));
+        let is_team_adm = vk.team_id.as_deref().is_some_and(|tid| {
+            state
+                .db
+                .is_team_admin(tid, &principal.user.id)
+                .unwrap_or(false)
+        });
         if !is_team_adm {
             return Err(ApiError(QuixigateError::Forbidden(
                 "administrator or team admin privileges required".to_owned(),
@@ -2385,9 +2427,7 @@ pub async fn post_reset_key_spend(
 ) -> ApiResult<Json<VirtualKey>> {
     let principal = authenticate_admin(&state, &headers, true)?;
     let resolved = state.db.resolve_virtual_key_id(&id)?;
-    state
-        .db
-        .reset_spend(None, None, Some(&resolved), false)?;
+    state.db.reset_spend(None, None, Some(&resolved), false)?;
     let vk = state.db.get_virtual_key(&resolved)?;
     record_audit(
         &state,
@@ -2582,8 +2622,11 @@ pub async fn patch_settings(
             cur_obj.insert(canonical_key.to_owned(), v.clone());
         }
     }
-    let merged: GatewaySettings = serde_json::from_value(current)
-        .map_err(|e| ApiError(QuixigateError::Validation(format!("invalid settings patch: {e}"))))?;
+    let merged: GatewaySettings = serde_json::from_value(current).map_err(|e| {
+        ApiError(QuixigateError::Validation(format!(
+            "invalid settings patch: {e}"
+        )))
+    })?;
     if touched_ui && merged.ui_enabled && !AppState::is_ui_compiled_in() {
         return Err(ApiError(QuixigateError::Validation(
             "Web UI assets were excluded at compile time (--no-default-features); rebuild with default 'ui' feature to enable /ui".to_owned(),
@@ -2709,10 +2752,18 @@ pub async fn set_burst_status(
     {
         settings.openrouter_burst_model = m;
     }
-    if let Some(url) = req.app_url.map(|s| s.trim().to_owned()).filter(|s| !s.is_empty()) {
+    if let Some(url) = req
+        .app_url
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
+    {
         settings.openrouter_app_url = url;
     }
-    if let Some(title) = req.app_title.map(|s| s.trim().to_owned()).filter(|s| !s.is_empty()) {
+    if let Some(title) = req
+        .app_title
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
+    {
         settings.openrouter_app_title = title;
     }
     state.db.update_settings(&settings)?;
@@ -2960,7 +3011,9 @@ pub async fn post_import_config(
     Json(req): Json<ImportConfigRequest>,
 ) -> ApiResult<Json<Value>> {
     let _principal = authenticate_admin(&state, &headers, true)?;
-    let applied = state.db.import_config(&req.content, req.format.as_deref())?;
+    let applied = state
+        .db
+        .import_config(&req.content, req.format.as_deref())?;
     state.clear_ui_override();
     sync_local_scanner_from_db(&state.db, state.router.local_scanner());
     Ok(Json(json!({ "ok": true, "applied_items": applied })))

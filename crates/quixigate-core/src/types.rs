@@ -76,7 +76,10 @@ impl BudgetWindow {
 
     /// Computes the next UTC boundary reset timestamp in milliseconds, or `None` for `Total`.
     pub fn next_reset_ms(self, from_ms: i64) -> Option<i64> {
-        let dt = Utc.timestamp_millis_opt(from_ms).single().unwrap_or_else(Utc::now);
+        let dt = Utc
+            .timestamp_millis_opt(from_ms)
+            .single()
+            .unwrap_or_else(Utc::now);
         match self {
             Self::Hourly => Some((dt + ChronoDuration::hours(1)).timestamp_millis()),
             Self::Daily => Some((dt + ChronoDuration::days(1)).timestamp_millis()),
@@ -123,6 +126,12 @@ pub struct TeamMember {
 pub struct Team {
     pub id: String,
     pub name: String,
+    #[serde(default)]
+    pub blocked: bool,
+    #[serde(default)]
+    pub disable_logging: bool,
+    #[serde(default)]
+    pub allowed_models: Vec<String>,
     pub budget_limit_nanos: Option<NanoUsd>,
     pub budget_window: BudgetWindow,
     pub spend_nanos: NanoUsd,
@@ -135,6 +144,78 @@ pub struct Team {
     #[serde(default)]
     pub model_budgets_nanos: BTreeMap<String, NanoUsd>,
     pub created_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EndUser {
+    pub user_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alias: Option<String>,
+    #[serde(default)]
+    pub blocked: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget_id: Option<String>,
+    pub budget_limit_nanos: Option<NanoUsd>,
+    pub budget_window: BudgetWindow,
+    pub spend_nanos: NanoUsd,
+    pub window_reset_at_ms: Option<i64>,
+    #[serde(default)]
+    pub allowed_models: Vec<String>,
+    #[serde(default)]
+    pub metadata: serde_json::Value,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BudgetRecord {
+    pub budget_id: String,
+    pub max_budget_nanos: Option<NanoUsd>,
+    pub soft_budget_nanos: Option<NanoUsd>,
+    pub max_parallel_requests: Option<u32>,
+    pub tpm_limit: Option<u64>,
+    pub rpm_limit: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget_duration: Option<String>,
+    #[serde(default)]
+    pub model_max_budget_nanos: BTreeMap<String, NanoUsd>,
+    pub budget_reset_at_ms: Option<i64>,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TagRecord {
+    pub tag_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub models: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget_id: Option<String>,
+    pub max_budget_nanos: Option<NanoUsd>,
+    pub spend_nanos: NanoUsd,
+    #[serde(default)]
+    pub metadata: serde_json::Value,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AccessGroupRecord {
+    pub access_group: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub model_names: Vec<String>,
+    #[serde(default)]
+    pub mcp_server_ids: Vec<String>,
+    pub max_budget_nanos: Option<NanoUsd>,
+    pub tpm_limit: Option<u64>,
+    pub rpm_limit: Option<u32>,
+    pub spend_nanos: NanoUsd,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -389,7 +470,11 @@ impl CredentialRecord {
             return false;
         }
         if let Some(model) = model {
-            if self.model_cooldowns.get(model).is_some_and(|&until| until > now_ms) {
+            if self
+                .model_cooldowns
+                .get(model)
+                .is_some_and(|&until| until > now_ms)
+            {
                 return false;
             }
         } else if self.model_cooldowns.values().any(|&until| until > now_ms) {
@@ -426,6 +511,8 @@ pub struct ModelRoute {
     pub pool_strategy: PoolStrategy,
     #[serde(default = "default_true")]
     pub allow_paid_overflow: bool,
+    #[serde(default)]
+    pub blocked: bool,
     pub input_nanos_per_m: Option<i64>,
     pub output_nanos_per_m: Option<i64>,
     pub cache_read_nanos_per_m: Option<i64>,
@@ -448,12 +535,18 @@ const fn default_true() -> bool {
 #[serde(rename_all = "snake_case")]
 pub enum IngressProtocol {
     ChatCompletions,
+    TextCompletions,
     Responses,
     ResponsesWs,
     AnthropicMessages,
     Gemini,
     VercelUi,
     Embeddings,
+    Images,
+    Audio,
+    Moderations,
+    Rerank,
+    Search,
     Mcp,
 }
 
@@ -461,24 +554,36 @@ impl IngressProtocol {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::ChatCompletions => "chat_completions",
+            Self::TextCompletions => "text_completions",
             Self::Responses => "responses",
             Self::ResponsesWs => "responses_ws",
             Self::AnthropicMessages => "anthropic_messages",
             Self::Gemini => "gemini",
             Self::VercelUi => "vercel_ui",
             Self::Embeddings => "embeddings",
+            Self::Images => "images",
+            Self::Audio => "audio",
+            Self::Moderations => "moderations",
+            Self::Rerank => "rerank",
+            Self::Search => "search",
             Self::Mcp => "mcp",
         }
     }
 
     pub fn parse(s: &str) -> Self {
         match s {
+            "text_completions" => Self::TextCompletions,
             "responses" => Self::Responses,
             "responses_ws" => Self::ResponsesWs,
             "anthropic_messages" => Self::AnthropicMessages,
             "gemini" => Self::Gemini,
             "vercel_ui" => Self::VercelUi,
             "embeddings" => Self::Embeddings,
+            "images" => Self::Images,
+            "audio" => Self::Audio,
+            "moderations" => Self::Moderations,
+            "rerank" => Self::Rerank,
+            "search" => Self::Search,
             "mcp" => Self::Mcp,
             _ => Self::ChatCompletions,
         }
@@ -612,10 +717,16 @@ pub struct GatewaySettings {
     #[serde(default = "default_true")]
     pub mcp_server_enabled: bool,
     /// Optional custom OpenAPI `/openapi.json` & `/docs` title (`DOCS_TITLE` / `QUIXIGATE_DOCS_TITLE`).
-    #[serde(default = "default_docs_title", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default = "default_docs_title",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub docs_title: Option<String>,
     /// Optional custom OpenAPI `/openapi.json` description (`DOCS_DESCRIPTION` / `QUIXIGATE_DOCS_DESCRIPTION`).
-    #[serde(default = "default_docs_description", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default = "default_docs_description",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub docs_description: Option<String>,
     /// Filter management & admin endpoints out of `/openapi.json` for unauthenticated/non-admin callers (`DOCS_FILTERED`).
     #[serde(default = "default_docs_filtered")]
@@ -804,8 +915,7 @@ fn default_secret_scanner_mode() -> SecretScannerMode {
 }
 
 fn default_docs_title() -> Option<String> {
-    crate::brand::env_opt("QUIXIGATE_DOCS_TITLE")
-        .or_else(|| crate::brand::env_opt("DOCS_TITLE"))
+    crate::brand::env_opt("QUIXIGATE_DOCS_TITLE").or_else(|| crate::brand::env_opt("DOCS_TITLE"))
 }
 
 fn default_docs_description() -> Option<String> {

@@ -19,8 +19,8 @@ use aisdk::core::{AssistantMessage, LanguageModel, Message, Tool, ToolCallInfo};
 use aisdk::extensions::Extensions;
 use aisdk::{Error, Result};
 use async_trait::async_trait;
-use quixigate_core::NanoUsd;
 use parking_lot::Mutex;
+use quixigate_core::NanoUsd;
 use serde_json::{Map, Value, json};
 
 use crate::sse::{self, SseDecoder};
@@ -131,7 +131,11 @@ impl GitHubCopilotModel {
         }
     }
 
-    async fn send(&self, options: &LanguageModelOptions, stream: bool) -> Result<reqwest::Response> {
+    async fn send(
+        &self,
+        options: &LanguageModelOptions,
+        stream: bool,
+    ) -> Result<reqwest::Response> {
         let has_agent_turns = options
             .messages()
             .iter()
@@ -552,12 +556,9 @@ impl CopilotStreamState {
             self.acc_reasoning = inline_r;
             self.acc_text = cleaned_t;
         }
-        let usage = reconcile_reasoning_usage(
-            self.usage.take(),
-            &self.acc_reasoning,
-            &self.acc_text,
-        )
-        .unwrap_or_default();
+        let usage =
+            reconcile_reasoning_usage(self.usage.take(), &self.acc_reasoning, &self.acc_text)
+                .unwrap_or_default();
         let mut items = Vec::new();
         if !self.acc_reasoning.is_empty() {
             items.push(LanguageModelResponseContentType::Reasoning {
@@ -746,10 +747,7 @@ fn flush_assistant_turn(
         obj.insert("content".into(), json!(std::mem::take(text)));
     }
     if !reasoning.is_empty() {
-        obj.insert(
-            "reasoning_content".into(),
-            json!(std::mem::take(reasoning)),
-        );
+        obj.insert("reasoning_content".into(), json!(std::mem::take(reasoning)));
     }
     if !tool_calls.is_empty() {
         obj.insert(
@@ -867,10 +865,7 @@ pub fn build_chat_completions_body(
     body.insert("messages".into(), Value::Array(messages));
     body.insert("stream".into(), json!(stream));
     if stream {
-        body.insert(
-            "stream_options".into(),
-            json!({ "include_usage": true }),
-        );
+        body.insert("stream_options".into(), json!({ "include_usage": true }));
     }
     if let Some(temp) = options.temperature {
         body.insert("temperature".into(), json!(temp as f64 / 100.0));

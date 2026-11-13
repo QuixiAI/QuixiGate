@@ -60,21 +60,27 @@ impl RuntimeLimiter {
                 .entry((scope_key.to_owned(), max_conc))
                 .or_insert_with(|| Arc::new(Semaphore::new(max_conc as usize)))
                 .clone();
-            Some(sem.try_acquire_owned().map_err(|_| QuixigateError::RateLimited {
-                message: format!("max concurrent requests ({max_conc}) exceeded"),
-                retry_after_secs: Some(1),
-            })?)
+            Some(
+                sem.try_acquire_owned()
+                    .map_err(|_| QuixigateError::RateLimited {
+                        message: format!("max concurrent requests ({max_conc}) exceeded"),
+                        retry_after_secs: Some(1),
+                    })?,
+            )
         } else {
             None
         };
 
         let now = now_ms();
         if rpm_limit.is_some() || tpm_limit.is_some() {
-            let mut entry = self.windows.entry(scope_key.to_owned()).or_insert(MinuteWindow {
-                window_start_ms: now,
-                requests: 0,
-                tokens: 0,
-            });
+            let mut entry = self
+                .windows
+                .entry(scope_key.to_owned())
+                .or_insert(MinuteWindow {
+                    window_start_ms: now,
+                    requests: 0,
+                    tokens: 0,
+                });
             if now - entry.window_start_ms >= MINUTE_MS {
                 entry.window_start_ms = now;
                 entry.requests = 0;
@@ -143,7 +149,9 @@ impl RuntimeLimiter {
             return Ok(());
         };
         let in_flight = NanoUsd(self.in_flight_nanos(budget_scope_key));
-        let projected = committed_spend.saturating_add(in_flight).saturating_add(reserve_nanos);
+        let projected = committed_spend
+            .saturating_add(in_flight)
+            .saturating_add(reserve_nanos);
         if projected > limit {
             return Err(QuixigateError::BudgetExceeded(format!(
                 "{scope_label} budget limit {} reached (spent {}, reserved {})",

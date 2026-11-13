@@ -7,13 +7,13 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use parking_lot::Mutex;
 use quixigate_auth::OAuthWizardManager;
 use quixigate_auth::quota::QuotaEndpoints;
 use quixigate_core::{QuixigateError, now_ms};
 use quixigate_db::Database;
 use quixigate_router::GatewayRouter;
 use quixigate_telemetry::TelemetryHub;
-use parking_lot::Mutex;
 use rand::RngCore;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -149,11 +149,7 @@ impl AppState {
 
     pub fn ui_status_json(&self) -> Value {
         let compiled_in = Self::is_ui_compiled_in();
-        let persisted = self
-            .db
-            .get_settings()
-            .map(|s| s.ui_enabled)
-            .unwrap_or(true);
+        let persisted = self.db.get_settings().map(|s| s.ui_enabled).unwrap_or(true);
         let runtime_override = self.ui_runtime_override();
         let enabled = self.is_ui_enabled();
         json!({
@@ -190,10 +186,7 @@ impl AppState {
         if let Some(forced) = *self.ui_override.lock() {
             return forced;
         }
-        self.db
-            .get_settings()
-            .map(|s| s.ui_enabled)
-            .unwrap_or(true)
+        self.db.get_settings().map(|s| s.ui_enabled).unwrap_or(true)
     }
 }
 
@@ -254,7 +247,8 @@ impl IntoResponse for ApiError {
         } = &self.0
             && let Ok(hv) = secs.to_string().parse()
         {
-            resp.headers_mut().insert(axum::http::header::RETRY_AFTER, hv);
+            resp.headers_mut()
+                .insert(axum::http::header::RETRY_AFTER, hv);
         }
 
         resp

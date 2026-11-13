@@ -50,7 +50,9 @@ pub async fn handle_vercel_ui_chat(
         .as_str()
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .ok_or_else(|| QuixigateError::Validation("missing 'model' in /api/chat request".to_owned()))?;
+        .ok_or_else(|| {
+            QuixigateError::Validation("missing 'model' in /api/chat request".to_owned())
+        })?;
     let online_flag = body["online"].as_bool().unwrap_or(false);
     let requested_model = if online_flag && !base_model.contains(":online") {
         format!("{base_model}:online")
@@ -227,11 +229,9 @@ pub async fn handle_vercel_ui_chat(
                         continue;
                     }
                     if !rsn_open {
-                        let _ = send_json(
-                            &tx,
-                            json!({ "type": "reasoning-start", "id": rsn_part_id }),
-                        )
-                        .await;
+                        let _ =
+                            send_json(&tx, json!({ "type": "reasoning-start", "id": rsn_part_id }))
+                                .await;
                         rsn_open = true;
                     }
                     let _ = send_json(
@@ -246,11 +246,9 @@ pub async fn handle_vercel_ui_chat(
                 }
                 RoutedStreamEvent::ReasoningEnd => {
                     if rsn_open {
-                        let _ = send_json(
-                            &tx,
-                            json!({ "type": "reasoning-end", "id": rsn_part_id }),
-                        )
-                        .await;
+                        let _ =
+                            send_json(&tx, json!({ "type": "reasoning-end", "id": rsn_part_id }))
+                                .await;
                         rsn_open = false;
                     }
                 }
@@ -259,17 +257,14 @@ pub async fn handle_vercel_ui_chat(
                         continue;
                     }
                     if rsn_open {
-                        let _ = send_json(
-                            &tx,
-                            json!({ "type": "reasoning-end", "id": rsn_part_id }),
-                        )
-                        .await;
+                        let _ =
+                            send_json(&tx, json!({ "type": "reasoning-end", "id": rsn_part_id }))
+                                .await;
                         rsn_open = false;
                     }
                     if !text_open {
-                        let _ =
-                            send_json(&tx, json!({ "type": "text-start", "id": text_part_id }))
-                                .await;
+                        let _ = send_json(&tx, json!({ "type": "text-start", "id": text_part_id }))
+                            .await;
                         text_open = true;
                     }
                     if send_json(
@@ -330,11 +325,9 @@ pub async fn handle_vercel_ui_chat(
                     output,
                 } => {
                     if rsn_open {
-                        let _ = send_json(
-                            &tx,
-                            json!({ "type": "reasoning-end", "id": rsn_part_id }),
-                        )
-                        .await;
+                        let _ =
+                            send_json(&tx, json!({ "type": "reasoning-end", "id": rsn_part_id }))
+                                .await;
                         rsn_open = false;
                     }
                     if text_open {
@@ -342,8 +335,8 @@ pub async fn handle_vercel_ui_chat(
                             send_json(&tx, json!({ "type": "text-end", "id": text_part_id })).await;
                         text_open = false;
                     }
-                    let parsed_output = serde_json::from_str::<Value>(&output)
-                        .unwrap_or(Value::String(output));
+                    let parsed_output =
+                        serde_json::from_str::<Value>(&output).unwrap_or(Value::String(output));
                     let _ = send_json(
                         &tx,
                         json!({
@@ -372,11 +365,9 @@ pub async fn handle_vercel_ui_chat(
                 }
                 RoutedStreamEvent::Finish(sum) => {
                     if rsn_open {
-                        let _ = send_json(
-                            &tx,
-                            json!({ "type": "reasoning-end", "id": rsn_part_id }),
-                        )
-                        .await;
+                        let _ =
+                            send_json(&tx, json!({ "type": "reasoning-end", "id": rsn_part_id }))
+                                .await;
                         rsn_open = false;
                     }
                     if text_open {
@@ -408,13 +399,13 @@ pub async fn handle_vercel_ui_chat(
                         }),
                     )
                     .await;
-                    let _ = send_json(&tx, json!({ "type": "finish", "finishReason": "stop" })).await;
+                    let _ =
+                        send_json(&tx, json!({ "type": "finish", "finishReason": "stop" })).await;
                     completed_summary = Some(sum);
                 }
                 RoutedStreamEvent::Error(err_msg) => {
                     stream_err = Some(err_msg.clone());
-                    let _ =
-                        send_json(&tx, json!({ "type": "error", "errorText": err_msg })).await;
+                    let _ = send_json(&tx, json!({ "type": "error", "errorText": err_msg })).await;
                     break;
                 }
                 _ => {}
@@ -428,7 +419,13 @@ pub async fn handle_vercel_ui_chat(
             let oi_tools = sum
                 .tool_calls
                 .iter()
-                .map(|tc| (tc.tool.id.clone(), tc.tool.name.clone(), tc.input.to_string()))
+                .map(|tc| {
+                    (
+                        tc.tool.id.clone(),
+                        tc.tool.name.clone(),
+                        tc.input.to_string(),
+                    )
+                })
                 .collect();
             let synth_resp = json!({
                 "content": sum.text,

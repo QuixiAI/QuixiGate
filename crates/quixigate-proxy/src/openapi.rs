@@ -43,13 +43,27 @@ pub async fn handle_api_root(State(state): State<AppState>, headers: HeaderMap) 
         "endpoints": {
             "inference": [
                 "POST /v1/chat/completions",
+                "POST /v1/completions",
                 "POST /v1/responses",
                 "GET  /v1/responses (WebSocket)",
+                "POST /v1/responses/input_tokens",
+                "POST /v1/responses/compact",
                 "POST /v1/messages",
                 "POST /v1/messages/count_tokens",
                 "POST /v1beta/models/{model}:{action}",
+                "POST /openai/deployments/{model}/chat/completions",
                 "POST /v1/embeddings",
+                "POST /v1/images/generations",
+                "POST /v1/images/edits",
+                "POST /v1/images/variations",
+                "POST /v1/audio/speech",
+                "POST /v1/audio/transcriptions",
+                "POST /v1/audio/translations",
+                "POST /v1/moderations",
+                "POST /v1/rerank",
+                "POST /v1/search",
                 "GET  /v1/models",
+                "GET  /v1/models/{model_id}",
                 "POST /api/chat"
             ],
             "management_litellm": [
@@ -129,10 +143,7 @@ pub async fn handle_docs(State(state): State<AppState>) -> Response {
 type OperationEntry = (&'static str, &'static str, &'static str);
 type PathEntry = (&'static str, &'static [OperationEntry]);
 
-pub async fn handle_openapi_json(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> Json<Value> {
+pub async fn handle_openapi_json(State(state): State<AppState>, headers: HeaderMap) -> Json<Value> {
     let ui_enabled = state.is_ui_enabled();
     let settings = state.db.get_settings().unwrap_or_default();
     let hide_mgmt = settings.docs_filtered
@@ -178,6 +189,185 @@ pub async fn handle_openapi_json(
         (
             "/v1/models",
             &[("get", "Inference", "List available models")],
+        ),
+        (
+            "/v1/models/{model_id}",
+            &[("get", "Inference", "Retrieve single model metadata")],
+        ),
+        (
+            "/v1/completions",
+            &[(
+                "post",
+                "Inference",
+                "OpenAI Legacy Text Completions (JSON & SSE)",
+            )],
+        ),
+        (
+            "/v1/responses/input_tokens",
+            &[(
+                "post",
+                "Inference",
+                "Count input tokens for an OpenAI Responses payload",
+            )],
+        ),
+        (
+            "/v1/responses/compact",
+            &[(
+                "post",
+                "Inference",
+                "Stateless multi-turn conversation compaction for OpenAI Responses",
+            )],
+        ),
+        (
+            "/openai/deployments/{model}/chat/completions",
+            &[(
+                "post",
+                "Inference",
+                "Azure OpenAI deployment-scoped Chat Completions",
+            )],
+        ),
+        (
+            "/v1/images/generations",
+            &[("post", "Inference", "OpenAI Image Generations")],
+        ),
+        (
+            "/v1/images/edits",
+            &[("post", "Inference", "OpenAI Image Edits")],
+        ),
+        (
+            "/v1/images/variations",
+            &[("post", "Inference", "OpenAI Image Variations")],
+        ),
+        (
+            "/v1/audio/speech",
+            &[("post", "Inference", "OpenAI Text-to-Speech (TTS)")],
+        ),
+        (
+            "/v1/audio/transcriptions",
+            &[("post", "Inference", "OpenAI Whisper Audio Transcriptions")],
+        ),
+        (
+            "/v1/audio/translations",
+            &[("post", "Inference", "OpenAI Whisper Audio Translations")],
+        ),
+        (
+            "/v1/moderations",
+            &[(
+                "post",
+                "Inference",
+                "OpenAI Moderations (upstream + local secret/injection classifier)",
+            )],
+        ),
+        (
+            "/v1/rerank",
+            &[(
+                "post",
+                "Inference",
+                "Cohere / Jina / Voyage compatible Document Reranking",
+            )],
+        ),
+        (
+            "/v1/search",
+            &[(
+                "post",
+                "Inference",
+                "6-Engine Web Search Waterfall (Tavily, Exa, Brave, Perplexity, SearXNG, Keyless)",
+            )],
+        ),
+        (
+            "/v1/search/tools",
+            &[("get", "Inference", "List available web search engines")],
+        ),
+        (
+            "/utils/token_counter",
+            &[(
+                "post",
+                "LiteLLM Developer Utils",
+                "Count tokens for text or chat messages",
+            )],
+        ),
+        (
+            "/utils/supported_openai_params",
+            &[(
+                "get",
+                "LiteLLM Developer Utils",
+                "List supported OpenAI parameters for a model",
+            )],
+        ),
+        (
+            "/utils/model_info",
+            &[(
+                "get",
+                "LiteLLM Developer Utils",
+                "Inspect catalog capabilities & NanoUsd pricing for a model",
+            )],
+        ),
+        (
+            "/utils/transform_request",
+            &[(
+                "post",
+                "LiteLLM Developer Utils",
+                "Dry-run inspect canonical request normalization & target resolution",
+            )],
+        ),
+        (
+            "/cost/estimate",
+            &[(
+                "post",
+                "LiteLLM Developer Utils",
+                "Pre-flight NanoUsd / USD cost estimator",
+            )],
+        ),
+        (
+            "/apply_guardrail",
+            &[(
+                "post",
+                "LiteLLM Developer Utils",
+                "Test built-in secret scanner & keyword blocklist guardrails",
+            )],
+        ),
+        (
+            "/customer/new",
+            &[("post", "LiteLLM End-Users", "Create/upsert end-user budget")],
+        ),
+        (
+            "/end_user/new",
+            &[("post", "LiteLLM End-Users", "Create/upsert end-user budget")],
+        ),
+        (
+            "/budget/new",
+            &[("post", "LiteLLM Budgets", "Create standalone budget record")],
+        ),
+        (
+            "/tag/new",
+            &[("post", "LiteLLM Tags", "Create managed spend tag & budget")],
+        ),
+        (
+            "/access_group/new",
+            &[(
+                "post",
+                "LiteLLM Access Groups",
+                "Create named model/MCP access group",
+            )],
+        ),
+        (
+            "/fallback",
+            &[(
+                "post",
+                "LiteLLM Fallbacks",
+                "Configure ordered model fallback chain",
+            )],
+        ),
+        (
+            "/v1/mcp/server",
+            &[
+                ("get", "MCP", "List registered upstream MCP servers"),
+                (
+                    "post",
+                    "MCP",
+                    "Register upstream Streamable-HTTP MCP server",
+                ),
+            ],
         ),
         (
             "/api/v1/presets",
@@ -260,10 +450,7 @@ pub async fn handle_openapi_json(
                 "Inspect a virtual key or current caller key",
             )],
         ),
-        (
-            "/key/list",
-            &[("get", "LiteLLM Keys", "List virtual keys")],
-        ),
+        ("/key/list", &[("get", "LiteLLM Keys", "List virtual keys")]),
         (
             "/key/regenerate",
             &[(
@@ -304,10 +491,7 @@ pub async fn handle_openapi_json(
                 "Update user role, display alias, password, or budget",
             )],
         ),
-        (
-            "/user/delete",
-            &[("post", "LiteLLM Users", "Delete users")],
-        ),
+        ("/user/delete", &[("post", "LiteLLM Users", "Delete users")]),
         (
             "/user/block",
             &[("post", "LiteLLM Users", "Block one or more users")],
@@ -337,10 +521,7 @@ pub async fn handle_openapi_json(
             "/team/update",
             &[("post", "LiteLLM Teams", "Update team settings and budget")],
         ),
-        (
-            "/team/delete",
-            &[("post", "LiteLLM Teams", "Delete teams")],
-        ),
+        ("/team/delete", &[("post", "LiteLLM Teams", "Delete teams")]),
         (
             "/team/info",
             &[("get", "LiteLLM Teams", "Get team details and keys")],
@@ -415,11 +596,7 @@ pub async fn handle_openapi_json(
         ),
         (
             "/credentials/{id}",
-            &[(
-                "delete",
-                "LiteLLM Credentials",
-                "Delete vault credential",
-            )],
+            &[("delete", "LiteLLM Credentials", "Delete vault credential")],
         ),
         (
             "/spend/logs",
@@ -558,7 +735,11 @@ pub async fn handle_openapi_json(
         ),
         (
             "/api/admin/auth/login",
-            &[("post", "QuixiGate Admin", "Sign in and mint qxs_... session")],
+            &[(
+                "post",
+                "QuixiGate Admin",
+                "Sign in and mint qxs_... session",
+            )],
         ),
         (
             "/api/admin/auth/logout",
@@ -736,11 +917,19 @@ pub async fn handle_openapi_json(
         ),
         (
             "/api/admin/oauth/sessions/{id}/complete",
-            &[("post", "QuixiGate Admin", "Complete OAuth callback exchange")],
+            &[(
+                "post",
+                "QuixiGate Admin",
+                "Complete OAuth callback exchange",
+            )],
         ),
         (
             "/api/admin/models",
-            &[("get", "QuixiGate Admin", "List models (active_only=true|false)")],
+            &[(
+                "get",
+                "QuixiGate Admin",
+                "List models (active_only=true|false)",
+            )],
         ),
         (
             "/api/admin/models/sync",
@@ -798,7 +987,11 @@ pub async fn handle_openapi_json(
         ),
         (
             "/api/admin/local-runtimes/{id}/load",
-            &[("post", "QuixiGate Admin", "Warm/load model on local runtime")],
+            &[(
+                "post",
+                "QuixiGate Admin",
+                "Warm/load model on local runtime",
+            )],
         ),
         (
             "/api/admin/local-runtimes/{id}/unload",
@@ -1024,7 +1217,11 @@ pub async fn handle_openapi_json(
         // Health & Metrics
         (
             "/robots.txt",
-            &[("get", "Health", "Search engine & web crawler Disallow policy")],
+            &[(
+                "get",
+                "Health",
+                "Search engine & web crawler Disallow policy",
+            )],
         ),
         ("/health", &[("get", "Health", "Gateway liveness check")]),
         (

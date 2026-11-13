@@ -40,14 +40,16 @@ pub async fn handle_embeddings(
             .filter_map(|v| v.as_str().map(str::to_owned))
             .collect(),
         _ => {
-            return Err(
-                QuixigateError::Validation("'input' must be a string or array of strings".to_owned())
-                    .into(),
-            );
+            return Err(QuixigateError::Validation(
+                "'input' must be a string or array of strings".to_owned(),
+            )
+            .into());
         }
     };
     if inputs.is_empty() {
-        return Err(QuixigateError::Validation("embeddings 'input' cannot be empty".to_owned()).into());
+        return Err(
+            QuixigateError::Validation("embeddings 'input' cannot be empty".to_owned()).into(),
+        );
     }
 
     let dimensions = body["dimensions"].as_u64().map(|v| v as usize);
@@ -248,8 +250,7 @@ pub async fn handle_list_models(
                 pat == "*"
                     || pat == &m.canonical_id
                     || pat == &m.bare_id
-                    || (pat.ends_with('*')
-                        && m.canonical_id.starts_with(pat.trim_end_matches('*')))
+                    || (pat.ends_with('*') && m.canonical_id.starts_with(pat.trim_end_matches('*')))
             })
         {
             continue;
@@ -258,8 +259,10 @@ pub async fn handle_list_models(
         if !query.all && !has_ready_seat {
             continue;
         }
-        let per_tok_prompt = (m.input_nanos_per_m.nanos() as f64) / 1_000_000.0 / (NANOS_PER_USD as f64);
-        let per_tok_comp = (m.output_nanos_per_m.nanos() as f64) / 1_000_000.0 / (NANOS_PER_USD as f64);
+        let per_tok_prompt =
+            (m.input_nanos_per_m.nanos() as f64) / 1_000_000.0 / (NANOS_PER_USD as f64);
+        let per_tok_comp =
+            (m.output_nanos_per_m.nanos() as f64) / 1_000_000.0 / (NANOS_PER_USD as f64);
 
         data.push(json!({
             "id": m.canonical_id,
@@ -396,7 +399,10 @@ pub async fn handle_openrouter_credits(
     let (spend, limit) = if let Some(vk) = &principal.virtual_key {
         (vk.spend_nanos, vk.budget_limit_nanos)
     } else {
-        (principal.user.spend_nanos, principal.user.budget_limit_nanos)
+        (
+            principal.user.spend_nanos,
+            principal.user.budget_limit_nanos,
+        )
     };
     let total_usage = (spend.nanos() as f64) / (NANOS_PER_USD as f64);
     let total_credits = limit

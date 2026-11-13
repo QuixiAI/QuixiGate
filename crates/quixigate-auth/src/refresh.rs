@@ -206,13 +206,16 @@ impl CredentialRefresher {
                 enterprise_domain,
                 ..
             } => {
-                let exchange_url = if let Some(override_url) = &self.endpoints.copilot_domain_override
-                {
-                    format!("{}/copilot_internal/v2/token", override_url.trim_end_matches('/'))
-                } else {
-                    let dom = enterprise_domain.as_deref().unwrap_or("github.com");
-                    format!("https://api.{dom}/copilot_internal/v2/token")
-                };
+                let exchange_url =
+                    if let Some(override_url) = &self.endpoints.copilot_domain_override {
+                        format!(
+                            "{}/copilot_internal/v2/token",
+                            override_url.trim_end_matches('/')
+                        )
+                    } else {
+                        let dom = enterprise_domain.as_deref().unwrap_or("github.com");
+                        format!("https://api.{dom}/copilot_internal/v2/token")
+                    };
                 let renewed = providers::exchange_github_for_copilot(
                     &self.http,
                     &exchange_url,

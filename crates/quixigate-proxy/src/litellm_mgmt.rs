@@ -6,13 +6,13 @@
 //! and exact `NanoUsd(i64)` accounting so headless scripts, Terraform providers, and
 //! existing LiteLLM tooling can manage QuixiGate with zero Web UI dependency.
 
+use axum::Json;
 use axum::Router;
 use axum::extract::{Path, Query, State};
 use axum::http::HeaderMap;
 use axum::routing::{delete, get, patch, post};
-use axum::Json;
 use quixigate_core::{
-    AuthKind, BudgetWindow, CredentialSecret, ModelRoute, NanoUsd, QuixigateError, PoolStrategy,
+    AuthKind, BudgetWindow, CredentialSecret, ModelRoute, NanoUsd, PoolStrategy, QuixigateError,
     RouteTarget, Team, User, UserRole, VirtualKey, now_ms,
 };
 use quixigate_db::LogFilter;
@@ -67,7 +67,11 @@ pub fn router() -> Router<AppState> {
             "/credentials",
             get(get_litellm_credentials).post(post_litellm_credential),
         )
-        .route("/credentials/{id}", delete(delete_litellm_credential))
+        .route(
+            "/credentials/{id}",
+            delete(delete_litellm_credential)
+                .patch(crate::litellm_mgmt_ext::patch_litellm_credential),
+        )
         // Spend, Audit, Cache, Config, UI, Health
         .route("/spend/logs", get(get_spend_logs))
         .route("/spend/report", get(crate::admin::get_spend_report))
@@ -90,17 +94,21 @@ pub fn router() -> Router<AppState> {
                 .put(crate::admin::set_ui_status)
                 .patch(crate::admin::set_ui_status),
         )
-        .route("/health/liveliness", get(get_health_liveliness))
+        .route(
+            "/health/liveliness",
+            get(get_health_liveliness).options(crate::litellm_mgmt_ext::options_ok),
+        )
+        .merge(crate::litellm_mgmt_ext::router())
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
-fn nanos_to_json_number(n: NanoUsd) -> Value {
+pub(crate) fn nanos_to_json_number(n: NanoUsd) -> Value {
     let dec = n.to_decimal_string();
     serde_json::from_str::<Value>(&dec).unwrap_or(Value::String(dec))
 }
 
-fn parse_budget_value(val: Option<&Value>) -> quixigate_core::Result<Option<NanoUsd>> {
+pub(crate) fn parse_budget_value(val: Option<&Value>) -> quixigate_core::Result<Option<NanoUsd>> {
     let Some(v) = val else {
         return Ok(None);
     };
@@ -122,7 +130,7 @@ fn parse_budget_value(val: Option<&Value>) -> quixigate_core::Result<Option<Nano
     )))
 }
 
-fn parse_budget_window_str(raw: Option<&str>) -> BudgetWindow {
+pub(crate) fn parse_budget_window_str(raw: Option<&str>) -> BudgetWindow {
     let Some(s) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
         return BudgetWindow::Total;
     };
@@ -153,7 +161,7 @@ fn parse_duration_to_expires_ms(raw: Option<&str>) -> Option<i64> {
     Some(now_ms().saturating_add(secs.saturating_mul(1_000)))
 }
 
-fn parse_litellm_role(raw: Option<&str>) -> Option<UserRole> {
+pub(crate) fn parse_litellm_role(raw: Option<&str>) -> Option<UserRole> {
     match raw?.trim().to_ascii_lowercase().as_str() {
         "proxy_admin" | "admin" | "owner" => Some(UserRole::Admin),
         "proxy_admin_viewer" | "internal_user_viewer" | "viewer" | "read_only" => {
@@ -164,7 +172,7 @@ fn parse_litellm_role(raw: Option<&str>) -> Option<UserRole> {
     }
 }
 
-fn format_model_budgets_json(
+pub(crate) fn format_model_budgets_json(
     map: &std::collections::BTreeMap<String, NanoUsd>,
 ) -> serde_json::Map<String, Value> {
     map.iter()
@@ -172,7 +180,7 @@ fn format_model_budgets_json(
         .collect()
 }
 
-fn format_virtual_key_litellm(vk: &VirtualKey, raw_key: Option<&str>) -> Value {
+pub(crate) fn format_virtual_key_litellm(vk: &VirtualKey, raw_key: Option<&str>) -> Value {
     let mut obj = json!({
         "token": vk.id,
         "token_id": vk.id,
@@ -213,7 +221,7 @@ fn format_virtual_key_litellm(vk: &VirtualKey, raw_key: Option<&str>) -> Value {
     obj
 }
 
-fn format_user_litellm(u: &User) -> Value {
+pub(crate) fn format_user_litellm(u: &User) -> Value {
     json!({
         "user_id": u.id,
         "username": u.username,
@@ -235,10 +243,13 @@ fn format_user_litellm(u: &User) -> Value {
     })
 }
 
-fn format_team_litellm(t: &Team) -> Value {
+pub(crate) fn format_team_litellm(t: &Team) -> Value {
     json!({
         "team_id": t.id,
         "team_alias": t.name,
+        "blocked": t.blocked,
+        "disable_logging": t.disable_logging,
+        "models": t.allowed_models,
         "spend": nanos_to_json_number(t.spend_nanos),
         "spend_nanos": t.spend_nanos.nanos(),
         "spend_usd": t.spend_nanos.to_decimal_string(),
@@ -452,12 +463,7 @@ pub async fn post_key_update(
     let model_budgets = parse_model_budget_map(req.model_max_budget.as_ref())?;
     let next_tags: Option<Vec<String>> = if let Some(explicit) = &req.tags {
         Some(extract_tags_from_litellm(explicit, req.metadata.as_ref()))
-    } else if req
-        .metadata
-        .as_ref()
-        .and_then(|m| m.get("tags"))
-        .is_some()
-    {
+    } else if req.metadata.as_ref().and_then(|m| m.get("tags")).is_some() {
         Some(extract_tags_from_litellm(&[], req.metadata.as_ref()))
     } else {
         None
@@ -633,15 +639,10 @@ pub async fn get_key_list(
         .filter(|k| {
             let team_scope_ok = match &admin_teams {
                 None => true,
-                Some(teams) => k
-                    .team_id
-                    .as_ref()
-                    .is_some_and(|tid| teams.contains(tid)),
+                Some(teams) => k.team_id.as_ref().is_some_and(|tid| teams.contains(tid)),
             };
             team_scope_ok
-                && q.user_id
-                    .as_deref()
-                    .is_none_or(|u| k.user_id == u.trim())
+                && q.user_id.as_deref().is_none_or(|u| k.user_id == u.trim())
                 && q.team_id
                     .as_deref()
                     .is_none_or(|t| k.team_id.as_deref() == Some(t.trim()))
@@ -1134,7 +1135,9 @@ pub async fn post_team_new(
         .db
         .create_team(&name, budget, window, &req.member_ids)?;
     if !role_pairs.is_empty() {
-        team = state.db.add_team_members_with_roles(&team.id, &role_pairs)?;
+        team = state
+            .db
+            .add_team_members_with_roles(&team.id, &role_pairs)?;
     }
     if !merged_tags.is_empty() || model_budgets.is_some() {
         team = state.db.set_team_policy(
@@ -1199,12 +1202,7 @@ pub async fn post_team_update(
     let model_budgets = parse_model_budget_map(req.model_max_budget.as_ref())?;
     let next_tags = if let Some(explicit) = &req.tags {
         Some(extract_tags_from_litellm(explicit, req.metadata.as_ref()))
-    } else if req
-        .metadata
-        .as_ref()
-        .and_then(|m| m.get("tags"))
-        .is_some()
-    {
+    } else if req.metadata.as_ref().and_then(|m| m.get("tags")).is_some() {
         Some(extract_tags_from_litellm(&[], req.metadata.as_ref()))
     } else {
         None
@@ -1221,11 +1219,9 @@ pub async fn post_team_update(
         req.member_ids.as_deref(),
     )?;
     if next_tags.is_some() || model_budgets.is_some() {
-        team = state.db.set_team_policy(
-            &team.id,
-            next_tags.as_deref(),
-            model_budgets.as_ref(),
-        )?;
+        team = state
+            .db
+            .set_team_policy(&team.id, next_tags.as_deref(), model_budgets.as_ref())?;
     }
     record_audit(
         &state,
@@ -1529,7 +1525,10 @@ pub async fn post_model_new(
             "team admin cannot overwrite a global route or another team's route".to_owned(),
         )));
     }
-    let mut targets = existing.as_ref().map(|r| r.targets.clone()).unwrap_or_default();
+    let mut targets = existing
+        .as_ref()
+        .map(|r| r.targets.clone())
+        .unwrap_or_default();
     let new_target = RouteTarget {
         model: upstream_model.clone(),
         provider_id: Some(provider_id.clone()),
@@ -1554,7 +1553,8 @@ pub async fn post_model_new(
         .or_else(|| existing.as_ref().and_then(|e| e.output_nanos_per_m));
 
     let now = now_ms();
-    let effective_team = team_id_clean.or_else(|| existing.as_ref().and_then(|e| e.team_id.clone()));
+    let effective_team =
+        team_id_clean.or_else(|| existing.as_ref().and_then(|e| e.team_id.clone()));
     let saved = state.db.upsert_model_route(&ModelRoute {
         alias: alias.clone(),
         targets,
@@ -1563,6 +1563,7 @@ pub async fn post_model_new(
             .map(|e| e.pool_strategy)
             .unwrap_or(PoolStrategy::FillFirst),
         allow_paid_overflow: true,
+        blocked: existing.as_ref().is_some_and(|e| e.blocked),
         input_nanos_per_m: input_nanos,
         output_nanos_per_m: output_nanos,
         cache_read_nanos_per_m: existing.as_ref().and_then(|e| e.cache_read_nanos_per_m),
@@ -1572,13 +1573,20 @@ pub async fn post_model_new(
             .and_then(|e| e.created_by.clone())
             .or_else(|| Some(principal.user.id.clone())),
         updated_by: Some(principal.user.id.clone()),
-        created_at_ms: existing.as_ref().and_then(|e| e.created_at_ms).or(Some(now)),
+        created_at_ms: existing
+            .as_ref()
+            .and_then(|e| e.created_at_ms)
+            .or(Some(now)),
         updated_at_ms: now,
     })?;
     record_audit(
         &state,
         &principal,
-        if existing.is_some() { "update" } else { "create" },
+        if existing.is_some() {
+            "update"
+        } else {
+            "create"
+        },
         "routes",
         &saved.alias,
         existing.and_then(|e| serde_json::to_value(e).ok()),
@@ -1820,9 +1828,16 @@ pub async fn post_litellm_credential(
     let provider_id = req
         .credential_info
         .as_ref()
-        .and_then(|v| v.get("custom_llm_provider").or_else(|| v.get("provider_id")))
+        .and_then(|v| {
+            v.get("custom_llm_provider")
+                .or_else(|| v.get("provider_id"))
+        })
         .and_then(Value::as_str)
-        .or_else(|| req.credential_values.get("provider_id").and_then(Value::as_str))
+        .or_else(|| {
+            req.credential_values
+                .get("provider_id")
+                .and_then(Value::as_str)
+        })
         .unwrap_or("openai");
     let api_key = req
         .credential_values
@@ -2044,7 +2059,10 @@ pub async fn post_spend_calculate(
         .completion_tokens
         .or_else(|| {
             usage_obj
-                .and_then(|u| u.get("completion_tokens").or_else(|| u.get("output_tokens")))
+                .and_then(|u| {
+                    u.get("completion_tokens")
+                        .or_else(|| u.get("output_tokens"))
+                })
                 .and_then(Value::as_u64)
         })
         .unwrap_or(0);
@@ -2102,7 +2120,9 @@ pub async fn post_global_spend_reset(
 ) -> ApiResult<Json<Value>> {
     let _principal = authenticate_admin(&state, &headers, true)?;
     state.db.reset_spend(None, None, None, true)?;
-    Ok(Json(json!({ "ok": true, "message": "Global spend counters reset to 0" })))
+    Ok(Json(
+        json!({ "ok": true, "message": "Global spend counters reset to 0" }),
+    ))
 }
 
 pub async fn get_cache_ping(
@@ -2163,8 +2183,11 @@ pub async fn post_config_yaml(
     let _principal = authenticate_admin(&state, &headers, true)?;
     let content = match req.yaml {
         Some(s) => s,
-        None => serde_yaml_ng::to_string(&req.raw_object)
-            .map_err(|e| ApiError(QuixigateError::Validation(format!("invalid YAML payload: {e}"))))?,
+        None => serde_yaml_ng::to_string(&req.raw_object).map_err(|e| {
+            ApiError(QuixigateError::Validation(format!(
+                "invalid YAML payload: {e}"
+            )))
+        })?,
     };
     let applied = state.db.import_config(&content, Some("yaml"))?;
     state.clear_ui_override();

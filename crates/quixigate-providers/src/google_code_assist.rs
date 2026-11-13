@@ -87,7 +87,11 @@ impl GoogleCodeAssistModel {
         }
     }
 
-    async fn send(&self, options: &LanguageModelOptions, stream: bool) -> Result<reqwest::Response> {
+    async fn send(
+        &self,
+        options: &LanguageModelOptions,
+        stream: bool,
+    ) -> Result<reqwest::Response> {
         let body = build_code_assist_body(options, &self.tools);
         let mut req = self
             .http
@@ -518,10 +522,7 @@ pub fn build_code_assist_body(options: &LanguageModelOptions, tools: &[Tool]) ->
                 })
             })
             .collect();
-        body.insert(
-            "tools".into(),
-            json!([{ "functionDeclarations": decls }]),
-        );
+        body.insert("tools".into(), json!([{ "functionDeclarations": decls }]));
     }
 
     let mut gen_cfg = Map::new();

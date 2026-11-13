@@ -7,7 +7,9 @@ use std::time::Instant;
 
 use aisdk::core::language_model::LanguageModelResponseContentType;
 use aisdk::core::tools::ToolDetails;
-use aisdk::core::{AssistantMessage, Message, SystemMessage, ToolCallInfo, ToolResultInfo, UserMessage};
+use aisdk::core::{
+    AssistantMessage, Message, SystemMessage, ToolCallInfo, ToolResultInfo, UserMessage,
+};
 use axum::Json;
 use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
 use axum::extract::{Query, State};
@@ -33,12 +35,17 @@ pub struct WsQuery {
     pub model: Option<String>,
 }
 
-fn parse_responses_canonical(body: &Value, headers: &HeaderMap) -> quixigate_core::Result<CanonicalRequest> {
+fn parse_responses_canonical(
+    body: &Value,
+    headers: &HeaderMap,
+) -> quixigate_core::Result<CanonicalRequest> {
     let requested_model = body["model"]
         .as_str()
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .ok_or_else(|| QuixigateError::Validation("missing 'model' in Responses request".to_owned()))?
+        .ok_or_else(|| {
+            QuixigateError::Validation("missing 'model' in Responses request".to_owned())
+        })?
         .to_owned();
 
     let mut system_parts = Vec::new();
@@ -291,7 +298,13 @@ pub async fn handle_responses_post(
                 let oi_tools = gen_out
                     .tool_calls
                     .iter()
-                    .map(|tc| (tc.tool.id.clone(), tc.tool.name.clone(), tc.input.to_string()))
+                    .map(|tc| {
+                        (
+                            tc.tool.id.clone(),
+                            tc.tool.name.clone(),
+                            tc.input.to_string(),
+                        )
+                    })
                     .collect();
 
                 finalize_request_accounting(
@@ -536,7 +549,9 @@ pub async fn handle_responses_post(
                             "error": { "message": err_msg }
                         });
                         let _ = tx
-                            .send(Ok(Event::default().event("error").data(fail_ev.to_string())))
+                            .send(Ok(Event::default()
+                                .event("error")
+                                .data(fail_ev.to_string())))
                             .await;
                         break;
                     }
@@ -549,7 +564,13 @@ pub async fn handle_responses_post(
                 let oi_tools = sum
                     .tool_calls
                     .iter()
-                    .map(|tc| (tc.tool.id.clone(), tc.tool.name.clone(), tc.input.to_string()))
+                    .map(|tc| {
+                        (
+                            tc.tool.id.clone(),
+                            tc.tool.name.clone(),
+                            tc.input.to_string(),
+                        )
+                    })
                     .collect();
                 finalize_request_accounting(
                     &state_bg,
@@ -828,7 +849,13 @@ async fn run_responses_websocket(
             let oi_tools = sum
                 .tool_calls
                 .iter()
-                .map(|tc| (tc.tool.id.clone(), tc.tool.name.clone(), tc.input.to_string()))
+                .map(|tc| {
+                    (
+                        tc.tool.id.clone(),
+                        tc.tool.name.clone(),
+                        tc.input.to_string(),
+                    )
+                })
                 .collect();
             finalize_request_accounting(
                 &state,

@@ -9,16 +9,16 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use argon2::Argon2;
 use argon2::password_hash::rand_core::OsRng;
 use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
-use argon2::Argon2;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 pub use limiter::ConcurrencyGuard;
 use limiter::RuntimeLimiter;
+use parking_lot::{Mutex, RwLock};
 use quixigate_core::*;
 use quixigate_vault::Vault;
-use parking_lot::{Mutex, RwLock};
 use rand::RngCore;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -64,7 +64,7 @@ impl AuthenticatedPrincipal {
     }
 }
 
-/// RAII reservation of estimated `NanoUsd` across virtual key, user, team, model, and tag budgets.
+/// RAII reservation of estimated `NanoUsd` across virtual key, user, team, end-user, model, and tag budgets.
 pub struct BudgetGuard {
     db: Database,
     scopes: Vec<String>,
@@ -75,6 +75,7 @@ pub struct BudgetGuard {
     user_id: Option<String>,
     team_id: Option<String>,
     virtual_key_id: Option<String>,
+    end_user_id: Option<String>,
     committed: bool,
 }
 
@@ -91,18 +92,22 @@ impl BudgetGuard {
         self.suppress_log = suppress;
     }
 
-    /// Commits exact `actual_cost` to SQLite (`users`, `teams`, `virtual_keys`, `scoped_spend`)
+    /// Commits exact `actual_cost` to SQLite (`users`, `teams`, `virtual_keys`, `end_users`, `scoped_spend`)
     /// and releases in-flight reservation.
     pub fn commit(mut self, actual_cost: NanoUsd) -> Result<()> {
         for scope in &self.scopes {
-            self.db.inner.limiter.add_in_flight(scope, -self.reserved.nanos());
+            self.db
+                .inner
+                .limiter
+                .add_in_flight(scope, -self.reserved.nanos());
         }
         self.committed = true;
         if actual_cost.nanos() > 0 {
-            self.db.record_spend_with_scopes(
+            self.db.record_spend_full(
                 self.user_id.as_deref(),
                 self.team_id.as_deref(),
                 self.virtual_key_id.as_deref(),
+                self.end_user_id.as_deref(),
                 &self.durable_scopes,
                 actual_cost,
             )?;
@@ -115,7 +120,10 @@ impl Drop for BudgetGuard {
     fn drop(&mut self) {
         if !self.committed {
             for scope in &self.scopes {
-                self.db.inner.limiter.add_in_flight(scope, -self.reserved.nanos());
+                self.db
+                    .inner
+                    .limiter
+                    .add_in_flight(scope, -self.reserved.nanos());
             }
         }
     }
@@ -348,7 +356,9 @@ impl Database {
     ) -> Result<User> {
         let username = username.trim();
         if username.is_empty() {
-            return Err(QuixigateError::Validation("username cannot be empty".to_owned()));
+            return Err(QuixigateError::Validation(
+                "username cannot be empty".to_owned(),
+            ));
         }
         let id = format!("usr_{}", Uuid::new_v4().simple());
         let now = now_ms();
@@ -380,7 +390,9 @@ impl Database {
                     now
                 ],
             )
-            .map_err(|e| QuixigateError::Validation(format!("could not create user '{username}': {e}")))?;
+            .map_err(|e| {
+                QuixigateError::Validation(format!("could not create user '{username}': {e}"))
+            })?;
         }
         self.get_user(&id)
     }
@@ -486,7 +498,9 @@ impl Database {
             )
             .optional()
             .map_err(storage_err)?
-            .ok_or_else(|| QuixigateError::Unauthorized("invalid username or password".to_owned()))?
+            .ok_or_else(|| {
+                QuixigateError::Unauthorized("invalid username or password".to_owned())
+            })?
         };
         if user.blocked {
             return Err(QuixigateError::Forbidden(format!(
@@ -573,7 +587,8 @@ impl Database {
         let mut stmt = conn
             .prepare(
                 "SELECT id, name, budget_limit_nanos, budget_window, spend_nanos,
-                        window_reset_at_ms, created_at_ms, tags_json, model_budgets_json
+                        window_reset_at_ms, created_at_ms, tags_json, model_budgets_json,
+                        blocked, disable_logging, allowed_models_json
                  FROM teams ORDER BY created_at_ms ASC",
             )
             .map_err(storage_err)?;
@@ -581,9 +596,13 @@ impl Database {
             .query_map([], |row| {
                 let tags_json: String = row.get(7)?;
                 let mb_json: String = row.get(8)?;
+                let allowed_json: String = row.get(11).unwrap_or_else(|_| "[]".to_owned());
                 Ok(Team {
                     id: row.get(0)?,
                     name: row.get(1)?,
+                    blocked: row.get::<_, i32>(9).unwrap_or(0) != 0,
+                    disable_logging: row.get::<_, i32>(10).unwrap_or(0) != 0,
+                    allowed_models: serde_json::from_str(&allowed_json).unwrap_or_default(),
                     budget_limit_nanos: row.get::<_, Option<i64>>(2)?.map(NanoUsd),
                     budget_window: BudgetWindow::parse(&row.get::<_, String>(3)?),
                     spend_nanos: NanoUsd(row.get(4)?),
@@ -630,7 +649,9 @@ impl Database {
     ) -> Result<Team> {
         let trimmed = name.trim();
         if trimmed.is_empty() {
-            return Err(QuixigateError::Validation("team name cannot be empty".to_owned()));
+            return Err(QuixigateError::Validation(
+                "team name cannot be empty".to_owned(),
+            ));
         }
         let id = format!("team_{}", Uuid::new_v4().simple());
         let now = now_ms();
@@ -801,7 +822,9 @@ impl Database {
     ) -> Result<Team> {
         let existing = self.get_team(id)?;
         let next_tags = match tags {
-            Some(t) => serde_json::to_string(&normalize_string_list(t)).unwrap_or_else(|_| "[]".to_owned()),
+            Some(t) => {
+                serde_json::to_string(&normalize_string_list(t)).unwrap_or_else(|_| "[]".to_owned())
+            }
             None => serde_json::to_string(&existing.tags).unwrap_or_else(|_| "[]".to_owned()),
         };
         let next_mb = match model_budgets {
@@ -813,6 +836,47 @@ impl Database {
             conn.execute(
                 "UPDATE teams SET tags_json = ?1, model_budgets_json = ?2 WHERE id = ?3",
                 params![next_tags, next_mb, existing.id],
+            )
+            .map_err(storage_err)?;
+        }
+        self.get_team(&existing.id)
+    }
+
+    pub fn set_team_blocked(&self, id: &str, blocked: bool) -> Result<Team> {
+        let existing = self.get_team(id)?;
+        {
+            let conn = self.inner.conn.lock();
+            conn.execute(
+                "UPDATE teams SET blocked = ?1 WHERE id = ?2",
+                params![i32::from(blocked), existing.id],
+            )
+            .map_err(storage_err)?;
+        }
+        self.get_team(&existing.id)
+    }
+
+    pub fn set_team_disable_logging(&self, id: &str, disable_logging: bool) -> Result<Team> {
+        let existing = self.get_team(id)?;
+        {
+            let conn = self.inner.conn.lock();
+            conn.execute(
+                "UPDATE teams SET disable_logging = ?1 WHERE id = ?2",
+                params![i32::from(disable_logging), existing.id],
+            )
+            .map_err(storage_err)?;
+        }
+        self.get_team(&existing.id)
+    }
+
+    pub fn set_team_allowed_models(&self, id: &str, models: &[String]) -> Result<Team> {
+        let existing = self.get_team(id)?;
+        let normalized = normalize_string_list(models);
+        let json = serde_json::to_string(&normalized).unwrap_or_else(|_| "[]".to_owned());
+        {
+            let conn = self.inner.conn.lock();
+            conn.execute(
+                "UPDATE teams SET allowed_models_json = ?1 WHERE id = ?2",
+                params![json, existing.id],
             )
             .map_err(storage_err)?;
         }
@@ -926,25 +990,32 @@ impl Database {
     ) -> Result<(VirtualKey, String)> {
         let trimmed = name.trim();
         if trimmed.is_empty() {
-            return Err(QuixigateError::Validation("key name cannot be empty".to_owned()));
+            return Err(QuixigateError::Validation(
+                "key name cannot be empty".to_owned(),
+            ));
         }
         // Confirm user exists and resolve canonical user.id.
         let owner = self.get_user(user_id)?;
         let id = format!("key_{}", Uuid::new_v4().simple());
-        let (raw_key, prefix, digest) = match custom_raw_token.map(str::trim).filter(|s| !s.is_empty()) {
-            Some(custom) => {
-                if custom.len() < 16 || !custom.chars().all(|c| c.is_ascii_graphic()) {
-                    return Err(QuixigateError::Validation(
+        let (raw_key, prefix, digest) =
+            match custom_raw_token.map(str::trim).filter(|s| !s.is_empty()) {
+                Some(custom) => {
+                    if custom.len() < 16 || !custom.chars().all(|c| c.is_ascii_graphic()) {
+                        return Err(QuixigateError::Validation(
                         "custom virtual key token must be at least 16 printable ASCII characters"
                             .to_owned(),
                     ));
+                    }
+                    let pfx = format!(
+                        "{}…{}",
+                        &custom[..12.min(custom.len())],
+                        &custom[custom.len() - 4..]
+                    );
+                    let dig = sha256_bytes(custom.as_bytes());
+                    (custom.to_owned(), pfx, dig)
                 }
-                let pfx = format!("{}…{}", &custom[..12.min(custom.len())], &custom[custom.len() - 4..]);
-                let dig = sha256_bytes(custom.as_bytes());
-                (custom.to_owned(), pfx, dig)
-            }
-            None => generate_virtual_key_material(),
-        };
+                None => generate_virtual_key_material(),
+            };
         let now = now_ms();
         let reset_at = budget_window.next_reset_ms(now);
         let models_json = serde_json::to_string(allowed_models).unwrap_or_else(|_| "[]".to_owned());
@@ -994,17 +1065,22 @@ impl Database {
         let id = self.resolve_virtual_key_id(id_or_token)?;
         let existing = self.get_virtual_key(&id)?;
         let next_tags = match tags {
-            Some(t) => serde_json::to_string(&normalize_string_list(t)).unwrap_or_else(|_| "[]".to_owned()),
+            Some(t) => {
+                serde_json::to_string(&normalize_string_list(t)).unwrap_or_else(|_| "[]".to_owned())
+            }
             None => serde_json::to_string(&existing.tags).unwrap_or_else(|_| "[]".to_owned()),
         };
         let next_mb = match model_budgets {
             Some(m) => serialize_model_budgets_json(m),
             None => serialize_model_budgets_json(&existing.model_budgets_nanos),
         };
-        let next_cidrs = match allowed_cidrs {
-            Some(c) => serde_json::to_string(&normalize_string_list(c)).unwrap_or_else(|_| "[]".to_owned()),
-            None => serde_json::to_string(&existing.allowed_cidrs).unwrap_or_else(|_| "[]".to_owned()),
-        };
+        let next_cidrs =
+            match allowed_cidrs {
+                Some(c) => serde_json::to_string(&normalize_string_list(c))
+                    .unwrap_or_else(|_| "[]".to_owned()),
+                None => serde_json::to_string(&existing.allowed_cidrs)
+                    .unwrap_or_else(|_| "[]".to_owned()),
+            };
         let next_spend_read = allow_spend_read.unwrap_or(existing.allow_spend_read);
         {
             let conn = self.inner.conn.lock();
@@ -1129,7 +1205,9 @@ impl Database {
     pub fn resolve_virtual_key_id(&self, id_or_token: &str) -> Result<String> {
         let trimmed = id_or_token.trim();
         if trimmed.is_empty() {
-            return Err(QuixigateError::Validation("key identifier cannot be empty".to_owned()));
+            return Err(QuixigateError::Validation(
+                "key identifier cannot be empty".to_owned(),
+            ));
         }
         let conn = self.inner.conn.lock();
         if let Some(id) = conn
@@ -1193,7 +1271,9 @@ impl Database {
         let existing = self.get_virtual_key(&id)?;
         let next_name = name.unwrap_or(&existing.name).trim();
         if next_name.is_empty() {
-            return Err(QuixigateError::Validation("key name cannot be empty".to_owned()));
+            return Err(QuixigateError::Validation(
+                "key name cannot be empty".to_owned(),
+            ));
         }
         let next_user_id = match user_id.map(str::trim).filter(|s| !s.is_empty()) {
             Some(uid) => {
@@ -1203,7 +1283,10 @@ impl Database {
             None => existing.user_id,
         };
         let next_team_id = match team_id {
-            Some(opt) => opt.map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned),
+            Some(opt) => opt
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned),
             None => existing.team_id,
         };
         let next_budget = budget_limit.unwrap_or(existing.budget_limit_nanos);
@@ -1218,7 +1301,9 @@ impl Database {
         let next_conc = max_concurrent.unwrap_or(existing.max_concurrent);
         let next_models = match allowed_models {
             Some(m) => serde_json::to_string(m).unwrap_or_else(|_| "[]".to_owned()),
-            None => serde_json::to_string(&existing.allowed_models).unwrap_or_else(|_| "[]".to_owned()),
+            None => {
+                serde_json::to_string(&existing.allowed_models).unwrap_or_else(|_| "[]".to_owned())
+            }
         };
         let next_log = log_payloads.unwrap_or(existing.log_payloads);
         let next_exp = expires_at_ms.unwrap_or(existing.expires_at_ms);
@@ -1296,7 +1381,9 @@ impl Database {
 
             if let Some((vk, stored_digest)) = primary {
                 if stored_digest.ct_eq(&candidate_digest).unwrap_u8() != 1 {
-                    return Err(QuixigateError::Unauthorized("invalid virtual key".to_owned()));
+                    return Err(QuixigateError::Unauthorized(
+                        "invalid virtual key".to_owned(),
+                    ));
                 }
                 vk
             } else {
@@ -1311,7 +1398,9 @@ impl Database {
                     .optional()
                     .map_err(storage_err)?;
                 let Some(vk_id) = rotated_id else {
-                    return Err(QuixigateError::Unauthorized("invalid virtual key".to_owned()));
+                    return Err(QuixigateError::Unauthorized(
+                        "invalid virtual key".to_owned(),
+                    ));
                 };
                 conn.query_row(
                     &format!("SELECT {VIRTUAL_KEY_COLUMNS} FROM virtual_keys WHERE id = ?1"),
@@ -1380,6 +1469,25 @@ impl Database {
         estimated_paid_nanos: NanoUsd,
         request_tags: &[String],
     ) -> Result<(ConcurrencyGuard, BudgetGuard)> {
+        self.authorize_and_reserve_full(
+            principal,
+            requested_model,
+            estimated_tokens,
+            estimated_paid_nanos,
+            request_tags,
+            None,
+        )
+    }
+
+    pub fn authorize_and_reserve_full(
+        &self,
+        principal: &AuthenticatedPrincipal,
+        requested_model: &str,
+        estimated_tokens: u64,
+        estimated_paid_nanos: NanoUsd,
+        request_tags: &[String],
+        end_user_id: Option<&str>,
+    ) -> Result<(ConcurrencyGuard, BudgetGuard)> {
         if principal.user.blocked {
             return Err(QuixigateError::Forbidden(format!(
                 "user '{}' is blocked",
@@ -1389,28 +1497,35 @@ impl Database {
 
         let base_model = ModelSpec::parse(requested_model).base_model;
 
-        // Enforce team-scoped custom model routes (`model_routes.team_id`).
-        if let Some(route) = self.get_model_route(&base_model)?
-            && let Some(route_tid) = route.team_id.as_deref().filter(|s| !s.is_empty())
-            && !principal.via_master_key
-            && principal.user.role != UserRole::Admin
-        {
-            let eff_tid = principal.effective_team_id();
-            let eff_matches_team = eff_tid.as_deref() == Some(route_tid);
-            let user_in_team = self.is_team_member(route_tid, &principal.user.id)?;
-            if !(eff_matches_team || (principal.virtual_key.is_none() && user_in_team)) {
+        // Enforce blocked & team-scoped custom model routes (`model_routes`).
+        if let Some(route) = self.get_model_route(&base_model)? {
+            if route.blocked {
                 return Err(QuixigateError::Forbidden(format!(
-                    "model '{requested_model}' is scoped to team '{route_tid}'"
+                    "model '{requested_model}' is currently blocked"
                 )));
+            }
+            if let Some(route_tid) = route.team_id.as_deref().filter(|s| !s.is_empty())
+                && !principal.via_master_key
+                && principal.user.role != UserRole::Admin
+            {
+                let eff_tid = principal.effective_team_id();
+                let eff_matches_team = eff_tid.as_deref() == Some(route_tid);
+                let user_in_team = self.is_team_member(route_tid, &principal.user.id)?;
+                if !(eff_matches_team || (principal.virtual_key.is_none() && user_in_team)) {
+                    return Err(QuixigateError::Forbidden(format!(
+                        "model '{requested_model}' is scoped to team '{route_tid}'"
+                    )));
+                }
             }
         }
 
         let concurrency_guard = if let Some(vk) = &principal.virtual_key {
             if !vk.allowed_models.is_empty()
-                && !vk
-                    .allowed_models
-                    .iter()
-                    .any(|pat| glob_matches(pat, requested_model) || glob_matches(pat, &base_model))
+                && !self.model_matches_allowlist(
+                    &vk.allowed_models,
+                    requested_model,
+                    &base_model,
+                )?
             {
                 return Err(QuixigateError::Forbidden(format!(
                     "virtual key '{}' is not permitted to access model '{requested_model}'",
@@ -1426,13 +1541,19 @@ impl Database {
                 estimated_tokens,
             )?
         } else {
-            self.inner
-                .limiter
-                .check_and_acquire("global:loopback", None, None, None, estimated_tokens)?
+            self.inner.limiter.check_and_acquire(
+                "global:loopback",
+                None,
+                None,
+                None,
+                estimated_tokens,
+            )?
         };
 
         let mut scopes = Vec::new();
         let mut durable_scopes = Vec::new();
+        let mut suppress_log = false;
+        let clean_end_user = end_user_id.map(str::trim).filter(|s| !s.is_empty());
         let mut effective_tags: Vec<String> = request_tags
             .iter()
             .map(|s| s.trim())
@@ -1443,6 +1564,91 @@ impl Database {
                 }
                 acc
             });
+
+        // Pre-flight team & end_user policy checks (apply even when estimated_paid_nanos == 0).
+        {
+            let conn = self.inner.conn.lock();
+            self.refresh_expired_windows_locked(&conn, now_ms())?;
+
+            if let Some(tid) = principal.effective_team_id()
+                && let Some((t_name, t_blocked, t_disable_log, t_allowed_json)) = conn
+                    .query_row(
+                        "SELECT name, blocked, disable_logging, allowed_models_json
+                         FROM teams WHERE id = ?1",
+                        params![tid],
+                        |r| {
+                            Ok((
+                                r.get::<_, String>(0)?,
+                                r.get::<_, i32>(1).unwrap_or(0) != 0,
+                                r.get::<_, i32>(2).unwrap_or(0) != 0,
+                                r.get::<_, String>(3).unwrap_or_else(|_| "[]".to_owned()),
+                            ))
+                        },
+                    )
+                    .optional()
+                    .map_err(storage_err)?
+            {
+                if t_blocked {
+                    return Err(QuixigateError::Forbidden(format!(
+                        "team '{t_name}' is blocked"
+                    )));
+                }
+                if t_disable_log {
+                    suppress_log = true;
+                }
+                let t_allowed: Vec<String> =
+                    serde_json::from_str(&t_allowed_json).unwrap_or_default();
+                if !t_allowed.is_empty()
+                    && !model_matches_allowlist_locked(
+                        &conn,
+                        &t_allowed,
+                        requested_model,
+                        &base_model,
+                    )?
+                {
+                    return Err(QuixigateError::Forbidden(format!(
+                        "team '{t_name}' is not permitted to access model '{requested_model}'"
+                    )));
+                }
+            }
+
+            if let Some(eu_id) = clean_end_user
+                && let Some((eu_blocked, eu_allowed_json)) = conn
+                    .query_row(
+                        "SELECT blocked, allowed_models_json FROM end_users WHERE user_id = ?1",
+                        params![eu_id],
+                        |r| {
+                            Ok((
+                                r.get::<_, i32>(0).unwrap_or(0) != 0,
+                                r.get::<_, String>(1).unwrap_or_else(|_| "[]".to_owned()),
+                            ))
+                        },
+                    )
+                    .optional()
+                    .map_err(storage_err)?
+            {
+                if eu_blocked {
+                    return Err(QuixigateError::Forbidden(format!(
+                        "end_user '{eu_id}' is blocked"
+                    )));
+                }
+                let eu_allowed: Vec<String> =
+                    serde_json::from_str(&eu_allowed_json).unwrap_or_default();
+                if !eu_allowed.is_empty()
+                    && !model_matches_allowlist_locked(
+                        &conn,
+                        &eu_allowed,
+                        requested_model,
+                        &base_model,
+                    )?
+                {
+                    return Err(QuixigateError::Forbidden(format!(
+                        "end_user '{eu_id}' is not permitted to access model '{requested_model}'"
+                    )));
+                }
+            }
+        }
+
         if estimated_paid_nanos.nanos() >= 0 {
             let settings = self.inner.settings_cache.read().clone();
             let conn = self.inner.conn.lock();
@@ -1562,20 +1768,83 @@ impl Database {
                 }
             }
 
-            // Global tag-based max budgets (`tag_budgets_nanos`)
+            // End-user / Customer budget gate (`end_users` + linked `budgets`)
+            if let Some(eu_id) = clean_end_user {
+                if let Some((eu_spend, eu_limit, eu_budget_id)) = conn
+                    .query_row(
+                        "SELECT spend_nanos, budget_limit_nanos, budget_id
+                         FROM end_users WHERE user_id = ?1",
+                        params![eu_id],
+                        |r| {
+                            Ok((
+                                r.get::<_, i64>(0)?,
+                                r.get::<_, Option<i64>>(1)?,
+                                r.get::<_, Option<String>>(2)?,
+                            ))
+                        },
+                    )
+                    .optional()
+                    .map_err(storage_err)?
+                {
+                    let linked_limit = match eu_budget_id.as_deref() {
+                        Some(bid) => conn
+                            .query_row(
+                                "SELECT max_budget_nanos FROM budgets WHERE budget_id = ?1",
+                                params![bid],
+                                |r| r.get::<_, Option<i64>>(0),
+                            )
+                            .optional()
+                            .map_err(storage_err)?
+                            .flatten(),
+                        None => None,
+                    };
+                    let eff_limit = eu_limit.or(linked_limit);
+                    let eu_scope = format!("budget:end_user:{eu_id}");
+                    self.inner.limiter.check_scope_budget(
+                        &format!("end_user '{eu_id}'"),
+                        &eu_scope,
+                        NanoUsd(eu_spend),
+                        eff_limit.map(NanoUsd),
+                        estimated_paid_nanos,
+                    )?;
+                    scopes.push(eu_scope);
+                }
+                durable_scopes.push(format!("end_user:{eu_id}"));
+            }
+
+            // Global tag-based max budgets (`settings.tag_budgets_nanos` + `tags` table)
             for tag in &effective_tags {
-                if let Some(tag_limit) = settings.tag_budgets_nanos.get(tag) {
-                    let db_scope = format!("tag:{tag}");
+                let db_scope = format!("tag:{tag}");
+                let table_limit: Option<i64> = conn
+                    .query_row(
+                        "SELECT COALESCE(t.max_budget_nanos, b.max_budget_nanos)
+                         FROM tags t
+                         LEFT JOIN budgets b ON t.budget_id = b.budget_id
+                         WHERE t.tag_name = ?1",
+                        params![tag],
+                        |r| r.get::<_, Option<i64>>(0),
+                    )
+                    .optional()
+                    .map_err(storage_err)?
+                    .flatten();
+                let eff_tag_limit = settings
+                    .tag_budgets_nanos
+                    .get(tag)
+                    .copied()
+                    .or_else(|| table_limit.map(NanoUsd));
+                if let Some(tag_limit) = eff_tag_limit {
                     let lim_scope = format!("budget:{db_scope}");
                     let cur_spend = query_scoped_spend_locked(&conn, &db_scope)?;
                     self.inner.limiter.check_scope_budget(
                         &format!("tag '{tag}'"),
                         &lim_scope,
                         NanoUsd(cur_spend),
-                        Some(*tag_limit),
+                        Some(tag_limit),
                         estimated_paid_nanos,
                     )?;
                     scopes.push(lim_scope);
+                }
+                if !durable_scopes.contains(&db_scope) {
                     durable_scopes.push(db_scope);
                 }
             }
@@ -1592,11 +1861,12 @@ impl Database {
             scopes,
             durable_scopes,
             effective_tags,
-            suppress_log: false,
+            suppress_log,
             reserved: estimated_paid_nanos,
             user_id: Some(principal.user.id.clone()),
             team_id: principal.effective_team_id(),
             virtual_key_id: principal.virtual_key.as_ref().map(|k| k.id.clone()),
+            end_user_id: clean_end_user.map(str::to_owned),
             committed: false,
         };
         Ok((concurrency_guard, budget_guard))
@@ -1609,7 +1879,7 @@ impl Database {
         virtual_key_id: Option<&str>,
         cost: NanoUsd,
     ) -> Result<()> {
-        self.record_spend_with_scopes(user_id, team_id, virtual_key_id, &[], cost)
+        self.record_spend_full(user_id, team_id, virtual_key_id, None, &[], cost)
     }
 
     pub fn record_spend_with_scopes(
@@ -1617,6 +1887,18 @@ impl Database {
         user_id: Option<&str>,
         team_id: Option<&str>,
         virtual_key_id: Option<&str>,
+        durable_scopes: &[String],
+        cost: NanoUsd,
+    ) -> Result<()> {
+        self.record_spend_full(user_id, team_id, virtual_key_id, None, durable_scopes, cost)
+    }
+
+    pub fn record_spend_full(
+        &self,
+        user_id: Option<&str>,
+        team_id: Option<&str>,
+        virtual_key_id: Option<&str>,
+        end_user_id: Option<&str>,
         durable_scopes: &[String],
         cost: NanoUsd,
     ) -> Result<()> {
@@ -1644,6 +1926,13 @@ impl Database {
             conn.execute(
                 "UPDATE virtual_keys SET spend_nanos = spend_nanos + ?1 WHERE id = ?2",
                 params![nanos, kid],
+            )
+            .map_err(storage_err)?;
+        }
+        if let Some(eu_id) = end_user_id {
+            conn.execute(
+                "UPDATE end_users SET spend_nanos = spend_nanos + ?1, updated_at_ms = ?2 WHERE user_id = ?3",
+                params![nanos, now, eu_id],
             )
             .map_err(storage_err)?;
         }
@@ -1679,6 +1968,8 @@ impl Database {
             conn.execute("UPDATE teams SET spend_nanos = 0", [])
                 .map_err(storage_err)?;
             conn.execute("UPDATE virtual_keys SET spend_nanos = 0", [])
+                .map_err(storage_err)?;
+            conn.execute("UPDATE end_users SET spend_nanos = 0", [])
                 .map_err(storage_err)?;
             conn.execute("DELETE FROM scoped_spend", [])
                 .map_err(storage_err)?;
@@ -1720,10 +2011,15 @@ impl Database {
     }
 
     fn refresh_expired_windows_locked(&self, conn: &Connection, now: i64) -> Result<()> {
-        for table in ["users", "teams", "virtual_keys"] {
+        for (table, id_col) in [
+            ("users", "id"),
+            ("teams", "id"),
+            ("virtual_keys", "id"),
+            ("end_users", "user_id"),
+        ] {
             let mut stmt = conn
                 .prepare(&format!(
-                    "SELECT id, budget_window FROM {table}
+                    "SELECT {id_col}, budget_window FROM {table}
                      WHERE window_reset_at_ms IS NOT NULL AND window_reset_at_ms <= ?1"
                 ))
                 .map_err(storage_err)?;
@@ -1737,7 +2033,7 @@ impl Database {
                 let next_reset = BudgetWindow::parse(&win_str).next_reset_ms(now);
                 conn.execute(
                     &format!(
-                        "UPDATE {table} SET spend_nanos = 0, window_reset_at_ms = ?1 WHERE id = ?2"
+                        "UPDATE {table} SET spend_nanos = 0, window_reset_at_ms = ?1 WHERE {id_col} = ?2"
                     ),
                     params![next_reset, id],
                 )
@@ -1840,7 +2136,9 @@ impl Database {
             .map_err(storage_err)?
         };
         if updated == 0 {
-            return Err(QuixigateError::NotFound(format!("credential '{id}' not found")));
+            return Err(QuixigateError::NotFound(format!(
+                "credential '{id}' not found"
+            )));
         }
         Ok(())
     }
@@ -1967,12 +2265,7 @@ impl Database {
         Ok(())
     }
 
-    pub fn record_credential_cooldown(
-        &self,
-        id: &str,
-        until_ms: i64,
-        reason: &str,
-    ) -> Result<()> {
+    pub fn record_credential_cooldown(&self, id: &str, until_ms: i64, reason: &str) -> Result<()> {
         let conn = self.inner.conn.lock();
         conn.execute(
             "UPDATE credentials
@@ -2036,8 +2329,9 @@ impl Database {
     }
 
     pub fn save_quota_snapshot(&self, id: &str, snapshot: &QuotaSnapshot) -> Result<()> {
-        let json = serde_json::to_string(snapshot)
-            .map_err(|e| QuixigateError::Storage(format!("quota snapshot serialize failed: {e}")))?;
+        let json = serde_json::to_string(snapshot).map_err(|e| {
+            QuixigateError::Storage(format!("quota snapshot serialize failed: {e}"))
+        })?;
         let conn = self.inner.conn.lock();
         conn.execute(
             "UPDATE credentials SET quota_snapshot_json = ?1 WHERE id = ?2",
@@ -2078,7 +2372,9 @@ impl Database {
     pub fn upsert_model_route(&self, route: &ModelRoute) -> Result<ModelRoute> {
         let alias = route.alias.trim();
         if alias.is_empty() {
-            return Err(QuixigateError::Validation("route alias cannot be empty".to_owned()));
+            return Err(QuixigateError::Validation(
+                "route alias cannot be empty".to_owned(),
+            ));
         }
         let targets_json = serde_json::to_string(&route.targets)
             .map_err(|e| QuixigateError::Validation(format!("invalid route targets: {e}")))?;
@@ -2097,14 +2393,15 @@ impl Database {
             let conn = self.inner.conn.lock();
             conn.execute(
                 "INSERT INTO model_routes (
-                    alias, targets_json, pool_strategy, allow_paid_overflow,
+                    alias, targets_json, pool_strategy, allow_paid_overflow, blocked,
                     input_nanos_per_m, output_nanos_per_m, cache_read_nanos_per_m,
                     team_id, created_by, updated_by, created_at_ms, updated_at_ms
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
                  ON CONFLICT(alias) DO UPDATE SET
                     targets_json = excluded.targets_json,
                     pool_strategy = excluded.pool_strategy,
                     allow_paid_overflow = excluded.allow_paid_overflow,
+                    blocked = excluded.blocked,
                     input_nanos_per_m = excluded.input_nanos_per_m,
                     output_nanos_per_m = excluded.output_nanos_per_m,
                     cache_read_nanos_per_m = excluded.cache_read_nanos_per_m,
@@ -2118,6 +2415,7 @@ impl Database {
                     targets_json,
                     strategy,
                     i32::from(route.allow_paid_overflow),
+                    i32::from(route.blocked),
                     route.input_nanos_per_m,
                     route.output_nanos_per_m,
                     route.cache_read_nanos_per_m,
@@ -2134,10 +2432,519 @@ impl Database {
             .ok_or_else(|| QuixigateError::NotFound(alias.to_owned()))
     }
 
+    pub fn set_model_route_blocked(&self, alias: &str, blocked: bool) -> Result<ModelRoute> {
+        let trimmed = alias.trim();
+        if trimmed.is_empty() {
+            return Err(QuixigateError::Validation(
+                "model alias cannot be empty".to_owned(),
+            ));
+        }
+        let now = now_ms();
+        let existing = self.get_model_route(trimmed)?;
+        match existing {
+            Some(mut r) => {
+                r.blocked = blocked;
+                r.updated_at_ms = now;
+                self.upsert_model_route(&r)
+            }
+            None => self.upsert_model_route(&ModelRoute {
+                alias: trimmed.to_owned(),
+                targets: vec![RouteTarget {
+                    model: trimmed.to_owned(),
+                    provider_id: None,
+                    credential_id: None,
+                }],
+                pool_strategy: PoolStrategy::FillFirst,
+                allow_paid_overflow: true,
+                blocked,
+                input_nanos_per_m: None,
+                output_nanos_per_m: None,
+                cache_read_nanos_per_m: None,
+                team_id: None,
+                created_by: None,
+                updated_by: None,
+                created_at_ms: Some(now),
+                updated_at_ms: now,
+            }),
+        }
+    }
+
     pub fn delete_model_route(&self, alias: &str) -> Result<()> {
         let conn = self.inner.conn.lock();
         conn.execute("DELETE FROM model_routes WHERE alias = ?1", params![alias])
             .map_err(storage_err)?;
+        Ok(())
+    }
+
+    fn model_matches_allowlist(
+        &self,
+        patterns: &[String],
+        requested_model: &str,
+        base_model: &str,
+    ) -> Result<bool> {
+        let conn = self.inner.conn.lock();
+        model_matches_allowlist_locked(&conn, patterns, requested_model, base_model)
+    }
+
+    // ── End-Users / Customers (`end_users`) ──────────────────────────────────
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn upsert_end_user(
+        &self,
+        user_id: &str,
+        alias: Option<&str>,
+        blocked: Option<bool>,
+        budget_id: Option<Option<&str>>,
+        budget_limit: Option<Option<NanoUsd>>,
+        budget_window: Option<BudgetWindow>,
+        allowed_models: Option<&[String]>,
+        metadata: Option<&serde_json::Value>,
+    ) -> Result<EndUser> {
+        let uid = user_id.trim();
+        if uid.is_empty() {
+            return Err(QuixigateError::Validation(
+                "user_id cannot be empty".to_owned(),
+            ));
+        }
+        let existing = self.get_end_user(uid).ok();
+        let now = now_ms();
+        let next_alias = match alias {
+            Some(a) => Some(a.trim().to_owned()).filter(|s| !s.is_empty()),
+            None => existing.as_ref().and_then(|e| e.alias.clone()),
+        };
+        let next_blocked = blocked.unwrap_or_else(|| existing.as_ref().is_some_and(|e| e.blocked));
+        let next_budget_id = match budget_id {
+            Some(opt) => opt
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned),
+            None => existing.as_ref().and_then(|e| e.budget_id.clone()),
+        };
+        let next_limit = match budget_limit {
+            Some(v) => v,
+            None => existing.as_ref().and_then(|e| e.budget_limit_nanos),
+        };
+        let next_window = budget_window.unwrap_or_else(|| {
+            existing
+                .as_ref()
+                .map(|e| e.budget_window)
+                .unwrap_or(BudgetWindow::Monthly)
+        });
+        let next_reset = if budget_window.is_some() || existing.is_none() {
+            next_window.next_reset_ms(now)
+        } else {
+            existing.as_ref().and_then(|e| e.window_reset_at_ms)
+        };
+        let next_models = match allowed_models {
+            Some(m) => normalize_string_list(m),
+            None => existing
+                .as_ref()
+                .map(|e| e.allowed_models.clone())
+                .unwrap_or_default(),
+        };
+        let models_json = serde_json::to_string(&next_models).unwrap_or_else(|_| "[]".to_owned());
+        let next_meta = match metadata {
+            Some(v) => v.clone(),
+            None => existing
+                .as_ref()
+                .map(|e| e.metadata.clone())
+                .unwrap_or_else(|| serde_json::json!({})),
+        };
+        let meta_json = serde_json::to_string(&next_meta).unwrap_or_else(|_| "{}".to_owned());
+        let created_at = existing.as_ref().map(|e| e.created_at_ms).unwrap_or(now);
+        let spend = existing
+            .as_ref()
+            .map(|e| e.spend_nanos.nanos())
+            .unwrap_or(0);
+        {
+            let conn = self.inner.conn.lock();
+            conn.execute(
+                "INSERT INTO end_users (
+                    user_id, alias, blocked, budget_id, budget_limit_nanos, budget_window,
+                    spend_nanos, window_reset_at_ms, allowed_models_json, metadata_json,
+                    created_at_ms, updated_at_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                 ON CONFLICT(user_id) DO UPDATE SET
+                    alias = excluded.alias,
+                    blocked = excluded.blocked,
+                    budget_id = excluded.budget_id,
+                    budget_limit_nanos = excluded.budget_limit_nanos,
+                    budget_window = excluded.budget_window,
+                    window_reset_at_ms = excluded.window_reset_at_ms,
+                    allowed_models_json = excluded.allowed_models_json,
+                    metadata_json = excluded.metadata_json,
+                    updated_at_ms = excluded.updated_at_ms",
+                params![
+                    uid,
+                    next_alias,
+                    i32::from(next_blocked),
+                    next_budget_id,
+                    next_limit.map(NanoUsd::nanos),
+                    next_window.as_str(),
+                    spend,
+                    next_reset,
+                    models_json,
+                    meta_json,
+                    created_at,
+                    now
+                ],
+            )
+            .map_err(storage_err)?;
+        }
+        self.get_end_user(uid)
+    }
+
+    pub fn get_end_user(&self, user_id: &str) -> Result<EndUser> {
+        let trimmed = user_id.trim();
+        let conn = self.inner.conn.lock();
+        self.refresh_expired_windows_locked(&conn, now_ms())?;
+        conn.query_row(
+            "SELECT user_id, alias, blocked, budget_id, budget_limit_nanos, budget_window,
+                    spend_nanos, window_reset_at_ms, allowed_models_json, metadata_json,
+                    created_at_ms, updated_at_ms
+             FROM end_users WHERE user_id = ?1",
+            params![trimmed],
+            map_end_user_row,
+        )
+        .optional()
+        .map_err(storage_err)?
+        .ok_or_else(|| QuixigateError::NotFound(format!("end_user '{trimmed}' not found")))
+    }
+
+    pub fn list_end_users(&self) -> Result<Vec<EndUser>> {
+        let conn = self.inner.conn.lock();
+        self.refresh_expired_windows_locked(&conn, now_ms())?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT user_id, alias, blocked, budget_id, budget_limit_nanos, budget_window,
+                        spend_nanos, window_reset_at_ms, allowed_models_json, metadata_json,
+                        created_at_ms, updated_at_ms
+                 FROM end_users ORDER BY created_at_ms ASC",
+            )
+            .map_err(storage_err)?;
+        let rows = stmt
+            .query_map([], map_end_user_row)
+            .map_err(storage_err)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(storage_err)?;
+        Ok(rows)
+    }
+
+    pub fn set_end_user_blocked(&self, user_id: &str, blocked: bool) -> Result<EndUser> {
+        self.upsert_end_user(user_id, None, Some(blocked), None, None, None, None, None)
+    }
+
+    pub fn delete_end_users(&self, user_ids: &[String]) -> Result<usize> {
+        let conn = self.inner.conn.lock();
+        let mut deleted = 0usize;
+        for uid in user_ids {
+            let trimmed = uid.trim();
+            if !trimmed.is_empty() {
+                deleted += conn
+                    .execute("DELETE FROM end_users WHERE user_id = ?1", params![trimmed])
+                    .map_err(storage_err)?;
+                let _ = conn.execute(
+                    "DELETE FROM scoped_spend WHERE scope_key = ?1",
+                    params![format!("end_user:{trimmed}")],
+                );
+            }
+        }
+        Ok(deleted)
+    }
+
+    // ── Standalone Budgets (`budgets`) ───────────────────────────────────────
+
+    pub fn upsert_budget(&self, b: &BudgetRecord) -> Result<BudgetRecord> {
+        let id = b.budget_id.trim();
+        if id.is_empty() {
+            return Err(QuixigateError::Validation(
+                "budget_id cannot be empty".to_owned(),
+            ));
+        }
+        let now = now_ms();
+        let existing = self.get_budget(id).ok();
+        let created_at = existing.as_ref().map(|e| e.created_at_ms).unwrap_or(now);
+        let mmb_json = serialize_model_budgets_json(&b.model_max_budget_nanos);
+        {
+            let conn = self.inner.conn.lock();
+            conn.execute(
+                "INSERT INTO budgets (
+                    budget_id, max_budget_nanos, soft_budget_nanos, max_parallel_requests,
+                    tpm_limit, rpm_limit, budget_duration, model_max_budget_json,
+                    budget_reset_at_ms, created_at_ms, updated_at_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                 ON CONFLICT(budget_id) DO UPDATE SET
+                    max_budget_nanos = excluded.max_budget_nanos,
+                    soft_budget_nanos = excluded.soft_budget_nanos,
+                    max_parallel_requests = excluded.max_parallel_requests,
+                    tpm_limit = excluded.tpm_limit,
+                    rpm_limit = excluded.rpm_limit,
+                    budget_duration = excluded.budget_duration,
+                    model_max_budget_json = excluded.model_max_budget_json,
+                    budget_reset_at_ms = excluded.budget_reset_at_ms,
+                    updated_at_ms = excluded.updated_at_ms",
+                params![
+                    id,
+                    b.max_budget_nanos.map(NanoUsd::nanos),
+                    b.soft_budget_nanos.map(NanoUsd::nanos),
+                    b.max_parallel_requests,
+                    b.tpm_limit.map(|v| v as i64),
+                    b.rpm_limit,
+                    b.budget_duration,
+                    mmb_json,
+                    b.budget_reset_at_ms,
+                    created_at,
+                    now
+                ],
+            )
+            .map_err(storage_err)?;
+        }
+        self.get_budget(id)
+    }
+
+    pub fn get_budget(&self, budget_id: &str) -> Result<BudgetRecord> {
+        let trimmed = budget_id.trim();
+        let conn = self.inner.conn.lock();
+        conn.query_row(
+            "SELECT budget_id, max_budget_nanos, soft_budget_nanos, max_parallel_requests,
+                    tpm_limit, rpm_limit, budget_duration, model_max_budget_json,
+                    budget_reset_at_ms, created_at_ms, updated_at_ms
+             FROM budgets WHERE budget_id = ?1",
+            params![trimmed],
+            map_budget_row,
+        )
+        .optional()
+        .map_err(storage_err)?
+        .ok_or_else(|| QuixigateError::NotFound(format!("budget '{trimmed}' not found")))
+    }
+
+    pub fn list_budgets(&self) -> Result<Vec<BudgetRecord>> {
+        let conn = self.inner.conn.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT budget_id, max_budget_nanos, soft_budget_nanos, max_parallel_requests,
+                        tpm_limit, rpm_limit, budget_duration, model_max_budget_json,
+                        budget_reset_at_ms, created_at_ms, updated_at_ms
+                 FROM budgets ORDER BY created_at_ms ASC",
+            )
+            .map_err(storage_err)?;
+        let rows = stmt
+            .query_map([], map_budget_row)
+            .map_err(storage_err)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(storage_err)?;
+        Ok(rows)
+    }
+
+    pub fn delete_budget(&self, budget_id: &str) -> Result<()> {
+        let conn = self.inner.conn.lock();
+        conn.execute(
+            "DELETE FROM budgets WHERE budget_id = ?1",
+            params![budget_id.trim()],
+        )
+        .map_err(storage_err)?;
+        Ok(())
+    }
+
+    // ── Managed Tags (`tags`) ────────────────────────────────────────────────
+
+    pub fn upsert_tag(&self, tag: &TagRecord) -> Result<TagRecord> {
+        let name = tag.tag_name.trim();
+        if name.is_empty() {
+            return Err(QuixigateError::Validation(
+                "tag_name cannot be empty".to_owned(),
+            ));
+        }
+        let now = now_ms();
+        let existing = self.get_tag(name).ok();
+        let created_at = existing.as_ref().map(|e| e.created_at_ms).unwrap_or(now);
+        let models_json = serde_json::to_string(&normalize_string_list(&tag.models))
+            .unwrap_or_else(|_| "[]".to_owned());
+        let meta_json = serde_json::to_string(&tag.metadata).unwrap_or_else(|_| "{}".to_owned());
+        {
+            let conn = self.inner.conn.lock();
+            conn.execute(
+                "INSERT INTO tags (
+                    tag_name, description, models_json, budget_id, max_budget_nanos,
+                    metadata_json, created_at_ms, updated_at_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 ON CONFLICT(tag_name) DO UPDATE SET
+                    description = excluded.description,
+                    models_json = excluded.models_json,
+                    budget_id = excluded.budget_id,
+                    max_budget_nanos = excluded.max_budget_nanos,
+                    metadata_json = excluded.metadata_json,
+                    updated_at_ms = excluded.updated_at_ms",
+                params![
+                    name,
+                    tag.description,
+                    models_json,
+                    tag.budget_id,
+                    tag.max_budget_nanos.map(NanoUsd::nanos),
+                    meta_json,
+                    created_at,
+                    now
+                ],
+            )
+            .map_err(storage_err)?;
+        }
+        self.get_tag(name)
+    }
+
+    pub fn get_tag(&self, tag_name: &str) -> Result<TagRecord> {
+        let trimmed = tag_name.trim();
+        let conn = self.inner.conn.lock();
+        let mut rec = conn
+            .query_row(
+                "SELECT tag_name, description, models_json, budget_id, max_budget_nanos,
+                        metadata_json, created_at_ms, updated_at_ms
+                 FROM tags WHERE tag_name = ?1",
+                params![trimmed],
+                map_tag_row,
+            )
+            .optional()
+            .map_err(storage_err)?
+            .ok_or_else(|| QuixigateError::NotFound(format!("tag '{trimmed}' not found")))?;
+        rec.spend_nanos = NanoUsd(query_scoped_spend_locked(&conn, &format!("tag:{trimmed}"))?);
+        Ok(rec)
+    }
+
+    pub fn list_tags(&self) -> Result<Vec<TagRecord>> {
+        let conn = self.inner.conn.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT tag_name, description, models_json, budget_id, max_budget_nanos,
+                        metadata_json, created_at_ms, updated_at_ms
+                 FROM tags ORDER BY tag_name ASC",
+            )
+            .map_err(storage_err)?;
+        let mut rows = stmt
+            .query_map([], map_tag_row)
+            .map_err(storage_err)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(storage_err)?;
+        drop(stmt);
+        for rec in &mut rows {
+            rec.spend_nanos = NanoUsd(query_scoped_spend_locked(
+                &conn,
+                &format!("tag:{}", rec.tag_name),
+            )?);
+        }
+        Ok(rows)
+    }
+
+    pub fn delete_tag(&self, tag_name: &str) -> Result<()> {
+        let conn = self.inner.conn.lock();
+        conn.execute(
+            "DELETE FROM tags WHERE tag_name = ?1",
+            params![tag_name.trim()],
+        )
+        .map_err(storage_err)?;
+        Ok(())
+    }
+
+    // ── Access Groups (`access_groups`) ──────────────────────────────────────
+
+    pub fn upsert_access_group(&self, ag: &AccessGroupRecord) -> Result<AccessGroupRecord> {
+        let name = ag.access_group.trim();
+        if name.is_empty() {
+            return Err(QuixigateError::Validation(
+                "access_group cannot be empty".to_owned(),
+            ));
+        }
+        let now = now_ms();
+        let existing = self.get_access_group(name).ok();
+        let created_at = existing.as_ref().map(|e| e.created_at_ms).unwrap_or(now);
+        let models_json = serde_json::to_string(&normalize_string_list(&ag.model_names))
+            .unwrap_or_else(|_| "[]".to_owned());
+        let mcp_json = serde_json::to_string(&normalize_string_list(&ag.mcp_server_ids))
+            .unwrap_or_else(|_| "[]".to_owned());
+        {
+            let conn = self.inner.conn.lock();
+            conn.execute(
+                "INSERT INTO access_groups (
+                    access_group, description, model_names_json, mcp_server_ids_json,
+                    max_budget_nanos, tpm_limit, rpm_limit, created_at_ms, updated_at_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                 ON CONFLICT(access_group) DO UPDATE SET
+                    description = excluded.description,
+                    model_names_json = excluded.model_names_json,
+                    mcp_server_ids_json = excluded.mcp_server_ids_json,
+                    max_budget_nanos = excluded.max_budget_nanos,
+                    tpm_limit = excluded.tpm_limit,
+                    rpm_limit = excluded.rpm_limit,
+                    updated_at_ms = excluded.updated_at_ms",
+                params![
+                    name,
+                    ag.description,
+                    models_json,
+                    mcp_json,
+                    ag.max_budget_nanos.map(NanoUsd::nanos),
+                    ag.tpm_limit.map(|v| v as i64),
+                    ag.rpm_limit,
+                    created_at,
+                    now
+                ],
+            )
+            .map_err(storage_err)?;
+        }
+        self.get_access_group(name)
+    }
+
+    pub fn get_access_group(&self, access_group: &str) -> Result<AccessGroupRecord> {
+        let trimmed = access_group.trim();
+        let conn = self.inner.conn.lock();
+        let mut rec = conn
+            .query_row(
+                "SELECT access_group, description, model_names_json, mcp_server_ids_json,
+                        max_budget_nanos, tpm_limit, rpm_limit, created_at_ms, updated_at_ms
+                 FROM access_groups WHERE access_group = ?1",
+                params![trimmed],
+                map_access_group_row,
+            )
+            .optional()
+            .map_err(storage_err)?
+            .ok_or_else(|| {
+                QuixigateError::NotFound(format!("access_group '{trimmed}' not found"))
+            })?;
+        rec.spend_nanos = NanoUsd(query_scoped_spend_locked(
+            &conn,
+            &format!("access_group:{trimmed}"),
+        )?);
+        Ok(rec)
+    }
+
+    pub fn list_access_groups(&self) -> Result<Vec<AccessGroupRecord>> {
+        let conn = self.inner.conn.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT access_group, description, model_names_json, mcp_server_ids_json,
+                        max_budget_nanos, tpm_limit, rpm_limit, created_at_ms, updated_at_ms
+                 FROM access_groups ORDER BY access_group ASC",
+            )
+            .map_err(storage_err)?;
+        let mut rows = stmt
+            .query_map([], map_access_group_row)
+            .map_err(storage_err)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(storage_err)?;
+        drop(stmt);
+        for rec in &mut rows {
+            rec.spend_nanos = NanoUsd(query_scoped_spend_locked(
+                &conn,
+                &format!("access_group:{}", rec.access_group),
+            )?);
+        }
+        Ok(rows)
+    }
+
+    pub fn delete_access_group(&self, access_group: &str) -> Result<()> {
+        let conn = self.inner.conn.lock();
+        conn.execute(
+            "DELETE FROM access_groups WHERE access_group = ?1",
+            params![access_group.trim()],
+        )
+        .map_err(storage_err)?;
         Ok(())
     }
 
@@ -2408,13 +3215,21 @@ impl Database {
                 }
                 "provider" | "providers" => vec![r.provider_id.clone()],
                 "key" | "keys" | "api_key" | "virtual_key" => {
-                    vec![r.virtual_key_id.clone().unwrap_or_else(|| "(no-key)".to_owned())]
+                    vec![
+                        r.virtual_key_id
+                            .clone()
+                            .unwrap_or_else(|| "(no-key)".to_owned()),
+                    ]
                 }
                 "team" | "teams" | "team_id" => {
                     vec![r.team_id.clone().unwrap_or_else(|| "(no-team)".to_owned())]
                 }
                 "user" | "users" | "user_id" => {
-                    vec![r.user_id.clone().unwrap_or_else(|| "(anonymous)".to_owned())]
+                    vec![
+                        r.user_id
+                            .clone()
+                            .unwrap_or_else(|| "(anonymous)".to_owned()),
+                    ]
                 }
                 "day" | "date" | "daily" => {
                     let day = chrono::TimeZone::timestamp_millis_opt(&chrono::Utc, r.timestamp_ms)
@@ -2449,9 +3264,18 @@ impl Database {
                 entry.output_tokens += r.output_tokens;
                 entry.cached_tokens += r.cached_input_tokens;
                 entry.total_tokens += r.input_tokens + r.output_tokens;
-                entry.spend_nanos = NanoUsd(entry.spend_nanos.nanos().saturating_add(r.cost_nanos.nanos()));
-                entry.api_equiv_nanos =
-                    NanoUsd(entry.api_equiv_nanos.nanos().saturating_add(r.api_equiv_nanos.nanos()));
+                entry.spend_nanos = NanoUsd(
+                    entry
+                        .spend_nanos
+                        .nanos()
+                        .saturating_add(r.cost_nanos.nanos()),
+                );
+                entry.api_equiv_nanos = NanoUsd(
+                    entry
+                        .api_equiv_nanos
+                        .nanos()
+                        .saturating_add(r.api_equiv_nanos.nanos()),
+                );
                 entry.savings_nanos =
                     NanoUsd(entry.savings_nanos.nanos().saturating_add(savings.nanos()));
             }
@@ -2639,7 +3463,10 @@ impl Database {
             )
             .map_err(storage_err)?;
         let ttfts: Vec<u64> = ttft_stmt
-            .query_map(params![since_24h], |r| Ok(r.get::<_, i64>(0)?.max(0) as u64))
+            .query_map(
+                params![since_24h],
+                |r| Ok(r.get::<_, i64>(0)?.max(0) as u64),
+            )
             .map_err(storage_err)?
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(storage_err)?;
@@ -2786,7 +3613,7 @@ const VIRTUAL_KEY_COLUMNS: &str = "id, key_prefix, name, user_id, team_id, budge
 
 const MODEL_ROUTE_COLUMNS: &str = "alias, targets_json, pool_strategy, allow_paid_overflow, \
     input_nanos_per_m, output_nanos_per_m, cache_read_nanos_per_m, updated_at_ms, \
-    team_id, created_by, updated_by, created_at_ms";
+    team_id, created_by, updated_by, created_at_ms, blocked";
 
 const REQUEST_LOG_COLUMNS: &str = "id, timestamp_ms, ingress_protocol, requested_model, resolved_model, \
     provider_id, credential_id, user_id, team_id, virtual_key_id, \
@@ -2808,7 +3635,10 @@ fn normalize_string_list(items: &[String]) -> Vec<String> {
 
 fn parse_model_budgets_json(raw: &str) -> BTreeMap<String, NanoUsd> {
     if let Ok(nanos_map) = serde_json::from_str::<BTreeMap<String, i64>>(raw) {
-        return nanos_map.into_iter().map(|(k, v)| (k, NanoUsd(v))).collect();
+        return nanos_map
+            .into_iter()
+            .map(|(k, v)| (k, NanoUsd(v)))
+            .collect();
     }
     serde_json::from_str::<BTreeMap<String, NanoUsd>>(raw).unwrap_or_default()
 }
@@ -2906,6 +3736,110 @@ fn map_credential_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CredentialRec
     })
 }
 
+fn model_matches_allowlist_locked(
+    conn: &Connection,
+    patterns: &[String],
+    requested_model: &str,
+    base_model: &str,
+) -> Result<bool> {
+    for pat in patterns {
+        if glob_matches(pat, requested_model) || glob_matches(pat, base_model) {
+            return Ok(true);
+        }
+        let ag_key = pat
+            .trim()
+            .strip_prefix("access_group:")
+            .unwrap_or(pat.trim());
+        if let Some(models_json) = conn
+            .query_row(
+                "SELECT model_names_json FROM access_groups WHERE access_group = ?1",
+                params![ag_key],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(storage_err)?
+        {
+            let ag_models: Vec<String> = serde_json::from_str(&models_json).unwrap_or_default();
+            if ag_models
+                .iter()
+                .any(|m| glob_matches(m, requested_model) || glob_matches(m, base_model))
+            {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+fn map_end_user_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<EndUser> {
+    let models_json: String = row.get(8).unwrap_or_else(|_| "[]".to_owned());
+    let meta_json: String = row.get(9).unwrap_or_else(|_| "{}".to_owned());
+    Ok(EndUser {
+        user_id: row.get(0)?,
+        alias: row.get(1)?,
+        blocked: row.get::<_, i32>(2).unwrap_or(0) != 0,
+        budget_id: row.get(3)?,
+        budget_limit_nanos: row.get::<_, Option<i64>>(4)?.map(NanoUsd),
+        budget_window: BudgetWindow::parse(&row.get::<_, String>(5)?),
+        spend_nanos: NanoUsd(row.get(6)?),
+        window_reset_at_ms: row.get(7)?,
+        allowed_models: serde_json::from_str(&models_json).unwrap_or_default(),
+        metadata: serde_json::from_str(&meta_json).unwrap_or_else(|_| serde_json::json!({})),
+        created_at_ms: row.get(10)?,
+        updated_at_ms: row.get(11)?,
+    })
+}
+
+fn map_budget_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<BudgetRecord> {
+    let mmb_json: String = row.get(7).unwrap_or_else(|_| "{}".to_owned());
+    Ok(BudgetRecord {
+        budget_id: row.get(0)?,
+        max_budget_nanos: row.get::<_, Option<i64>>(1)?.map(NanoUsd),
+        soft_budget_nanos: row.get::<_, Option<i64>>(2)?.map(NanoUsd),
+        max_parallel_requests: row.get(3)?,
+        tpm_limit: row.get::<_, Option<i64>>(4)?.map(|v| v.max(0) as u64),
+        rpm_limit: row.get(5)?,
+        budget_duration: row.get(6)?,
+        model_max_budget_nanos: parse_model_budgets_json(&mmb_json),
+        budget_reset_at_ms: row.get(8)?,
+        created_at_ms: row.get(9)?,
+        updated_at_ms: row.get(10)?,
+    })
+}
+
+fn map_tag_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TagRecord> {
+    let models_json: String = row.get(2).unwrap_or_else(|_| "[]".to_owned());
+    let meta_json: String = row.get(5).unwrap_or_else(|_| "{}".to_owned());
+    Ok(TagRecord {
+        tag_name: row.get(0)?,
+        description: row.get(1)?,
+        models: serde_json::from_str(&models_json).unwrap_or_default(),
+        budget_id: row.get(3)?,
+        max_budget_nanos: row.get::<_, Option<i64>>(4)?.map(NanoUsd),
+        spend_nanos: NanoUsd::ZERO,
+        metadata: serde_json::from_str(&meta_json).unwrap_or_else(|_| serde_json::json!({})),
+        created_at_ms: row.get(6)?,
+        updated_at_ms: row.get(7)?,
+    })
+}
+
+fn map_access_group_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AccessGroupRecord> {
+    let models_json: String = row.get(2).unwrap_or_else(|_| "[]".to_owned());
+    let mcp_json: String = row.get(3).unwrap_or_else(|_| "[]".to_owned());
+    Ok(AccessGroupRecord {
+        access_group: row.get(0)?,
+        description: row.get(1)?,
+        model_names: serde_json::from_str(&models_json).unwrap_or_default(),
+        mcp_server_ids: serde_json::from_str(&mcp_json).unwrap_or_default(),
+        max_budget_nanos: row.get::<_, Option<i64>>(4)?.map(NanoUsd),
+        tpm_limit: row.get::<_, Option<i64>>(5)?.map(|v| v.max(0) as u64),
+        rpm_limit: row.get(6)?,
+        spend_nanos: NanoUsd::ZERO,
+        created_at_ms: row.get(7)?,
+        updated_at_ms: row.get(8)?,
+    })
+}
+
 fn map_model_route_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ModelRoute> {
     let targets_json: String = row.get(1)?;
     let strategy_str: String = row.get(2)?;
@@ -2916,6 +3850,7 @@ fn map_model_route_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ModelRoute> 
         targets: serde_json::from_str(&targets_json).unwrap_or_default(),
         pool_strategy,
         allow_paid_overflow: row.get::<_, i32>(3)? != 0,
+        blocked: row.get::<_, i32>(12).unwrap_or(0) != 0,
         input_nanos_per_m: row.get(4)?,
         output_nanos_per_m: row.get(5)?,
         cache_read_nanos_per_m: row.get(6)?,

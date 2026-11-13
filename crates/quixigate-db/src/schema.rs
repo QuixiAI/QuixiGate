@@ -30,6 +30,9 @@ CREATE TABLE IF NOT EXISTS sessions (
 CREATE TABLE IF NOT EXISTS teams (
     id                  TEXT PRIMARY KEY,
     name                TEXT NOT NULL UNIQUE,
+    blocked             INTEGER NOT NULL DEFAULT 0,
+    disable_logging     INTEGER NOT NULL DEFAULT 0,
+    allowed_models_json TEXT NOT NULL DEFAULT '[]',
     budget_limit_nanos  INTEGER,
     budget_window       TEXT NOT NULL DEFAULT 'monthly' CHECK (budget_window IN ('hourly','daily','weekly','monthly','total')),
     spend_nanos         INTEGER NOT NULL DEFAULT 0,
@@ -104,6 +107,7 @@ CREATE TABLE IF NOT EXISTS model_routes (
     targets_json           TEXT NOT NULL,
     pool_strategy          TEXT NOT NULL DEFAULT 'fill_first',
     allow_paid_overflow    INTEGER NOT NULL DEFAULT 1,
+    blocked                INTEGER NOT NULL DEFAULT 0,
     input_nanos_per_m      INTEGER,
     output_nanos_per_m     INTEGER,
     cache_read_nanos_per_m INTEGER,
@@ -112,6 +116,58 @@ CREATE TABLE IF NOT EXISTS model_routes (
     updated_by             TEXT,
     created_at_ms          INTEGER,
     updated_at_ms          INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS end_users (
+    user_id             TEXT PRIMARY KEY,
+    alias               TEXT,
+    blocked             INTEGER NOT NULL DEFAULT 0,
+    budget_id           TEXT,
+    budget_limit_nanos  INTEGER,
+    budget_window       TEXT NOT NULL DEFAULT 'monthly' CHECK (budget_window IN ('hourly','daily','weekly','monthly','total')),
+    spend_nanos         INTEGER NOT NULL DEFAULT 0,
+    window_reset_at_ms  INTEGER,
+    allowed_models_json TEXT NOT NULL DEFAULT '[]',
+    metadata_json       TEXT NOT NULL DEFAULT '{}',
+    created_at_ms       INTEGER NOT NULL,
+    updated_at_ms       INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS budgets (
+    budget_id              TEXT PRIMARY KEY,
+    max_budget_nanos       INTEGER,
+    soft_budget_nanos      INTEGER,
+    max_parallel_requests  INTEGER,
+    tpm_limit              INTEGER,
+    rpm_limit              INTEGER,
+    budget_duration        TEXT,
+    model_max_budget_json  TEXT NOT NULL DEFAULT '{}',
+    budget_reset_at_ms     INTEGER,
+    created_at_ms          INTEGER NOT NULL,
+    updated_at_ms          INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS tags (
+    tag_name            TEXT PRIMARY KEY,
+    description         TEXT,
+    models_json         TEXT NOT NULL DEFAULT '[]',
+    budget_id           TEXT,
+    max_budget_nanos    INTEGER,
+    metadata_json       TEXT NOT NULL DEFAULT '{}',
+    created_at_ms       INTEGER NOT NULL,
+    updated_at_ms       INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS access_groups (
+    access_group        TEXT PRIMARY KEY,
+    description         TEXT,
+    model_names_json    TEXT NOT NULL DEFAULT '[]',
+    mcp_server_ids_json TEXT NOT NULL DEFAULT '[]',
+    max_budget_nanos    INTEGER,
+    tpm_limit           INTEGER,
+    rpm_limit           INTEGER,
+    created_at_ms       INTEGER NOT NULL,
+    updated_at_ms       INTEGER NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS settings (
@@ -195,7 +251,9 @@ fn ensure_column(conn: &Connection, table: &str, column: &str, ddl: &str) -> Res
     if !cols.iter().any(|c| c.eq_ignore_ascii_case(column)) {
         conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {ddl};"))
             .map_err(|e| {
-                QuixigateError::Storage(format!("migration ALTER TABLE {table}.{column} failed: {e}"))
+                QuixigateError::Storage(format!(
+                    "migration ALTER TABLE {table}.{column} failed: {e}"
+                ))
             })?;
     }
     Ok(())
@@ -215,17 +273,66 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
 
     // Idempotent online migrations for upgraded SQLite databases
     ensure_column(conn, "users", "blocked", "INTEGER NOT NULL DEFAULT 0")?;
+    ensure_column(conn, "teams", "blocked", "INTEGER NOT NULL DEFAULT 0")?;
+    ensure_column(
+        conn,
+        "teams",
+        "disable_logging",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_column(
+        conn,
+        "teams",
+        "allowed_models_json",
+        "TEXT NOT NULL DEFAULT '[]'",
+    )?;
     ensure_column(conn, "teams", "tags_json", "TEXT NOT NULL DEFAULT '[]'")?;
-    ensure_column(conn, "teams", "model_budgets_json", "TEXT NOT NULL DEFAULT '{}'")?;
-    ensure_column(conn, "virtual_keys", "tags_json", "TEXT NOT NULL DEFAULT '[]'")?;
-    ensure_column(conn, "virtual_keys", "model_budgets_json", "TEXT NOT NULL DEFAULT '{}'")?;
-    ensure_column(conn, "virtual_keys", "allowed_cidrs_json", "TEXT NOT NULL DEFAULT '[]'")?;
-    ensure_column(conn, "virtual_keys", "allow_spend_read", "INTEGER NOT NULL DEFAULT 1")?;
+    ensure_column(
+        conn,
+        "teams",
+        "model_budgets_json",
+        "TEXT NOT NULL DEFAULT '{}'",
+    )?;
+    ensure_column(
+        conn,
+        "virtual_keys",
+        "tags_json",
+        "TEXT NOT NULL DEFAULT '[]'",
+    )?;
+    ensure_column(
+        conn,
+        "virtual_keys",
+        "model_budgets_json",
+        "TEXT NOT NULL DEFAULT '{}'",
+    )?;
+    ensure_column(
+        conn,
+        "virtual_keys",
+        "allowed_cidrs_json",
+        "TEXT NOT NULL DEFAULT '[]'",
+    )?;
+    ensure_column(
+        conn,
+        "virtual_keys",
+        "allow_spend_read",
+        "INTEGER NOT NULL DEFAULT 1",
+    )?;
+    ensure_column(
+        conn,
+        "model_routes",
+        "blocked",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
     ensure_column(conn, "model_routes", "team_id", "TEXT")?;
     ensure_column(conn, "model_routes", "created_by", "TEXT")?;
     ensure_column(conn, "model_routes", "updated_by", "TEXT")?;
     ensure_column(conn, "model_routes", "created_at_ms", "INTEGER")?;
-    ensure_column(conn, "request_logs", "tags_json", "TEXT NOT NULL DEFAULT '[]'")?;
+    ensure_column(
+        conn,
+        "request_logs",
+        "tags_json",
+        "TEXT NOT NULL DEFAULT '[]'",
+    )?;
 
     let now = now_ms();
     conn.execute(

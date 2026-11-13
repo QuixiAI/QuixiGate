@@ -92,10 +92,11 @@ pub async fn handle_chat_completions(
     };
 
     let est_in = estimate_request_tokens(&req);
-    let (est_total, est_cost) =
-        state
-            .router
-            .estimate_preflight_budget(&requested_model, est_in, u64::from(max_out.unwrap_or(1024)))?;
+    let (est_total, est_cost) = state.router.estimate_preflight_budget(
+        &requested_model,
+        est_in,
+        u64::from(max_out.unwrap_or(1024)),
+    )?;
     let (conc_guard, budget_guard) = authorize_inference_request(
         &state,
         &principal,
@@ -279,7 +280,13 @@ pub async fn handle_chat_completions(
                 let oi_tools = gen_out
                     .tool_calls
                     .iter()
-                    .map(|tc| (tc.tool.id.clone(), tc.tool.name.clone(), tc.input.to_string()))
+                    .map(|tc| {
+                        (
+                            tc.tool.id.clone(),
+                            tc.tool.name.clone(),
+                            tc.input.to_string(),
+                        )
+                    })
                     .collect();
 
                 finalize_request_accounting(
@@ -424,7 +431,9 @@ pub async fn handle_chat_completions(
                     "finish_reason": Value::Null
                 }]
             });
-            let _ = tx.send(Ok(Event::default().data(init_chunk.to_string()))).await;
+            let _ = tx
+                .send(Ok(Event::default().data(init_chunk.to_string())))
+                .await;
 
             while let Some(ev) = events.next().await {
                 match ev {
@@ -443,7 +452,11 @@ pub async fn handle_chat_completions(
                                 "finish_reason": Value::Null
                             }]
                         });
-                        if tx.send(Ok(Event::default().data(chunk.to_string()))).await.is_err() {
+                        if tx
+                            .send(Ok(Event::default().data(chunk.to_string())))
+                            .await
+                            .is_err()
+                        {
                             break;
                         }
                     }
@@ -462,7 +475,11 @@ pub async fn handle_chat_completions(
                                 "finish_reason": Value::Null
                             }]
                         });
-                        if tx.send(Ok(Event::default().data(chunk.to_string()))).await.is_err() {
+                        if tx
+                            .send(Ok(Event::default().data(chunk.to_string())))
+                            .await
+                            .is_err()
+                        {
                             break;
                         }
                     }
@@ -577,7 +594,9 @@ pub async fn handle_chat_completions(
                                 }
                             }
                         });
-                        let _ = tx.send(Ok(Event::default().data(final_chunk.to_string()))).await;
+                        let _ = tx
+                            .send(Ok(Event::default().data(final_chunk.to_string())))
+                            .await;
                         completed_summary = Some(summary);
                     }
                     RoutedStreamEvent::Error(err_msg) => {
@@ -585,7 +604,9 @@ pub async fn handle_chat_completions(
                         let err_chunk = json!({
                             "error": { "message": err_msg, "type": "upstream_error" }
                         });
-                        let _ = tx.send(Ok(Event::default().data(err_chunk.to_string()))).await;
+                        let _ = tx
+                            .send(Ok(Event::default().data(err_chunk.to_string())))
+                            .await;
                         break;
                     }
                     _ => {}
@@ -599,7 +620,13 @@ pub async fn handle_chat_completions(
                 let oi_tools = sum
                     .tool_calls
                     .iter()
-                    .map(|tc| (tc.tool.id.clone(), tc.tool.name.clone(), tc.input.to_string()))
+                    .map(|tc| {
+                        (
+                            tc.tool.id.clone(),
+                            tc.tool.name.clone(),
+                            tc.input.to_string(),
+                        )
+                    })
                     .collect();
                 let synth_resp = json!({
                     "content": sum.text,

@@ -316,9 +316,7 @@ mod tests {
 
     #[tokio::test]
     async fn llamacpp_instance_router_auth_and_multiturn_reasoning_coalescing() {
-        use aisdk::core::language_model::{
-            LanguageModelOptions, LanguageModelResponseContentType,
-        };
+        use aisdk::core::language_model::{LanguageModelOptions, LanguageModelResponseContentType};
         use aisdk::core::tools::ToolDetails;
         use aisdk::core::{
             AssistantMessage, LanguageModelRequest, Message, ToolCallInfo, ToolResultInfo,
@@ -558,8 +556,8 @@ mod tests {
 
     #[tokio::test]
     async fn reconciles_ollama_reasoning_tokens_inline_think_and_timeout_cause() {
-        use aisdk::core::language_model::Usage;
         use crate::copilot::{reconcile_reasoning_usage, split_inline_think_block};
+        use aisdk::core::language_model::Usage;
 
         // 1. Exact reproduction of Ollama `lfm2.5:24b` omitting `completion_tokens_details.reasoning_tokens`
         let reasoning = "The user says \"Hello!\" This is a simple greeting. The assistant should respond politely, perhaps ask how they can help. There's no policy violation. So just greet back and ask what they need.\n\nWe must follow the style guidelines: be friendly, helpful. Possibly ask about their day or what they'd like assistance with.\n\nThus answer: \"Hello! How can I help you today?\" That's it.";

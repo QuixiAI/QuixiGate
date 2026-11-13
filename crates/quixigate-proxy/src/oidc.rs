@@ -7,9 +7,9 @@ use std::time::Duration;
 
 use base64::Engine;
 use base64::engine::general_purpose::{URL_SAFE, URL_SAFE_NO_PAD};
+use parking_lot::RwLock;
 use quixigate_core::{BudgetWindow, GatewaySettings, QuixigateError, Result, UserRole, now_ms};
 use quixigate_db::AuthenticatedPrincipal;
-use parking_lot::RwLock;
 use ring::signature::{self, RsaPublicKeyComponents, UnparsedPublicKey};
 use serde_json::Value;
 
@@ -116,7 +116,10 @@ impl OidcVerifier {
                 && now.saturating_sub(snap.fetched_at_ms) < JWKS_TTL_MS;
             if fresh {
                 let kid_hit = match &kid {
-                    Some(k) => snap.keys.iter().any(|jwk| jwk.kid.as_deref() == Some(k.as_str())),
+                    Some(k) => snap
+                        .keys
+                        .iter()
+                        .any(|jwk| jwk.kid.as_deref() == Some(k.as_str())),
                     None => true,
                 };
                 if kid_hit {
@@ -137,10 +140,14 @@ impl OidcVerifier {
                 && now.saturating_sub(snap.fetched_at_ms) < JWKS_TTL_MS;
             if fresh {
                 let kid_hit = match &kid {
-                    Some(k) => snap.keys.iter().any(|jwk| jwk.kid.as_deref() == Some(k.as_str())),
+                    Some(k) => snap
+                        .keys
+                        .iter()
+                        .any(|jwk| jwk.kid.as_deref() == Some(k.as_str())),
                     None => true,
                 };
-                if kid_hit || now.saturating_sub(snap.last_attempt_ms) < KID_MISS_REFRESH_COOLDOWN_MS
+                if kid_hit
+                    || now.saturating_sub(snap.last_attempt_ms) < KID_MISS_REFRESH_COOLDOWN_MS
                 {
                     return;
                 }
@@ -170,11 +177,14 @@ impl OidcVerifier {
         let (Some(header_b64), Some(payload_b64), Some(sig_b64), None) =
             (parts.next(), parts.next(), parts.next(), parts.next())
         else {
-            return Err(QuixigateError::Unauthorized("malformed JWT structure".to_owned()));
+            return Err(QuixigateError::Unauthorized(
+                "malformed JWT structure".to_owned(),
+            ));
         };
 
-        let header_bytes = b64url_decode(header_b64)
-            .ok_or_else(|| QuixigateError::Unauthorized("invalid JWT header base64url".to_owned()))?;
+        let header_bytes = b64url_decode(header_b64).ok_or_else(|| {
+            QuixigateError::Unauthorized("invalid JWT header base64url".to_owned())
+        })?;
         let header: Value = serde_json::from_slice(&header_bytes)
             .map_err(|_| QuixigateError::Unauthorized("invalid JWT header JSON".to_owned()))?;
 
@@ -244,7 +254,9 @@ impl OidcVerifier {
         if let Some(nbf) = payload.get("nbf").and_then(Value::as_i64)
             && nbf > now_sec.saturating_add(CLOCK_SKEW_SECS)
         {
-            return Err(QuixigateError::Unauthorized("JWT is not yet valid (nbf)".to_owned()));
+            return Err(QuixigateError::Unauthorized(
+                "JWT is not yet valid (nbf)".to_owned(),
+            ));
         }
 
         // Validate `iss` if `jwt_issuer_url` is configured
@@ -331,9 +343,14 @@ impl OidcVerifier {
         let user = match state.db.get_user(&subject) {
             Ok(existing) => {
                 if grants_admin && existing.role != UserRole::Admin {
-                    state
-                        .db
-                        .update_user(&existing.id, None, Some(UserRole::Admin), None, None, None)?
+                    state.db.update_user(
+                        &existing.id,
+                        None,
+                        Some(UserRole::Admin),
+                        None,
+                        None,
+                        None,
+                    )?
                 } else {
                     existing
                 }
@@ -547,7 +564,10 @@ fn verify_jwk_signature(key: &JwkPublicKey, alg: &str, msg: &[u8], sig: &[u8]) -
     }
 }
 
-async fn fetch_json_bounded(http: &reqwest::Client, url: &str) -> std::result::Result<Value, String> {
+async fn fetch_json_bounded(
+    http: &reqwest::Client,
+    url: &str,
+) -> std::result::Result<Value, String> {
     let trimmed = url.trim();
     if !(trimmed.starts_with("https://") || trimmed.starts_with("http://")) {
         return Err(format!("unsupported OIDC/JWKS URL scheme in '{trimmed}'"));
@@ -600,10 +620,7 @@ async fn fetch_jwks_snapshot(
         };
         match fetch_json_bounded(http, &discovery_url).await {
             Ok(doc) => {
-                discovered_issuer = doc
-                    .get("issuer")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned);
+                discovered_issuer = doc.get("issuer").and_then(Value::as_str).map(str::to_owned);
                 if jwks_urls.is_empty()
                     && let Some(uri) = doc.get("jwks_uri").and_then(Value::as_str)
                 {
@@ -615,7 +632,9 @@ async fn fetch_jwks_snapshot(
                     // Cloudflare Access fallback (`<team-domain>/cdn-cgi/access/certs`)
                     jwks_urls.push(format!("{base}/cdn-cgi/access/certs"));
                 } else {
-                    tracing::debug!("OIDC discovery skipped ({disc_err}); using explicit jwt_jwks_url");
+                    tracing::debug!(
+                        "OIDC discovery skipped ({disc_err}); using explicit jwt_jwks_url"
+                    );
                 }
             }
         }
@@ -643,7 +662,9 @@ async fn fetch_jwks_snapshot(
     }
 
     if parsed_keys.is_empty() {
-        return Err(last_err.unwrap_or_else(|| "JWKS contained zero supported signing keys".to_owned()));
+        return Err(
+            last_err.unwrap_or_else(|| "JWKS contained zero supported signing keys".to_owned())
+        );
     }
 
     let now = now_ms();

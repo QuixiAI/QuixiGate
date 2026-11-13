@@ -5,10 +5,13 @@ use std::collections::HashMap;
 
 use aisdk::core::language_model::{LanguageModelResponseContentType, ReasoningEffort};
 use aisdk::core::tools::ToolDetails;
-use aisdk::core::{AssistantMessage, Message, SystemMessage, ToolCallInfo, ToolResultInfo, UserMessage};
+use aisdk::core::{
+    AssistantMessage, Message, SystemMessage, ToolCallInfo, ToolResultInfo, UserMessage,
+};
 use axum::http::{HeaderMap, HeaderValue};
 use quixigate_core::{
-    GatewaySettings, IngressProtocol, NanoUsd, QuixigateError, RequestLog, SecretScannerMode, now_ms,
+    GatewaySettings, IngressProtocol, NanoUsd, QuixigateError, RequestLog, SecretScannerMode,
+    now_ms,
 };
 use quixigate_db::{AuthenticatedPrincipal, BudgetGuard, ConcurrencyGuard};
 use quixigate_router::guardrails::redact_secrets_in_str;
@@ -198,7 +201,8 @@ pub fn extract_content_text(content: &Value) -> String {
                         out.push(format!("[image: {preview}]"));
                     }
                     _ => {
-                        if let Some(t) = part["text"].as_str().or_else(|| part["content"].as_str()) {
+                        if let Some(t) = part["text"].as_str().or_else(|| part["content"].as_str())
+                        {
                             out.push(t.to_owned());
                         }
                     }
@@ -273,9 +277,8 @@ pub fn parse_openai_messages(raw_messages: &[Value]) -> (Option<String>, Vec<Mes
                             .unwrap_or("tool")
                             .to_owned();
                         let args_val = match &tc["function"]["arguments"] {
-                            Value::String(s) => {
-                                serde_json::from_str::<Value>(s).unwrap_or_else(|_| json!({ "raw": s }))
-                            }
+                            Value::String(s) => serde_json::from_str::<Value>(s)
+                                .unwrap_or_else(|_| json!({ "raw": s })),
                             v if v.is_object() => v.clone(),
                             _ => json!({}),
                         };
@@ -444,9 +447,21 @@ pub fn attach_gateway_headers(
     set(headers, "x-quixigate-request-id", request_id);
     set(headers, "x-quixigate-provider", provider_id);
     set(headers, "x-quixigate-model", resolved_model);
-    set(headers, "x-quixigate-cache", if cache_hit { "HIT" } else { "MISS" });
-    set(headers, "x-quixigate-cost-nanos", &cost_nanos.nanos().to_string());
-    set(headers, "x-litellm-response-cost", &cost_nanos.to_decimal_string());
+    set(
+        headers,
+        "x-quixigate-cache",
+        if cache_hit { "HIT" } else { "MISS" },
+    );
+    set(
+        headers,
+        "x-quixigate-cost-nanos",
+        &cost_nanos.nanos().to_string(),
+    );
+    set(
+        headers,
+        "x-litellm-response-cost",
+        &cost_nanos.to_decimal_string(),
+    );
     set(
         headers,
         "x-quixigate-api-equiv-nanos",
@@ -481,12 +496,9 @@ pub fn extract_request_tags(headers: &HeaderMap, body: Option<&Value>) -> Vec<St
         }
     }
     if let Some(b) = body {
-        for candidate in [
-            b.get("metadata").and_then(|m| m.get("tags")),
-            b.get("tags"),
-        ]
-        .into_iter()
-        .flatten()
+        for candidate in [b.get("metadata").and_then(|m| m.get("tags")), b.get("tags")]
+            .into_iter()
+            .flatten()
         {
             match candidate {
                 Value::Array(arr) => {
@@ -576,9 +588,34 @@ pub fn validate_enforced_params(
     Ok(())
 }
 
-/// Unified pre-flight inference authorization: validates `enforced_params`, extracts request `tags`,
-/// enforces team-scoped models + key/team/user/model/tag `NanoUsd` budgets + RPM/TPM/concurrency,
-/// and records per-request privacy header state (`x-quixigate-no-log`).
+/// Extracts optional end-user / customer identifier (`body["user"]`, `body["end_user_id"]`,
+/// or `x-litellm-end-user-id` / `x-end-user-id` header).
+pub fn extract_end_user_id(headers: &HeaderMap, body: Option<&Value>) -> Option<String> {
+    if let Some(b) = body {
+        for key in ["user", "end_user_id"] {
+            if let Some(s) = b.get(key).and_then(Value::as_str).map(str::trim)
+                && !s.is_empty()
+            {
+                return Some(s.to_owned());
+            }
+        }
+    }
+    for hdr_name in ["x-litellm-end-user-id", "x-end-user-id"] {
+        if let Some(s) = headers
+            .get(hdr_name)
+            .and_then(|v| v.to_str().ok())
+            .map(str::trim)
+            && !s.is_empty()
+        {
+            return Some(s.to_owned());
+        }
+    }
+    None
+}
+
+/// Unified pre-flight inference authorization: validates `enforced_params`, extracts request `tags`
+/// and `end_user_id`, enforces team/model/end-user blocks + key/team/user/end-user/model/tag `NanoUsd`
+/// budgets + RPM/TPM/concurrency, and records per-request privacy header state (`x-quixigate-no-log`).
 pub fn authorize_inference_request(
     state: &AppState,
     principal: &AuthenticatedPrincipal,
@@ -593,12 +630,14 @@ pub fn authorize_inference_request(
         validate_enforced_params(&settings, headers, json_body)?;
     }
     let req_tags = extract_request_tags(headers, body);
-    let (conc, mut budget_guard) = state.db.authorize_and_reserve_with_tags(
+    let end_user_id = extract_end_user_id(headers, body);
+    let (conc, mut budget_guard) = state.db.authorize_and_reserve_full(
         principal,
         requested_model,
         estimated_tokens,
         estimated_paid_nanos,
         &req_tags,
+        end_user_id.as_deref(),
     )?;
     if should_suppress_request_log(headers, &settings) {
         budget_guard.set_suppress_log(true);

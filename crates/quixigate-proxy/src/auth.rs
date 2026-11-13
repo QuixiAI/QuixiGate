@@ -134,18 +134,17 @@ fn extract_host_only(host_raw: &str) -> &str {
     }
 }
 
-fn is_trusted_hostname(
-    host_raw: &str,
-    trust_containers: bool,
-    trusted_cidrs: &[String],
-) -> bool {
+fn is_trusted_hostname(host_raw: &str, trust_containers: bool, trusted_cidrs: &[String]) -> bool {
     let trimmed = host_raw.trim();
     if trimmed.is_empty() {
         return true;
     }
     let host_only = extract_host_only(trimmed);
     let lower = host_only.to_ascii_lowercase();
-    if matches!(lower.as_str(), "localhost" | "127.0.0.1" | "::1" | "0.0.0.0") {
+    if matches!(
+        lower.as_str(),
+        "localhost" | "127.0.0.1" | "::1" | "0.0.0.0"
+    ) {
         return true;
     }
     if trust_containers && CONTAINER_HOST_ALIASES.contains(&lower.as_str()) {
@@ -167,11 +166,7 @@ fn is_trusted_hostname(
     false
 }
 
-fn is_trusted_origin(
-    origin_raw: &str,
-    trust_containers: bool,
-    trusted_cidrs: &[String],
-) -> bool {
+fn is_trusted_origin(origin_raw: &str, trust_containers: bool, trusted_cidrs: &[String]) -> bool {
     let trimmed = origin_raw.trim();
     if trimmed.is_empty() {
         return true;
@@ -316,7 +311,9 @@ pub async fn peer_trust_middleware(
         seen_bytes = seen_bytes.saturating_add(chunk.len());
         if seen_bytes > max_bytes {
             exceeded_flag.store(true, std::sync::atomic::Ordering::Relaxed);
-            return Err(std::io::Error::other("request body exceeds max_request_size_mb"));
+            return Err(std::io::Error::other(
+                "request body exceeds max_request_size_mb",
+            ));
         }
         Ok::<_, std::io::Error>(chunk)
     });
@@ -464,7 +461,12 @@ pub fn extract_api_token(headers: &HeaderMap, query_key: Option<&str>) -> Option
             }
         }
     }
-    for hdr_name in ["x-api-key", "x-goog-api-key"] {
+    for hdr_name in [
+        "x-api-key",
+        "x-goog-api-key",
+        "api-key",
+        "x-litellm-api-key",
+    ] {
         if let Some(val) = headers.get(hdr_name).and_then(|v| v.to_str().ok()) {
             let tok = val.trim();
             if !tok.is_empty() {
@@ -545,12 +547,18 @@ pub fn sign_hs256_jwt(claims: &Value, secret: &[u8]) -> String {
     format!("{signing_input}.{sig_b64}")
 }
 
-fn verify_hs256_jwt(state: &AppState, raw_token: &str, secret: &[u8]) -> Result<AuthenticatedPrincipal> {
+fn verify_hs256_jwt(
+    state: &AppState,
+    raw_token: &str,
+    secret: &[u8],
+) -> Result<AuthenticatedPrincipal> {
     let mut parts = raw_token.split('.');
     let (Some(header_b64), Some(payload_b64), Some(sig_b64), None) =
         (parts.next(), parts.next(), parts.next(), parts.next())
     else {
-        return Err(QuixigateError::Unauthorized("malformed JWT structure".to_owned()));
+        return Err(QuixigateError::Unauthorized(
+            "malformed JWT structure".to_owned(),
+        ));
     };
 
     let header_bytes = URL_SAFE_NO_PAD
@@ -570,7 +578,9 @@ fn verify_hs256_jwt(state: &AppState, raw_token: &str, secret: &[u8]) -> Result<
     let signing_input = format!("{header_b64}.{payload_b64}");
     let expected_mac = hmac_sha256(secret, signing_input.as_bytes());
     if sig_bytes.len() != 32 || sig_bytes.as_slice().ct_eq(&expected_mac).unwrap_u8() != 1 {
-        return Err(QuixigateError::Unauthorized("invalid JWT signature".to_owned()));
+        return Err(QuixigateError::Unauthorized(
+            "invalid JWT signature".to_owned(),
+        ));
     }
 
     let payload_bytes = URL_SAFE_NO_PAD
@@ -588,7 +598,9 @@ fn verify_hs256_jwt(state: &AppState, raw_token: &str, secret: &[u8]) -> Result<
     if let Some(nbf) = payload.get("nbf").and_then(Value::as_i64)
         && now_secs + 30 < nbf
     {
-        return Err(QuixigateError::Unauthorized("JWT is not yet valid (nbf)".to_owned()));
+        return Err(QuixigateError::Unauthorized(
+            "JWT is not yet valid (nbf)".to_owned(),
+        ));
     }
 
     let sub = payload
@@ -678,8 +690,8 @@ pub fn authenticate_inference(
 ) -> Result<AuthenticatedPrincipal> {
     let settings = state.db.get_settings()?;
     let direct_loopback = is_direct_loopback(state, headers);
-    let explicit_admin_hdr = headers.contains_key("x-quixigate-admin-key")
-        || headers.contains_key("x-litellm-api-key");
+    let explicit_admin_hdr =
+        headers.contains_key("x-quixigate-admin-key") || headers.contains_key("x-litellm-api-key");
 
     if let Some(raw_token) = extract_api_token(headers, query_key) {
         if state.verify_master_key(&raw_token) {

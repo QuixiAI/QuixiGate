@@ -8,8 +8,10 @@ use std::time::Duration;
 
 use chrono::Utc;
 use dashmap::DashMap;
-use quixigate_core::{LocalEndpointConfig, LocalModelInfo, LocalRuntimeStatus, QuixigateError, Result};
 use parking_lot::RwLock;
+use quixigate_core::{
+    LocalEndpointConfig, LocalModelInfo, LocalRuntimeStatus, QuixigateError, Result,
+};
 use serde_json::{Value, json};
 
 /// Normalizes common local runtime aliases (`"llama.cpp"`, `"llama-cpp"`, `"lm-studio"`)
@@ -137,8 +139,8 @@ impl LocalRuntimeScanner {
             .unwrap_or_default();
         let endpoints = LocalEndpointSpec::defaults();
         let api_keys = DashMap::new();
-        if let Ok(k) = std::env::var("QUIXIGATE_LLAMACPP_API_KEY")
-        .or_else(|_| std::env::var("LLAMA_API_KEY"))
+        if let Ok(k) =
+            std::env::var("QUIXIGATE_LLAMACPP_API_KEY").or_else(|_| std::env::var("LLAMA_API_KEY"))
             && !k.trim().is_empty()
         {
             api_keys.insert("llamacpp".to_owned(), k.trim().to_owned());
@@ -322,12 +324,17 @@ impl LocalRuntimeScanner {
             .iter()
             .find(|e| e.runtime_id == id)
             .cloned()
-            .ok_or_else(|| QuixigateError::NotFound(format!("local runtime '{id}' not registered")))?;
+            .ok_or_else(|| {
+                QuixigateError::NotFound(format!("local runtime '{id}' not registered"))
+            })?;
 
         let root = server_root(&ep.base_url);
         let action = if load { "load" } else { "unload" };
         let url = format!("{root}/models/{action}");
-        let mut req = self.control_http.post(&url).json(&json!({ "model": model }));
+        let mut req = self
+            .control_http
+            .post(&url)
+            .json(&json!({ "model": model }));
         if let Some(key) = self.api_key_for(&id) {
             req = req.bearer_auth(key);
         }
@@ -357,7 +364,8 @@ impl LocalRuntimeScanner {
         }
 
         let updated = self.probe_one(&ep).await;
-        self.statuses.insert(updated.runtime_id.clone(), updated.clone());
+        self.statuses
+            .insert(updated.runtime_id.clone(), updated.clone());
         Ok(updated)
     }
 
@@ -612,7 +620,9 @@ impl LocalRuntimeScanner {
             .unwrap_or_default();
 
         let is_router = props_json["role"].as_str() == Some("router")
-            || data_arr.iter().any(|item| item["status"]["value"].is_string());
+            || data_arr
+                .iter()
+                .any(|item| item["status"]["value"].is_string());
 
         let server_version = props_json["build_info"]
             .as_str()
@@ -651,8 +661,7 @@ impl LocalRuntimeScanner {
                     loaded_models.push(id.to_owned());
                 }
                 let routable = !failed
-                    && (models_autoload
-                        || matches!(status_val, "loaded" | "loading" | "sleeping"));
+                    && (models_autoload || matches!(status_val, "loaded" | "loading" | "sleeping"));
                 if routable {
                     models.push(id.to_owned());
                 }
@@ -692,9 +701,9 @@ impl LocalRuntimeScanner {
 
         // Single-Model Instance Mode (`llama-server -m ...` or `-hf ...`, or compatible local server on :8080)
         let is_llamacpp_instance = props_json.get("total_slots").is_some()
-            || data_arr
-                .iter()
-                .any(|item| item["owned_by"].as_str() == Some("llamacpp") || item.get("meta").is_some());
+            || data_arr.iter().any(|item| {
+                item["owned_by"].as_str() == Some("llamacpp") || item.get("meta").is_some()
+            });
 
         let total_slots = props_json["total_slots"]
             .as_u64()
@@ -703,7 +712,9 @@ impl LocalRuntimeScanner {
         let props_ctx = props_json["default_generation_settings"]["n_ctx"]
             .as_u64()
             .filter(|&n| n > 0);
-        let props_vision = props_json["modalities"]["vision"].as_bool().unwrap_or(false);
+        let props_vision = props_json["modalities"]["vision"]
+            .as_bool()
+            .unwrap_or(false);
         let is_sleeping = props_json["is_sleeping"].as_bool().unwrap_or(false);
         let is_loading = health_status == Some(503);
 
@@ -722,8 +733,8 @@ impl LocalRuntimeScanner {
                 .or(props_ctx)
                 .or_else(|| item["meta"]["n_ctx_train"].as_u64().filter(|&n| n > 0))
                 .or_else(|| item["context_length"].as_u64().filter(|&n| n > 0));
-            let supports_vision = props_vision
-                || has_image_modality(&item["architecture"]["input_modalities"]);
+            let supports_vision =
+                props_vision || has_image_modality(&item["architecture"]["input_modalities"]);
             let state_label = if is_loading {
                 "loading"
             } else if is_sleeping {
@@ -842,7 +853,10 @@ impl Default for LocalRuntimeScanner {
 }
 
 fn server_root(base_url: &str) -> &str {
-    base_url.trim().trim_end_matches('/').trim_end_matches("/v1")
+    base_url
+        .trim()
+        .trim_end_matches('/')
+        .trim_end_matches("/v1")
 }
 
 fn models_endpoint(base_url: &str) -> String {
@@ -858,7 +872,9 @@ fn models_endpoint(base_url: &str) -> String {
 
 fn looks_like_llamacpp_id(id: &str) -> bool {
     let lower = id.to_ascii_lowercase();
-    lower.starts_with("llamacpp") || lower.starts_with("llama.cpp") || lower.starts_with("llama-cpp")
+    lower.starts_with("llamacpp")
+        || lower.starts_with("llama.cpp")
+        || lower.starts_with("llama-cpp")
 }
 
 fn parse_string_array(v: &Value) -> Vec<String> {

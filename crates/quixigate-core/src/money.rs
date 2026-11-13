@@ -15,7 +15,9 @@ use crate::error::{QuixigateError, Result};
 pub const NANOS_PER_USD: i64 = 1_000_000_000;
 
 /// Exact monetary value in nano-dollars (`1e-9` USD).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
 #[serde(transparent)]
 pub struct NanoUsd(pub i64);
 
@@ -74,12 +76,16 @@ impl NanoUsd {
             None => (unsigned, ""),
         };
         if whole_str.is_empty() && frac_str.is_empty() {
-            return Err(QuixigateError::Validation(format!("invalid USD amount: {input}")));
+            return Err(QuixigateError::Validation(format!(
+                "invalid USD amount: {input}"
+            )));
         }
         if !whole_str.chars().all(|c| c.is_ascii_digit())
             || !frac_str.chars().all(|c| c.is_ascii_digit())
         {
-            return Err(QuixigateError::Validation(format!("invalid USD amount: {input}")));
+            return Err(QuixigateError::Validation(format!(
+                "invalid USD amount: {input}"
+            )));
         }
 
         let whole: i128 = if whole_str.is_empty() {
@@ -198,10 +204,16 @@ mod tests {
     #[test]
     fn exact_decimal_parsing_and_formatting() {
         assert_eq!(NanoUsd::parse_usd("25").unwrap(), NanoUsd(25_000_000_000));
-        assert_eq!(NanoUsd::parse_usd("$25.50").unwrap(), NanoUsd(25_500_000_000));
+        assert_eq!(
+            NanoUsd::parse_usd("$25.50").unwrap(),
+            NanoUsd(25_500_000_000)
+        );
         assert_eq!(NanoUsd::parse_usd("0.000000001").unwrap(), NanoUsd(1));
         assert_eq!(NanoUsd::parse_usd(".5").unwrap(), NanoUsd(500_000_000));
-        assert_eq!(NanoUsd::parse_usd("-1.25").unwrap(), NanoUsd(-1_250_000_000));
+        assert_eq!(
+            NanoUsd::parse_usd("-1.25").unwrap(),
+            NanoUsd(-1_250_000_000)
+        );
         assert_eq!(NanoUsd(25_500_000_000).format_usd(), "$25.50");
         assert_eq!(NanoUsd(4_210_000).format_usd(), "$0.00421");
         assert_eq!(NanoUsd(0).format_usd(), "$0.00");
@@ -212,7 +224,10 @@ mod tests {
     fn token_cost_never_underflows_or_drifts() {
         // $3.00 / 1M input tokens => 3_000_000_000 nanos per 1M => 3,000 nanos per token.
         let rate = NanoUsd::parse_usd("3.00").unwrap().nanos();
-        assert_eq!(NanoUsd::from_tokens_and_rate(1_000, rate), NanoUsd(3_000_000));
+        assert_eq!(
+            NanoUsd::from_tokens_and_rate(1_000, rate),
+            NanoUsd(3_000_000)
+        );
         // Even 1 token at $0.05 / 1M = 50_000_000 nanos/1M = 50 nanos exact.
         let cheap = NanoUsd::parse_usd("0.05").unwrap().nanos();
         assert_eq!(NanoUsd::from_tokens_and_rate(1, cheap), NanoUsd(50));

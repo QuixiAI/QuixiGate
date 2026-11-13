@@ -17,7 +17,9 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::auth::authenticate_inference;
-use crate::codecs::common::{extract_request_tags, is_catalog_model_routable, should_suppress_request_log};
+use crate::codecs::common::{
+    extract_request_tags, is_catalog_model_routable, should_suppress_request_log,
+};
 use crate::state::{ApiError, ApiResult, AppState};
 
 const DEFAULT_PROTOCOL_VERSION: &str = "2025-03-26";
@@ -130,9 +132,7 @@ pub async fn handle_mcp_post(
             }
             let mut responses = Vec::new();
             for item in items {
-                if let Some(r) =
-                    dispatch_jsonrpc_item(&state, &principal, &headers, item).await
-                {
+                if let Some(r) = dispatch_jsonrpc_item(&state, &principal, &headers, item).await {
                     responses.push(r);
                 }
             }
@@ -180,7 +180,11 @@ async fn dispatch_jsonrpc_item(
     msg: Value,
 ) -> Option<Value> {
     let Some(obj) = msg.as_object() else {
-        return Some(jsonrpc_err(Value::Null, -32600, "invalid JSON-RPC request object"));
+        return Some(jsonrpc_err(
+            Value::Null,
+            -32600,
+            "invalid JSON-RPC request object",
+        ));
     };
     let id = obj.get("id").cloned();
     let Some(method) = obj.get("method").and_then(Value::as_str) else {
@@ -228,9 +232,7 @@ async fn dispatch_jsonrpc_item(
         }
         "ping" => Some(jsonrpc_ok(req_id, json!({}))),
         "resources/list" => Some(jsonrpc_ok(req_id, json!({ "resources": [] }))),
-        "resources/templates/list" => {
-            Some(jsonrpc_ok(req_id, json!({ "resourceTemplates": [] })))
-        }
+        "resources/templates/list" => Some(jsonrpc_ok(req_id, json!({ "resourceTemplates": [] }))),
         "prompts/list" => Some(jsonrpc_ok(req_id, json!({ "prompts": [] }))),
         "tools/list" => Some(jsonrpc_ok(
             req_id,
@@ -585,8 +587,7 @@ fn run_list_models_tool(
                 pat == "*"
                     || pat == &m.canonical_id
                     || pat == &m.bare_id
-                    || (pat.ends_with('*')
-                        && m.canonical_id.starts_with(pat.trim_end_matches('*')))
+                    || (pat.ends_with('*') && m.canonical_id.starts_with(pat.trim_end_matches('*')))
             })
         {
             continue;

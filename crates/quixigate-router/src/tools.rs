@@ -111,7 +111,12 @@ impl WebSearchCredentials {
                 .filter(|v| !v.is_empty())
         };
         let keyless_fallback = non_empty_env("QUIXIGATE_WEB_KEYLESS_FALLBACK")
-            .map(|v| !matches!(v.to_ascii_lowercase().as_str(), "0" | "false" | "off" | "no"))
+            .map(|v| {
+                !matches!(
+                    v.to_ascii_lowercase().as_str(),
+                    "0" | "false" | "off" | "no"
+                )
+            })
             .unwrap_or(true);
 
         Self {
@@ -223,7 +228,9 @@ impl WebSearchEngine {
 
         // Rung 0: Custom override (`with_web_search_url` or `QUIXIGATE_WEB_SEARCH_URL`)
         if let Some(custom_url) = creds.search_endpoint_override.as_deref() {
-            return self.search_custom_endpoint(custom_url, trimmed, limit).await;
+            return self
+                .search_custom_endpoint(custom_url, trimmed, limit)
+                .await;
         }
 
         // Explicit provider pin (`QUIXIGATE_WEB_SEARCH_PROVIDER`) — strict, no silent reroute.
@@ -234,7 +241,9 @@ impl WebSearchEngine {
                 return Ok(cached);
             }
             let started = Instant::now();
-            let (id, label, hits) = self.execute_named_provider(pin, trimmed, limit, creds).await?;
+            let (id, label, hits) = self
+                .execute_named_provider(pin, trimmed, limit, creds)
+                .await?;
             let payload = build_search_payload(trimmed, id, label, hits, started.elapsed(), None);
             self.cache.insert(cache_key, payload.clone()).await;
             return Ok(payload);
@@ -269,7 +278,10 @@ impl WebSearchEngine {
                 return Ok(cached);
             }
             let started = Instant::now();
-            match self.execute_named_provider(cand, trimmed, limit, creds).await {
+            match self
+                .execute_named_provider(cand, trimmed, limit, creds)
+                .await
+            {
                 Ok((id, label, hits)) => {
                     let payload =
                         build_search_payload(trimmed, id, label, hits, started.elapsed(), None);
@@ -299,9 +311,7 @@ impl WebSearchEngine {
         // Rung 3: Keyless ring (either primary zero-key path, or one-shot stateless rescue).
         let is_rescue = !keyed_candidates.is_empty();
         let keyless_cache_key = format!("keyless\0{limit}\0{}", trimmed.to_lowercase());
-        if !is_rescue
-            && let Some(mut cached) = self.cache.get(&keyless_cache_key).await
-        {
+        if !is_rescue && let Some(mut cached) = self.cache.get(&keyless_cache_key).await {
             cached["cached"] = Value::Bool(true);
             return Ok(cached);
         }
@@ -555,9 +565,7 @@ impl WebSearchEngine {
                 .take(limit)
                 .filter_map(|item| {
                     let url = item["url"].as_str().unwrap_or("").trim().to_owned();
-                    let title = sanitize_external_text(
-                        item["title"].as_str().unwrap_or(query),
-                    );
+                    let title = sanitize_external_text(item["title"].as_str().unwrap_or(query));
                     let snippet = truncate_chars(
                         &sanitize_external_text(
                             item["snippet"]
@@ -729,15 +737,15 @@ impl WebSearchEngine {
                     return None;
                 }
                 Some(NormalizedSearchHit {
-                    title: sanitize_external_text(
-                        &strip_html_tags(item["title"].as_str().unwrap_or("")),
-                    ),
+                    title: sanitize_external_text(&strip_html_tags(
+                        item["title"].as_str().unwrap_or(""),
+                    )),
                     site_name: site_name_from_url(&url),
                     url,
                     snippet: truncate_chars(
-                        &sanitize_external_text(
-                            &strip_html_tags(item["description"].as_str().unwrap_or("")),
-                        ),
+                        &sanitize_external_text(&strip_html_tags(
+                            item["description"].as_str().unwrap_or(""),
+                        )),
                         MAX_SNIPPET_CHARS,
                     ),
                     published: item["age"].as_str().map(sanitize_external_text),
@@ -885,7 +893,12 @@ impl WebSearchEngine {
             .collect())
     }
 
-    async fn call_keyless_mcp(&self, mcp_url: &str, tool: &str, args: Value) -> Result<String, String> {
+    async fn call_keyless_mcp(
+        &self,
+        mcp_url: &str,
+        tool: &str,
+        args: Value,
+    ) -> Result<String, String> {
         let resp = self
             .http
             .post(mcp_url)
@@ -1113,7 +1126,10 @@ impl WebSearchEngine {
 }
 
 /// Builds the server-side `:online` web search tool (`quixigate_web_search`).
-pub fn build_web_search_tool(http: reqwest::Client, search_endpoint_override: Option<String>) -> Tool {
+pub fn build_web_search_tool(
+    http: reqwest::Client,
+    search_endpoint_override: Option<String>,
+) -> Tool {
     let engine = Arc::new(WebSearchEngine::new(http));
     let creds = WebSearchCredentials::from_env(search_endpoint_override);
     build_web_search_tool_with_engine(engine, creds)
@@ -1249,7 +1265,10 @@ pub fn sanitize_external_text(input: &str) -> String {
     {
         out = out
             .replace("<<<EXTERNAL_UNTRUSTED_CONTENT", "[[MARKER_SANITIZED")
-            .replace("<<<END_EXTERNAL_UNTRUSTED_CONTENT", "[[END_MARKER_SANITIZED");
+            .replace(
+                "<<<END_EXTERNAL_UNTRUSTED_CONTENT",
+                "[[END_MARKER_SANITIZED",
+            );
     }
     out.trim().to_owned()
 }
@@ -1271,17 +1290,25 @@ pub async fn validate_public_http_url(raw: &str) -> Result<reqwest::Url, String>
     let lower = host_clean.to_ascii_lowercase();
     if matches!(
         lower.as_str(),
-        "localhost" | "0.0.0.0" | "host.docker.internal" | "gateway.docker.internal" | "metadata.google.internal"
+        "localhost"
+            | "0.0.0.0"
+            | "host.docker.internal"
+            | "gateway.docker.internal"
+            | "metadata.google.internal"
     ) || lower.ends_with(".localhost")
         || lower.ends_with(".local")
         || lower.ends_with(".internal")
     {
-        return Err(format!("Blocked: internal hostname '{host_clean}' is not permitted"));
+        return Err(format!(
+            "Blocked: internal hostname '{host_clean}' is not permitted"
+        ));
     }
 
     if let Ok(ip) = host_clean.parse::<IpAddr>() {
         if !is_globally_routable_ip(ip) {
-            return Err(format!("Blocked: private or internal IP '{ip}' is not permitted"));
+            return Err(format!(
+                "Blocked: private or internal IP '{ip}' is not permitted"
+            ));
         }
         return Ok(parsed);
     }
@@ -1397,7 +1424,14 @@ pub(crate) fn parse_mcp_text_payload(body: &str) -> Result<String, String> {
 }
 
 pub(crate) fn parse_exa_mcp_search_text(text: &str, limit: usize) -> Vec<NormalizedSearchHit> {
-    const LABELS: &[&str] = &["Title:", "URL:", "Highlights:", "Text:", "Published:", "Author:"];
+    const LABELS: &[&str] = &[
+        "Title:",
+        "URL:",
+        "Highlights:",
+        "Text:",
+        "Published:",
+        "Author:",
+    ];
     let mut hits = Vec::new();
 
     for block in text.split("\n---\n") {
@@ -1516,7 +1550,12 @@ pub(crate) fn parse_bing_rss_xml(xml: &str, limit: usize) -> Vec<NormalizedSearc
             .map(|s| decode_html_entities(s.trim()))
             .unwrap_or_default();
         let snippet = extract_xml_tag(chunk, "description")
-            .map(|s| truncate_chars(&sanitize_external_text(&strip_html_tags(&s)), MAX_SNIPPET_CHARS))
+            .map(|s| {
+                truncate_chars(
+                    &sanitize_external_text(&strip_html_tags(&s)),
+                    MAX_SNIPPET_CHARS,
+                )
+            })
             .unwrap_or_default();
         let published = extract_xml_tag(chunk, "pubDate")
             .map(|s| sanitize_external_text(s.trim()))
@@ -1670,7 +1709,9 @@ fn extract_readable_html(html: &str) -> (String, String) {
         .map(|t| strip_html_tags(&t))
         .unwrap_or_default();
     let mut cleaned = pre_sanitized;
-    for drop_tag in ["script", "style", "noscript", "svg", "nav", "footer", "header"] {
+    for drop_tag in [
+        "script", "style", "noscript", "svg", "nav", "footer", "header",
+    ] {
         cleaned = remove_tag_blocks_ci(&cleaned, drop_tag);
     }
     let text = strip_html_tags(&cleaned);
@@ -1701,7 +1742,9 @@ fn remove_tag_blocks_ci(html: &str, tag: &str) -> String {
             .get(start + open_pat.len())
             .copied()
             .unwrap_or(b' ');
-        if !(after_tag_char == b'>' || after_tag_char.is_ascii_whitespace() || after_tag_char == b'/')
+        if !(after_tag_char == b'>'
+            || after_tag_char.is_ascii_whitespace()
+            || after_tag_char == b'/')
         {
             out.push_str(&html[cursor..start + open_pat.len()]);
             cursor = start + open_pat.len();
@@ -1816,10 +1859,7 @@ fn head_tail_truncate(text: &str, max_chars: usize) -> (String, bool) {
     let head_len = (max_chars * 3) / 4;
     let tail_len = max_chars.saturating_sub(head_len + 64);
     let head: String = text.chars().take(head_len).collect();
-    let tail: String = text
-        .chars()
-        .skip(total.saturating_sub(tail_len))
-        .collect();
+    let tail: String = text.chars().skip(total.saturating_sub(tail_len)).collect();
     let omitted = total.saturating_sub(head_len + tail_len);
     (
         format!("{head}\n\n[... {omitted} characters omitted ...]\n\n{tail}"),
@@ -1906,7 +1946,9 @@ pub async fn fetch_mcp_http_tools(http: &reqwest::Client, mcp_url: &str) -> Vec<
                         .json(&call_body)
                         .send()
                         .await
-                        .map_err(|e| aisdk::Error::ToolCallError(format!("MCP call failed: {e}")))?;
+                        .map_err(|e| {
+                            aisdk::Error::ToolCallError(format!("MCP call failed: {e}"))
+                        })?;
                     let body: Value = r.json().await.unwrap_or_default();
                     Ok(body["result"].to_string())
                 }

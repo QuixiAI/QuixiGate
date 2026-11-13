@@ -2,7 +2,7 @@
 //! `${ENV_VAR:-default}` expansion.
 
 use quixigate_core::{
-    AuthKind, CredentialSecret, GatewaySettings, ModelRoute, QuixigateError, PoolStrategy, Result,
+    AuthKind, CredentialSecret, GatewaySettings, ModelRoute, PoolStrategy, QuixigateError, Result,
     RouteTarget, now_ms,
 };
 use regex::Regex;
@@ -73,8 +73,8 @@ const fn default_true() -> bool {
 
 /// Expands `${VAR}` and `${VAR:-fallback}` tokens using process environment variables.
 pub fn expand_env_vars(raw: &str) -> Result<String> {
-    let re = Regex::new(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}")
-        .expect("valid env var regex");
+    let re =
+        Regex::new(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}").expect("valid env var regex");
     let mut missing = Vec::new();
     let expanded = re.replace_all(raw, |caps: &regex::Captures<'_>| {
         let name = &caps[1];
@@ -115,7 +115,9 @@ impl Database {
                 if let Ok((_, secret)) = self.get_credential_with_secret(&cred.id) {
                     match secret {
                         CredentialSecret::ApiKey { key } => api_key = Some(key),
-                        CredentialSecret::AnthropicSetupToken { token } => setup_token = Some(token),
+                        CredentialSecret::AnthropicSetupToken { token } => {
+                            setup_token = Some(token)
+                        }
                         _ => {}
                     }
                 }
@@ -175,7 +177,9 @@ impl Database {
         let expanded = expand_env_vars(raw)?;
         let is_yaml = match format_hint {
             Some(f) => matches!(f.to_ascii_lowercase().as_str(), "yaml" | "yml"),
-            None => expanded.trim_start().starts_with("settings:") || expanded.contains("\nroutes:\n"),
+            None => {
+                expanded.trim_start().starts_with("settings:") || expanded.contains("\nroutes:\n")
+            }
         };
 
         let cfg: DeclarativeConfig = if is_yaml {
@@ -230,6 +234,7 @@ impl Database {
                 targets: r.targets,
                 pool_strategy: r.pool_strategy,
                 allow_paid_overflow: r.allow_paid_overflow,
+                blocked: false,
                 input_nanos_per_m: r.input_nanos_per_m,
                 output_nanos_per_m: r.output_nanos_per_m,
                 cache_read_nanos_per_m: r.cache_read_nanos_per_m,

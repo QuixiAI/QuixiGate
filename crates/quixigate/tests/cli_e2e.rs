@@ -156,7 +156,13 @@ fn cli_end_to_end_keys_config_doctor_and_zero_dotfile_mutation_run() {
     assert!(String::from_utf8_lossy(&models_out.stdout).contains("claude-sonnet"));
 
     let doctor_out = Command::new(quixigate_bin())
-        .args(["--data-dir", data_dir.to_str().unwrap(), "doctor", "--port", "0"])
+        .args([
+            "--data-dir",
+            data_dir.to_str().unwrap(),
+            "doctor",
+            "--port",
+            "0",
+        ])
         .env("HOME", &fake_home)
         .output()
         .unwrap();

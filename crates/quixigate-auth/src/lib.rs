@@ -10,11 +10,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use dashmap::DashMap;
-use quixigate_core::{
-    AuthKind, CredentialRecord, QuixigateError, Result, now_ms,
-};
-use quixigate_db::Database;
 use providers::{OAUTH_PROVIDER_CATALOG, OAuthProviderDescriptor, PollOutcome};
+use quixigate_core::{AuthKind, CredentialRecord, QuixigateError, Result, now_ms};
+use quixigate_db::Database;
 use quota::QuotaEndpoints;
 use refresh::CredentialRefresher;
 use serde::{Deserialize, Serialize};
@@ -102,7 +100,9 @@ impl OAuthWizardManager {
         self.sessions
             .get(session_id)
             .map(|s| s.clone())
-            .ok_or_else(|| QuixigateError::NotFound(format!("OAuth session '{session_id}' not found")))
+            .ok_or_else(|| {
+                QuixigateError::NotFound(format!("OAuth session '{session_id}' not found"))
+            })
     }
 
     /// Starts any enabled OAuth / PKCE flow for the Web UI or CLI.
@@ -158,10 +158,7 @@ impl OAuthWizardManager {
         match provider_id.as_str() {
             "openai-codex" => {
                 let use_device = req.prefer_device_code.unwrap_or(false);
-                if !use_device
-                    && let Ok(listener) =
-                        TcpListener::bind(("127.0.0.1", 1455)).await
-                {
+                if !use_device && let Ok(listener) = TcpListener::bind(("127.0.0.1", 1455)).await {
                     let verifier = flow::random_token();
                     let state = flow::random_token();
                     let challenge = flow::pkce_challenge(&verifier);
@@ -266,12 +263,9 @@ impl OAuthWizardManager {
             }
 
             "xai-oauth" => {
-                let start = providers::start_xai_device_flow(
-                    &http,
-                    providers::XAI_DISCOVERY_URL,
-                    false,
-                )
-                .await?;
+                let start =
+                    providers::start_xai_device_flow(&http, providers::XAI_DISCOVERY_URL, false)
+                        .await?;
                 let session = OAuthWizardSession {
                     session_id: session_id.clone(),
                     provider_id: provider_id.clone(),
@@ -357,8 +351,14 @@ impl OAuthWizardManager {
                             let d = dc.clone();
                             let e = ent.clone();
                             async move {
-                                providers::poll_copilot_device_once(&client, &g, &c, &d, e.as_deref())
-                                    .await
+                                providers::poll_copilot_device_once(
+                                    &client,
+                                    &g,
+                                    &c,
+                                    &d,
+                                    e.as_deref(),
+                                )
+                                .await
                             }
                         },
                     )
@@ -685,7 +685,13 @@ impl OAuthWizardManager {
                 &pending.redirect_uri,
             )
             .await
-            .map(|s| (s, AuthKind::Oauth, Some(providers::CODEX_DEFAULT_BASE_URL.to_owned()))),
+            .map(|s| {
+                (
+                    s,
+                    AuthKind::Oauth,
+                    Some(providers::CODEX_DEFAULT_BASE_URL.to_owned()),
+                )
+            }),
 
             "google-gemini-cli" => providers::complete_gemini_login(
                 http,
@@ -738,7 +744,9 @@ impl OAuthWizardManager {
                 )
             }),
 
-            other => Err(QuixigateError::Validation(format!("unknown PKCE provider '{other}'"))),
+            other => Err(QuixigateError::Validation(format!(
+                "unknown PKCE provider '{other}'"
+            ))),
         };
 
         match exchanged {
@@ -945,12 +953,18 @@ mod tests {
         for _ in 0..20 {
             let r = refresher.clone();
             let cid = cred.id.clone();
-            tasks.push(tokio::spawn(async move { r.ensure_fresh(&cid).await.unwrap() }));
+            tasks.push(tokio::spawn(
+                async move { r.ensure_fresh(&cid).await.unwrap() },
+            ));
         }
         for t in tasks {
             let (_, sec) = t.await.unwrap();
             match sec {
-                CredentialSecret::Codex { refresh, account_id, .. } => {
+                CredentialSecret::Codex {
+                    refresh,
+                    account_id,
+                    ..
+                } => {
                     assert_eq!(refresh, "rotated_rt_1");
                     assert_eq!(account_id, "acct_1");
                 }

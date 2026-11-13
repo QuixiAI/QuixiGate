@@ -91,7 +91,10 @@ impl ChatGptCodexModel {
             .header("originator", ORIGINATOR)
             .header("OpenAI-Beta", "responses=experimental")
             .header("Accept", "text/event-stream")
-            .header("User-Agent", concat!("quixigate/", env!("CARGO_PKG_VERSION")))
+            .header(
+                "User-Agent",
+                concat!("quixigate/", env!("CARGO_PKG_VERSION")),
+            )
             .header("session_id", &request_id)
             .header("x-client-request-id", &request_id);
 
@@ -458,7 +461,8 @@ pub struct CodexEventMapper {
 
 impl CodexEventMapper {
     pub fn map(&mut self, event: &Value) -> Vec<LanguageModelStreamChunk> {
-        let delta = |kind: LanguageModelStreamChunkType| vec![LanguageModelStreamChunk::Delta(kind)];
+        let delta =
+            |kind: LanguageModelStreamChunkType| vec![LanguageModelStreamChunk::Delta(kind)];
         let text = |key: &str| event[key].as_str().unwrap_or_default().to_owned();
         match event["type"].as_str().unwrap_or_default() {
             "response.output_item.added" => match event["item"]["type"].as_str() {
@@ -475,7 +479,10 @@ impl CodexEventMapper {
                         self.call_ids_by_item.insert(item_id, call_id.clone());
                     }
                     delta(LanguageModelStreamChunkType::ToolCallStart(ToolDetails {
-                        name: event["item"]["name"].as_str().unwrap_or_default().to_owned(),
+                        name: event["item"]["name"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .to_owned(),
                         id: call_id,
                     }))
                 }
@@ -535,7 +542,9 @@ impl CodexEventMapper {
                 } else {
                     event
                 };
-                delta(LanguageModelStreamChunkType::Failed(codex_error_text(err_obj)))
+                delta(LanguageModelStreamChunkType::Failed(codex_error_text(
+                    err_obj,
+                )))
             }
             _ => Vec::new(),
         }
@@ -629,7 +638,9 @@ fn parse_codex_usage(usage: &Value) -> Usage {
 }
 
 fn codex_error_text(error: &Value) -> String {
-    let message = error["message"].as_str().unwrap_or("Codex model call failed");
+    let message = error["message"]
+        .as_str()
+        .unwrap_or("Codex model call failed");
     match error["code"].as_str().or(error["type"].as_str()) {
         Some(code) => format!("{code}: {message}"),
         None => message.to_owned(),

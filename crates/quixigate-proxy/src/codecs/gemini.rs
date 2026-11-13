@@ -120,7 +120,10 @@ fn parse_gemini_canonical(
                     if let Some(name) = decl["name"].as_str() {
                         client_tools.push(ClientToolSpec {
                             name: name.to_owned(),
-                            description: decl["description"].as_str().unwrap_or_default().to_owned(),
+                            description: decl["description"]
+                                .as_str()
+                                .unwrap_or_default()
+                                .to_owned(),
                             parameters: decl
                                 .get("parameters")
                                 .cloned()
@@ -184,13 +187,11 @@ pub async fn handle_gemini_model_action(
 ) -> ApiResult<Response> {
     let principal = authenticate_inference(&state, &headers, query.key.as_deref())?;
     let trimmed = model_action.trim_start_matches('/');
-    let (raw_model, action) = trimmed
-        .rsplit_once(':')
-        .ok_or_else(|| {
-            QuixigateError::Validation(format!(
-                "expected 'models/{{model}}:generateContent', got '{trimmed}'"
-            ))
-        })?;
+    let (raw_model, action) = trimmed.rsplit_once(':').ok_or_else(|| {
+        QuixigateError::Validation(format!(
+            "expected 'models/{{model}}:generateContent', got '{trimmed}'"
+        ))
+    })?;
     let model_name = raw_model.strip_prefix("models/").unwrap_or(raw_model);
 
     if action == "countTokens" {
@@ -282,7 +283,13 @@ pub async fn handle_gemini_model_action(
                 let oi_tools = gen_out
                     .tool_calls
                     .iter()
-                    .map(|tc| (tc.tool.id.clone(), tc.tool.name.clone(), tc.input.to_string()))
+                    .map(|tc| {
+                        (
+                            tc.tool.id.clone(),
+                            tc.tool.name.clone(),
+                            tc.input.to_string(),
+                        )
+                    })
                     .collect();
 
                 finalize_request_accounting(
@@ -444,7 +451,11 @@ pub async fn handle_gemini_model_action(
                             }],
                             "modelVersion": resolved_model
                         });
-                        if tx.send(Ok(Event::default().data(chunk.to_string()))).await.is_err() {
+                        if tx
+                            .send(Ok(Event::default().data(chunk.to_string())))
+                            .await
+                            .is_err()
+                        {
                             break;
                         }
                     }
@@ -501,7 +512,13 @@ pub async fn handle_gemini_model_action(
                 let oi_tools = sum
                     .tool_calls
                     .iter()
-                    .map(|tc| (tc.tool.id.clone(), tc.tool.name.clone(), tc.input.to_string()))
+                    .map(|tc| {
+                        (
+                            tc.tool.id.clone(),
+                            tc.tool.name.clone(),
+                            tc.input.to_string(),
+                        )
+                    })
                     .collect();
                 finalize_request_accounting(
                     &state_bg,

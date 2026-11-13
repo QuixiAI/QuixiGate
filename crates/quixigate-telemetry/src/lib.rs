@@ -13,10 +13,10 @@ use opentelemetry_proto::tonic::resource::v1::Resource;
 use opentelemetry_proto::tonic::trace::v1::{
     ResourceSpans, ScopeSpans, Span, Status, span::SpanKind, status::StatusCode,
 };
+use prost::Message as ProstMessage;
 use quixigate_core::{
     GatewaySettings, IngressProtocol, OtlpProtocol, QuixigateError, RequestLog, Result, now_ms,
 };
-use prost::Message as ProstMessage;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -177,9 +177,7 @@ impl TelemetryHub {
         }
 
         if let Some(ttft) = log.ttft_ms {
-            self.metrics
-                .ttft_sum_ms
-                .fetch_add(ttft, Ordering::Relaxed);
+            self.metrics.ttft_sum_ms.fetch_add(ttft, Ordering::Relaxed);
             self.metrics.ttft_count.fetch_add(1, Ordering::Relaxed);
         }
         self.metrics
@@ -254,14 +252,14 @@ impl TelemetryHub {
             ),
         };
         let oi = OpenInferencePayload {
-            invocation_parameters_json: Some(json!({ "temperature": 0.0, "stream": true }).to_string()),
+            invocation_parameters_json: Some(
+                json!({ "temperature": 0.0, "stream": true }).to_string(),
+            ),
             input_messages: vec![(
                 "user".to_owned(),
                 "Verify Arize Phoenix OpenInference connection from QuixiGate".to_owned(),
             )],
-            output_text: Some(
-                "Arize Phoenix OpenInference telemetry verified cleanly!".to_owned(),
-            ),
+            output_text: Some("Arize Phoenix OpenInference telemetry verified cleanly!".to_owned()),
             output_tool_calls: Vec::new(),
             tool_schemas_json: Vec::new(),
             session_id: Some("quixigate-phoenix-test".to_owned()),
@@ -384,7 +382,9 @@ impl Default for TelemetryHub {
 }
 
 fn escape_prom(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n")
+    s.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
 }
 
 fn kv_str(k: &str, v: impl Into<String>) -> KeyValue {
@@ -682,9 +682,7 @@ async fn send_otlp_request(
         } else {
             format!("http://{base}")
         };
-        let url = format!(
-            "{http_base}/opentelemetry.proto.collector.trace.v1.TraceService/Export"
-        );
+        let url = format!("{http_base}/opentelemetry.proto.collector.trace.v1.TraceService/Export");
         let proto_bytes = export_req.encode_to_vec();
         let mut framed = Vec::with_capacity(5 + proto_bytes.len());
         framed.push(0u8); // uncompressed gRPC flag
@@ -715,7 +713,9 @@ async fn send_otlp_request(
     } else {
         http
     };
-    let mut req = active_client.post(&url).header("Content-Type", content_type);
+    let mut req = active_client
+        .post(&url)
+        .header("Content-Type", content_type);
     if is_grpc {
         req = req.header("te", "trailers");
     }
@@ -729,11 +729,15 @@ async fn send_otlp_request(
             .header("api_key", api_key.trim());
     }
 
-    let resp = req.body(payload).send().await.map_err(|e| QuixigateError::Upstream {
-        status: 502,
-        provider: "arize-phoenix-otlp".to_owned(),
-        message: format!("could not reach OTLP collector at {url}: {e}"),
-    })?;
+    let resp = req
+        .body(payload)
+        .send()
+        .await
+        .map_err(|e| QuixigateError::Upstream {
+            status: 502,
+            provider: "arize-phoenix-otlp".to_owned(),
+            message: format!("could not reach OTLP collector at {url}: {e}"),
+        })?;
     let status = resp.status().as_u16();
     if !(200..300).contains(&status) {
         let body = resp.text().await.unwrap_or_default();
@@ -804,12 +808,13 @@ mod tests {
         let rs = &spans[0].resource_spans[0];
         let span = &rs.scope_spans[0].spans[0];
         let find_str = |k: &str| -> Option<String> {
-            span.attributes.iter().find(|kv| kv.key == k).and_then(|kv| {
-                match kv.value.as_ref()?.value.as_ref()? {
+            span.attributes
+                .iter()
+                .find(|kv| kv.key == k)
+                .and_then(|kv| match kv.value.as_ref()?.value.as_ref()? {
                     any_value::Value::StringValue(s) => Some(s.clone()),
                     _ => None,
-                }
-            })
+                })
         };
         assert_eq!(find_str("openinference.span.kind").as_deref(), Some("LLM"));
         assert_eq!(

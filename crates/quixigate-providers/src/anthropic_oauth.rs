@@ -74,7 +74,11 @@ impl AnthropicOAuthModel {
         }
     }
 
-    async fn send(&self, options: &LanguageModelOptions, stream: bool) -> Result<reqwest::Response> {
+    async fn send(
+        &self,
+        options: &LanguageModelOptions,
+        stream: bool,
+    ) -> Result<reqwest::Response> {
         let body = build_anthropic_body(&self.model, options, &self.tools, stream);
         let mut req = self
             .http
@@ -333,9 +337,10 @@ impl AnthropicStreamState {
                     "thinking" => {
                         self.blocks
                             .insert(index, AnthropicAccBlock::Thinking(String::new()));
-                        self.ready.push_back(Ok(vec![LanguageModelStreamChunk::Delta(
-                            LanguageModelStreamChunkType::ReasoningStart,
-                        )]));
+                        self.ready
+                            .push_back(Ok(vec![LanguageModelStreamChunk::Delta(
+                                LanguageModelStreamChunkType::ReasoningStart,
+                            )]));
                     }
                     "tool_use" => {
                         let id = cb["id"].as_str().unwrap_or("toolu_0").to_owned();
@@ -348,9 +353,13 @@ impl AnthropicStreamState {
                                 json_buf: String::new(),
                             },
                         );
-                        self.ready.push_back(Ok(vec![LanguageModelStreamChunk::Delta(
-                            LanguageModelStreamChunkType::ToolCallStart(ToolDetails { name, id }),
-                        )]));
+                        self.ready
+                            .push_back(Ok(vec![LanguageModelStreamChunk::Delta(
+                                LanguageModelStreamChunkType::ToolCallStart(ToolDetails {
+                                    name,
+                                    id,
+                                }),
+                            )]));
                     }
                     _ => {}
                 }
@@ -365,26 +374,32 @@ impl AnthropicStreamState {
                     (AnthropicAccBlock::Text(buf), "text_delta") => {
                         let d = delta["text"].as_str().unwrap_or_default().to_owned();
                         buf.push_str(&d);
-                        self.ready.push_back(Ok(vec![LanguageModelStreamChunk::Delta(
-                            LanguageModelStreamChunkType::TextDelta(d),
-                        )]));
+                        self.ready
+                            .push_back(Ok(vec![LanguageModelStreamChunk::Delta(
+                                LanguageModelStreamChunkType::TextDelta(d),
+                            )]));
                     }
                     (AnthropicAccBlock::Thinking(buf), "thinking_delta") => {
                         let d = delta["thinking"].as_str().unwrap_or_default().to_owned();
                         buf.push_str(&d);
-                        self.ready.push_back(Ok(vec![LanguageModelStreamChunk::Delta(
-                            LanguageModelStreamChunkType::ReasoningDelta(d),
-                        )]));
+                        self.ready
+                            .push_back(Ok(vec![LanguageModelStreamChunk::Delta(
+                                LanguageModelStreamChunkType::ReasoningDelta(d),
+                            )]));
                     }
                     (AnthropicAccBlock::ToolUse { id, json_buf, .. }, "input_json_delta") => {
-                        let d = delta["partial_json"].as_str().unwrap_or_default().to_owned();
+                        let d = delta["partial_json"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .to_owned();
                         json_buf.push_str(&d);
-                        self.ready.push_back(Ok(vec![LanguageModelStreamChunk::Delta(
-                            LanguageModelStreamChunkType::ToolCallDelta {
-                                id: id.clone(),
-                                delta: d,
-                            },
-                        )]));
+                        self.ready
+                            .push_back(Ok(vec![LanguageModelStreamChunk::Delta(
+                                LanguageModelStreamChunkType::ToolCallDelta {
+                                    id: id.clone(),
+                                    delta: d,
+                                },
+                            )]));
                     }
                     _ => {}
                 }
@@ -393,14 +408,16 @@ impl AnthropicStreamState {
                 let index = payload["index"].as_u64().unwrap_or(0) as usize;
                 match self.blocks.get(&index) {
                     Some(AnthropicAccBlock::Text(_)) => {
-                        self.ready.push_back(Ok(vec![LanguageModelStreamChunk::Delta(
-                            LanguageModelStreamChunkType::TextEnd,
-                        )]));
+                        self.ready
+                            .push_back(Ok(vec![LanguageModelStreamChunk::Delta(
+                                LanguageModelStreamChunkType::TextEnd,
+                            )]));
                     }
                     Some(AnthropicAccBlock::Thinking(_)) => {
-                        self.ready.push_back(Ok(vec![LanguageModelStreamChunk::Delta(
-                            LanguageModelStreamChunkType::ReasoningEnd,
-                        )]));
+                        self.ready
+                            .push_back(Ok(vec![LanguageModelStreamChunk::Delta(
+                                LanguageModelStreamChunkType::ReasoningEnd,
+                            )]));
                     }
                     _ => {}
                 }
@@ -424,9 +441,10 @@ impl AnthropicStreamState {
                 let msg = payload["error"]["message"]
                     .as_str()
                     .unwrap_or("Anthropic stream error");
-                self.ready.push_back(Ok(vec![LanguageModelStreamChunk::Delta(
-                    LanguageModelStreamChunkType::Failed(msg.to_owned()),
-                )]));
+                self.ready
+                    .push_back(Ok(vec![LanguageModelStreamChunk::Delta(
+                        LanguageModelStreamChunkType::Failed(msg.to_owned()),
+                    )]));
                 self.ended = true;
             }
             _ => {}
@@ -605,7 +623,10 @@ pub fn build_anthropic_body(
             ReasoningEffort::None => {
                 body.insert("thinking".into(), json!({ "type": "disabled" }));
             }
-            ReasoningEffort::Low | ReasoningEffort::Medium | ReasoningEffort::High | ReasoningEffort::XHigh => {
+            ReasoningEffort::Low
+            | ReasoningEffort::Medium
+            | ReasoningEffort::High
+            | ReasoningEffort::XHigh => {
                 let budget = match effort {
                     ReasoningEffort::Low => (max_tokens / 4).max(1024),
                     ReasoningEffort::Medium => (max_tokens / 2).max(1024),
