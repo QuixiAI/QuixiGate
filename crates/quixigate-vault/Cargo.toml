@@ -5,7 +5,6 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-homepage.workspace = true
 description = "AES-256-GCM encrypted credential vault with zeroize memory hygiene for QuixiGate"
 
 [dependencies]

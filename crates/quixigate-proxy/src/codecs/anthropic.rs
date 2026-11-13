@@ -7,7 +7,6 @@
 //!    `BytesMut` `AnthropicTranscodeSseStream` state machine (`0` `tokio::spawn`, `0` `mpsc`, `0` `json!`)
 //!    for OpenRouter, OpenAI, Codex, Gemini, and local runtimes.
 
-#[cfg(feature = "subscription-oauth")]
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::pin::Pin;
@@ -24,17 +23,13 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use bytes::BytesMut;
 use futures::Stream;
-#[cfg(feature = "subscription-oauth")]
-use quixigate_core::SecretScannerMode;
-use quixigate_core::{IngressProtocol, NanoUsd, QuixigateError};
+use quixigate_core::{IngressProtocol, NanoUsd, QuixigateError, SecretScannerMode};
 use quixigate_db::{AuthenticatedPrincipal, BudgetGuard, ConcurrencyGuard};
 use quixigate_router::{
-    CanonicalRequest, ClientToolSpec, RoutedStream, RoutedStreamEvent, StreamCompletionSummary,
+    CanonicalRequest, ClientToolSpec, CutThroughJsonOutcome, CutThroughStreamOutcome,
+    CutThroughWireFormat, RoutedStream, RoutedStreamEvent, StreamCompletionSummary,
 };
-#[cfg(feature = "subscription-oauth")]
-use quixigate_router::{CutThroughJsonOutcome, CutThroughStreamOutcome, CutThroughWireFormat};
 use quixigate_telemetry::{OpenInferencePayload, TelemetryHub};
-#[cfg(feature = "subscription-oauth")]
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
@@ -42,7 +37,6 @@ use crate::auth::authenticate_inference;
 use crate::codecs::common::*;
 use crate::state::{ApiError, ApiResult, AppState};
 
-#[cfg(feature = "subscription-oauth")]
 #[derive(Deserialize)]
 struct AnthropicEnvelopePeek<'a> {
     #[serde(borrow, default)]
@@ -268,7 +262,6 @@ pub async fn handle_messages(
     let mut pre_reserved: Option<(ConcurrencyGuard, BudgetGuard)> = None;
 
     // ── Fast Lane Gate: Zero-DOM `/v1/messages` -> Anthropic Cut-Through ─────
-    #[cfg(feature = "subscription-oauth")]
     {
         let cache_pref = parse_cache_preference(&headers);
         let can_attempt_peek = settings.enforced_params.is_empty()

@@ -1487,6 +1487,44 @@ async fn cmd_status(data_dir: &Path, vault: &Vault, db: &Database) -> anyhow::Re
     Ok(())
 }
 
+#[cfg(windows)]
+fn build_windows_child_command(binary: &str, extra_args: &[String]) -> tokio::process::Command {
+    let bp = Path::new(binary);
+    if bp.components().count() == 1 && bp.extension().is_none() {
+        if let Some(path_os) = std::env::var_os("PATH") {
+            for dir in std::env::split_paths(&path_os) {
+                let exe = dir.join(format!("{binary}.exe"));
+                if exe.is_file() {
+                    let mut c = tokio::process::Command::new(exe);
+                    c.args(extra_args);
+                    return c;
+                }
+                for ext in ["cmd", "bat"] {
+                    let script = dir.join(format!("{binary}.{ext}"));
+                    if script.is_file() {
+                        let mut c = tokio::process::Command::new("cmd.exe");
+                        c.arg("/C").arg(script).args(extra_args);
+                        return c;
+                    }
+                }
+            }
+        }
+    } else if matches!(
+        bp.extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase())
+            .as_deref(),
+        Some("cmd" | "bat")
+    ) {
+        let mut c = tokio::process::Command::new("cmd.exe");
+        c.arg("/C").arg(binary).args(extra_args);
+        return c;
+    }
+    let mut c = tokio::process::Command::new(binary);
+    c.args(extra_args);
+    c
+}
+
 async fn cmd_run(
     data_dir: &Path,
     agent: &str,
@@ -1538,28 +1576,40 @@ async fn cmd_run(
     };
 
     let token = key.unwrap_or("quixigate-local");
-    let normalized = Path::new(agent)
+    let raw_name = Path::new(agent)
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or(agent)
         .to_ascii_lowercase();
+    let normalized = raw_name
+        .strip_suffix(".exe")
+        .or_else(|| raw_name.strip_suffix(".cmd"))
+        .or_else(|| raw_name.strip_suffix(".bat"))
+        .unwrap_or(&raw_name);
 
-    let binary = match normalized.as_str() {
+    let binary = match normalized {
         "claude-code" => "claude",
         "gemini-cli" => "gemini",
         _ => agent,
     };
 
     // Scoped child-process environment injection ONLY — zero dotfile writes on disk!
-    let mut cmd = tokio::process::Command::new(binary);
-    cmd.args(extra_args)
-        .stdin(Stdio::inherit())
+    #[cfg(not(windows))]
+    let mut cmd = {
+        let mut c = tokio::process::Command::new(binary);
+        c.args(extra_args);
+        c
+    };
+    #[cfg(windows)]
+    let mut cmd = build_windows_child_command(binary, extra_args);
+
+    cmd.stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .env("QUIXIGATE_ACTIVE", "1")
         .env("QUIXIGATE_GATEWAY_URL", &base_url);
 
-    match normalized.as_str() {
+    match normalized {
         "claude" | "claude-code" => {
             cmd.env("ANTHROPIC_BASE_URL", &base_url)
                 .env("ANTHROPIC_AUTH_TOKEN", token);

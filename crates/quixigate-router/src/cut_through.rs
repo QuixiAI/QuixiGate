@@ -1313,6 +1313,19 @@ fn resolve_cut_through_endpoint(
     }
 }
 
+const DEFAULT_ANTHROPIC_CUT_THROUGH_BASE_URL: &str = "https://api.anthropic.com";
+
+fn resolve_anthropic_messages_url_str(base: &str) -> String {
+    let trimmed = base.trim().trim_end_matches('/');
+    if trimmed.ends_with("/v1/messages") || trimmed.ends_with("/messages") {
+        trimmed.to_owned()
+    } else if trimmed.ends_with("/v1") {
+        format!("{trimmed}/messages")
+    } else {
+        format!("{trimmed}/v1/messages")
+    }
+}
+
 impl GatewayRouter {
     /// Resolves (or retrieves from the lock-free `plan_cache`) the candidate list and pricing rates
     /// for `requested_model` in `~12 ns` with 0 heap allocations on steady-state traffic.
@@ -2077,7 +2090,6 @@ impl GatewayRouter {
         }))
     }
 
-    #[cfg(feature = "subscription-oauth")]
     async fn send_anthropic_cut_through_candidate(
         &self,
         cand: &DispatchCandidate,
@@ -2104,10 +2116,9 @@ impl GatewayRouter {
 
         let (url, token, use_x_api_key) = match (cand.provider_id.as_str(), secret_arc.as_ref()) {
             (_, CredentialSecret::AnthropicSetupToken { token }) => {
-                let base = eff_base
-                    .unwrap_or(quixigate_providers::anthropic_oauth::DEFAULT_ANTHROPIC_BASE_URL);
+                let base = eff_base.unwrap_or(DEFAULT_ANTHROPIC_CUT_THROUGH_BASE_URL);
                 (
-                    quixigate_providers::AnthropicOAuthModel::resolve_messages_url(base),
+                    resolve_anthropic_messages_url_str(base),
                     token.clone(),
                     false,
                 )
@@ -2124,19 +2135,14 @@ impl GatewayRouter {
                     .or(resource_url.as_deref().filter(|s| !s.trim().is_empty()))
                     .unwrap_or("https://api.minimax.io/anthropic");
                 (
-                    quixigate_providers::AnthropicOAuthModel::resolve_messages_url(base),
+                    resolve_anthropic_messages_url_str(base),
                     access.clone(),
                     false,
                 )
             }
             ("anthropic", CredentialSecret::ApiKey { key }) => {
-                let base = eff_base
-                    .unwrap_or(quixigate_providers::anthropic_oauth::DEFAULT_ANTHROPIC_BASE_URL);
-                (
-                    quixigate_providers::AnthropicOAuthModel::resolve_messages_url(base),
-                    key.clone(),
-                    true,
-                )
+                let base = eff_base.unwrap_or(DEFAULT_ANTHROPIC_CUT_THROUGH_BASE_URL);
+                (resolve_anthropic_messages_url_str(base), key.clone(), true)
             }
             _ => return Ok(None),
         };
@@ -2223,7 +2229,6 @@ impl GatewayRouter {
     }
 
     /// Zero-DOM cut-through for `POST /v1/messages` (`stream: true`) -> Anthropic (`/v1/messages`).
-    #[cfg(feature = "subscription-oauth")]
     pub async fn execute_anthropic_cut_through_stream(
         &self,
         plan: PreparedCutThroughPlan,
@@ -2276,7 +2281,6 @@ impl GatewayRouter {
     }
 
     /// Zero-DOM cut-through for `POST /v1/messages` (`stream: false`) -> Anthropic (`/v1/messages`).
-    #[cfg(feature = "subscription-oauth")]
     pub async fn execute_anthropic_cut_through_json(
         &self,
         plan: PreparedCutThroughPlan,

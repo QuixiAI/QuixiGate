@@ -297,6 +297,7 @@ pub async fn handle_responses_post(
         .unwrap_or(settings.capture_payloads_default);
     let need_deep_telemetry = capture_payloads || settings.otlp_enabled;
 
+    #[cfg_attr(not(feature = "subscription-oauth"), allow(unused_mut))]
     let mut pre_reserved: Option<(ConcurrencyGuard, BudgetGuard)> = None;
 
     // ── Fast Lane Gate: Zero-DOM `/v1/responses` -> Codex Cut-Through ────────

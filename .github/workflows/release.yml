@@ -24,6 +24,8 @@ jobs:
             target: x86_64-unknown-linux-gnu
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -40,7 +42,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Build Release Binary
         run: cargo build --release --locked --target ${{ matrix.target }} -p quixigate
-      - name: Package Tarball & Checksum
+      - name: Package Tarball & Checksum (Unix)
+        if: runner.os != 'Windows'
         shell: bash
         run: |
           mkdir -p dist
@@ -52,12 +55,21 @@ jobs:
           else
             shasum -a 256 "quixigate-${{ matrix.target }}.tar.gz" > "quixigate-${{ matrix.target }}.tar.gz.sha256"
           fi
+      - name: Package Zip & Checksum (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/quixigate.exe" dist/quixigate.exe
+          Copy-Item LICENSE, README.md dist/
+          Compress-Archive -Path dist/quixigate.exe, dist/LICENSE, dist/README.md -DestinationPath "quixigate-${{ matrix.target }}.zip" -Force
+          $hash = (Get-FileHash "quixigate-${{ matrix.target }}.zip" -Algorithm SHA256).Hash.ToLower()
+          "$hash  quixigate-${{ matrix.target }}.zip" | Out-File -Encoding ascii "quixigate-${{ matrix.target }}.zip.sha256"
       - uses: actions/upload-artifact@v4
         with:
           name: release-${{ matrix.target }}
           path: |
-            quixigate-${{ matrix.target }}.tar.gz
-            quixigate-${{ matrix.target }}.tar.gz.sha256
+            quixigate-${{ matrix.target }}.*
 
   publish:
     needs: build
@@ -71,4 +83,6 @@ jobs:
           files: |
             quixigate-*.tar.gz
             quixigate-*.tar.gz.sha256
+            quixigate-*.zip
+            quixigate-*.zip.sha256
           generate_release_notes: true

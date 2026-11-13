@@ -5,7 +5,6 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-homepage.workspace = true
 description = "Multi-seat sticky router, OpenRouter catalog sync, guardrails, and SSRF-safe web search/fetch tools for QuixiGate"
 
 [features]

@@ -5,7 +5,6 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-homepage.workspace = true
 description = "Embedded SQLite (WAL) state store, NanoUsd budget ledger, and audit log for QuixiGate"
 
 [dependencies]

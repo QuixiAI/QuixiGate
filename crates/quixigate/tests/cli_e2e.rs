@@ -169,25 +169,38 @@ fn cli_end_to_end_keys_config_doctor_and_zero_dotfile_mutation_run() {
     assert!(doctor_out.status.success());
     let doctor_stdout = String::from_utf8_lossy(&doctor_out.stdout);
     assert!(doctor_stdout.contains("[OK] Vault AES-256-GCM AEAD round-trip verified"));
+    #[cfg(unix)]
     assert!(doctor_stdout.contains("[OK] vault.key permissions strictly 0600"));
 
-    // 5. `quixigate run claude -- --flag-test`: create a pure-POSIX shell stub `claude` binary
+    // 5. `quixigate run claude -- --flag-test`: create a stub `claude` binary/script
     // that prints its injected env vars and verifies the ephemeral QuixiGate gateway is live!
-    let fake_claude = fake_bin.join("claude");
-    fs::write(
-        &fake_claude,
-        "#!/bin/sh\necho \"BASE=$ANTHROPIC_BASE_URL\"\necho \"TOKEN=$ANTHROPIC_AUTH_TOKEN\"\necho \"MODEL=$ANTHROPIC_MODEL\"\necho \"ARGS=$*\"\ncurl -fsS \"$ANTHROPIC_BASE_URL/health/liveness\"\necho \"\"\n",
-    )
-    .unwrap();
     #[cfg(unix)]
     {
+        let fake_claude = fake_bin.join("claude");
+        fs::write(
+            &fake_claude,
+            "#!/bin/sh\necho \"BASE=$ANTHROPIC_BASE_URL\"\necho \"TOKEN=$ANTHROPIC_AUTH_TOKEN\"\necho \"MODEL=$ANTHROPIC_MODEL\"\necho \"ARGS=$*\"\ncurl -fsS \"$ANTHROPIC_BASE_URL/health/liveness\"\necho \"\"\n",
+        )
+        .unwrap();
         let mut perms = fs::metadata(&fake_claude).unwrap().permissions();
         perms.set_mode(0o755);
         fs::set_permissions(&fake_claude, perms).unwrap();
     }
+    #[cfg(windows)]
+    {
+        let fake_claude = fake_bin.join("claude.cmd");
+        fs::write(
+            &fake_claude,
+            "@echo off\r\necho BASE=%ANTHROPIC_BASE_URL%\r\necho TOKEN=%ANTHROPIC_AUTH_TOKEN%\r\necho MODEL=%ANTHROPIC_MODEL%\r\necho ARGS=%*\r\ncurl.exe -fsS \"%ANTHROPIC_BASE_URL%/health/liveness\"\r\necho.\r\n",
+        )
+        .unwrap();
+    }
 
-    let orig_path = std::env::var("PATH").unwrap_or_default();
-    let new_path = format!("{}:{orig_path}", fake_bin.display());
+    let mut paths = vec![fake_bin.clone()];
+    if let Some(orig_path) = std::env::var_os("PATH") {
+        paths.extend(std::env::split_paths(&orig_path));
+    }
+    let new_path = std::env::join_paths(paths).unwrap();
 
     let run_out = Command::new(quixigate_bin())
         .args([
