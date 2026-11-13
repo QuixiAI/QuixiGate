@@ -10,12 +10,10 @@ description = "OpenInference / OpenTelemetry OTLP exporter and live SSE trace ri
 [dependencies]
 quixigate-core.workspace = true
 anyhow.workspace = true
-arc-swap.workspace = true
 dashmap.workspace = true
 fastrand.workspace = true
 hex.workspace = true
 opentelemetry-proto.workspace = true
-parking_lot.workspace = true
 prost.workspace = true
 rand.workspace = true
 reqwest.workspace = true

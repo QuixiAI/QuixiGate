@@ -380,10 +380,12 @@ impl WriteBehindEngine {
                         break;
                     }
                     engine.worker_busy.store(true, Ordering::Release);
-                    let batch = engine.take_pending();
-                    if !batch.is_empty() {
+                    {
                         let conn = conn_mutex.lock();
-                        let _ = apply_ops_locked(&conn, &batch);
+                        let batch = engine.take_pending();
+                        if !batch.is_empty() {
+                            let _ = apply_ops_locked(&conn, &batch);
+                        }
                     }
                     engine.worker_busy.store(false, Ordering::Release);
                 }

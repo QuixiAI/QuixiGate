@@ -14,7 +14,6 @@ subscription-oauth = []
 [dependencies]
 quixigate-core.workspace = true
 aisdk.workspace = true
-anyhow.workspace = true
 async-trait.workspace = true
 base64.workspace = true
 bytes.workspace = true

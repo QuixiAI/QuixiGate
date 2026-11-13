@@ -2027,7 +2027,6 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.21",
- "uuid",
  "zeroize",
 ]
 
@@ -2056,7 +2055,6 @@ dependencies = [
  "tempfile",
  "tokio",
  "toml",
- "tracing",
  "uuid",
 ]
 
@@ -2065,7 +2063,6 @@ name = "quixigate-providers"
 version = "0.1.0"
 dependencies = [
  "aisdk",
- "anyhow",
  "async-trait",
  "axum",
  "base64 0.22.1",
@@ -2177,13 +2174,11 @@ name = "quixigate-telemetry"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "arc-swap",
  "axum",
  "dashmap",
  "fastrand",
  "hex",
  "opentelemetry-proto",
- "parking_lot",
  "prost",
  "quixigate-core",
  "rand 0.8.8",
@@ -2200,7 +2195,6 @@ name = "quixigate-vault"
 version = "0.1.0"
 dependencies = [
  "aes-gcm",
- "anyhow",
  "base64 0.22.1",
  "hex",
  "quixigate-core",
