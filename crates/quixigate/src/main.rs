@@ -748,12 +748,7 @@ async fn cmd_serve(
         let _ = open::that(&target);
     }
 
-    let app = build_router(state);
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .with_graceful_shutdown(async {
+    quixigate_proxy::serve_sharded_per_core(listener, state, None, async {
         let _ = tokio::signal::ctrl_c().await;
         println!("\nShutting down QuixiGate cleanly…");
     })

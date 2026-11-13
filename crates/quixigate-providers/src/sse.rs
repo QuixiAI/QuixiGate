@@ -25,20 +25,60 @@ pub struct SseDecoder {
 }
 
 impl SseDecoder {
-    /// Feeds raw bytes and returns every complete `SseFrame` they finish.
+    /// Feeds raw bytes and returns every complete `SseFrame` they finish using SIMD newline scanning.
     pub fn push_frames(&mut self, bytes: &[u8]) -> Result<Vec<SseFrame>, FrameTooLarge> {
         let mut frames = Vec::new();
-        for &byte in bytes {
-            let after_cr = std::mem::replace(&mut self.after_cr, byte == b'\r');
-            match byte {
-                b'\n' if after_cr => {}
-                b'\n' | b'\r' => self.end_line(&mut frames),
-                _ => {
-                    self.frame_bytes += 1;
+        if bytes.is_empty() {
+            return Ok(frames);
+        }
+
+        let mut pos = 0usize;
+        if self.after_cr {
+            self.after_cr = false;
+            if bytes[0] == b'\n' {
+                pos = 1;
+            }
+        }
+
+        while pos < bytes.len() {
+            let rest = &bytes[pos..];
+            match memchr::memchr2(b'\n', b'\r', rest) {
+                Some(idx) => {
+                    let chunk = &rest[..idx];
+                    self.frame_bytes += chunk.len();
                     if self.frame_bytes > MAX_FRAME_BYTES {
                         return Err(FrameTooLarge);
                     }
-                    self.line.push(byte);
+                    if self.line.is_empty() {
+                        self.process_line_bytes(chunk, &mut frames);
+                    } else {
+                        self.line.extend_from_slice(chunk);
+                        let line = std::mem::take(&mut self.line);
+                        self.process_line_bytes(&line, &mut frames);
+                    }
+
+                    if rest[idx] == b'\r' {
+                        if idx + 1 < rest.len() {
+                            pos += if rest[idx + 1] == b'\n' {
+                                idx + 2
+                            } else {
+                                idx + 1
+                            };
+                        } else {
+                            self.after_cr = true;
+                            pos = bytes.len();
+                        }
+                    } else {
+                        pos += idx + 1;
+                    }
+                }
+                None => {
+                    self.frame_bytes += rest.len();
+                    if self.frame_bytes > MAX_FRAME_BYTES {
+                        return Err(FrameTooLarge);
+                    }
+                    self.line.extend_from_slice(rest);
+                    break;
                 }
             }
         }
@@ -58,9 +98,10 @@ impl SseDecoder {
     pub fn finish_frame(&mut self) -> Option<SseFrame> {
         let mut frames = Vec::new();
         if !self.line.is_empty() {
-            self.end_line(&mut frames);
+            let line = std::mem::take(&mut self.line);
+            self.process_line_bytes(&line, &mut frames);
         }
-        self.end_line(&mut frames);
+        self.process_line_bytes(&[], &mut frames);
         frames.pop()
     }
 
@@ -68,26 +109,31 @@ impl SseDecoder {
         self.finish_frame().map(|f| f.data)
     }
 
-    fn end_line(&mut self, frames: &mut Vec<SseFrame>) {
-        let line = std::mem::take(&mut self.line);
+    #[inline]
+    fn process_line_bytes(&mut self, line: &[u8], frames: &mut Vec<SseFrame>) {
         if line.is_empty() {
             self.frame_bytes = 0;
             let event = self.event.take();
             if !self.data.is_empty() {
-                frames.push(SseFrame {
-                    event,
-                    data: std::mem::take(&mut self.data).join("\n"),
-                });
+                let data = if self.data.len() == 1 {
+                    self.data.pop().unwrap_or_default()
+                } else {
+                    std::mem::take(&mut self.data).join("\n")
+                };
+                frames.push(SseFrame { event, data });
             }
             return;
         }
-        let line = String::from_utf8_lossy(&line);
-        if let Some(value) = line.strip_prefix("data:") {
+        let line_str = match std::str::from_utf8(line) {
+            Ok(s) => std::borrow::Cow::Borrowed(s),
+            Err(_) => String::from_utf8_lossy(line),
+        };
+        if let Some(value) = line_str.strip_prefix("data:") {
             self.data
                 .push(value.strip_prefix(' ').unwrap_or(value).to_owned());
-        } else if line == "data" {
+        } else if line_str == "data" {
             self.data.push(String::new());
-        } else if let Some(ev) = line.strip_prefix("event:") {
+        } else if let Some(ev) = line_str.strip_prefix("event:") {
             self.event = Some(ev.strip_prefix(' ').unwrap_or(ev).trim().to_owned());
         }
     }

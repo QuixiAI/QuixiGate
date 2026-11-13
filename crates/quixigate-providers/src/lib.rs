@@ -18,6 +18,7 @@ pub use anthropic_oauth::AnthropicOAuthModel;
 pub use builtin::{
     AISDK_BUILTIN_PROVIDERS, AnyLanguageModel, EmbeddingOutput, ModelBuildRequest,
     build_aisdk_builtin_provider, embed_texts, instantiate_model,
+    openai_compatible_default_base_url,
 };
 #[cfg(feature = "subscription-oauth")]
 pub use codex::ChatGptCodexModel;
@@ -27,10 +28,12 @@ pub use google_code_assist::GoogleCodeAssistModel;
 pub use local_discovery::{LocalEndpointSpec, LocalRuntimeScanner, normalize_local_runtime_id};
 pub use sse::{FrameTooLarge, SseDecoder, SseFrame};
 
-/// Builds a `reqwest::Client` tuned for long-running local (`ollama`, `llama.cpp`, `lmstudio`, `vllm`)
-/// and cloud reasoning/streaming inference:
+/// Builds a `reqwest::Client` tuned for ultra-low-latency streaming (`TCP_NODELAY`, high idle pool
+/// capacity, HTTP/2 adaptive window) as well as long-running local (`ollama`, `llama.cpp`, `lmstudio`,
+/// `vllm`) and cloud reasoning inference:
 /// - Fast 10s TCP connect timeout so dead ports fail over quickly
-/// - 30s TCP keepalive + 30s idle pool expiry so Go/`llama-server` HTTP/1.1 sockets don't silently drop
+/// - `TCP_NODELAY = true` so small SSE token frames flush immediately without Nagle's 40ms delay
+/// - 30s TCP keepalive + 30s idle pool expiry (`pool_max_idle_per_host = 2048`)
 /// - Per-read timeout (`QUIXIGATE_UPSTREAM_READ_TIMEOUT_SECS`, default 1800s = 30 min) rather than a
 ///   short total wall-clock `.timeout(...)`, so neither 24B/70B non-streaming thoughts nor multi-minute
 ///   SSE streams get killed prematurely at 30 seconds.
@@ -40,12 +43,66 @@ pub fn build_inference_http_client() -> reqwest::Client {
         .filter(|&s| s > 0)
         .unwrap_or(1_800);
     reqwest::Client::builder()
+        .tcp_nodelay(true)
+        .pool_max_idle_per_host(2_048)
+        .http2_adaptive_window(true)
         .connect_timeout(std::time::Duration::from_secs(10))
         .read_timeout(std::time::Duration::from_secs(read_secs))
         .pool_idle_timeout(std::time::Duration::from_secs(30))
         .tcp_keepalive(std::time::Duration::from_secs(30))
         .build()
         .unwrap_or_default()
+}
+
+/// Returns a process-wide warm `reqwest::Client` so model constructors never re-parse system TLS
+/// root stores when instantiated without an explicit worker-local client.
+#[inline]
+pub fn shared_inference_http_client() -> reqwest::Client {
+    static SHARED_CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    SHARED_CLIENT
+        .get_or_init(build_inference_http_client)
+        .clone()
+}
+
+/// Sharded pool of `reqwest::Client` instances indexed by caller thread, eliminating cross-core
+/// Hyper `PoolInner` mutex contention under high multi-threaded concurrency while also supporting
+/// dedicated pinned 1-client-per-core workers.
+#[derive(Clone)]
+pub struct ShardedHttpPool {
+    shards: std::sync::Arc<Vec<reqwest::Client>>,
+}
+
+impl ShardedHttpPool {
+    pub fn new(shard_count: usize) -> Self {
+        let count = shard_count.clamp(1, 128);
+        let shards = (0..count).map(|_| build_inference_http_client()).collect();
+        Self {
+            shards: std::sync::Arc::new(shards),
+        }
+    }
+
+    pub fn from_single(client: reqwest::Client) -> Self {
+        Self {
+            shards: std::sync::Arc::new(vec![client]),
+        }
+    }
+
+    #[inline]
+    pub fn get(&self) -> &reqwest::Client {
+        if self.shards.len() == 1 {
+            return &self.shards[0];
+        }
+        thread_local! {
+            static THREAD_SHARD_HASH: usize = {
+                use std::hash::{Hash, Hasher};
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                std::thread::current().id().hash(&mut h);
+                h.finish() as usize
+            };
+        }
+        let idx = THREAD_SHARD_HASH.with(|&h| h % self.shards.len());
+        &self.shards[idx]
+    }
 }
 
 /// Walks the full `std::error::Error::source()` chain of a `reqwest::Error` so root causes like

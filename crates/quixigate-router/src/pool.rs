@@ -641,6 +641,24 @@ pub fn record_upstream_failure(
         } => (status_code.map(|s| s.as_u16()), details.clone()),
         other => (None, other.to_string()),
     };
+    record_upstream_http_failure(
+        db,
+        cred,
+        upstream_model,
+        status_opt,
+        details,
+        total_live_seats_for_provider,
+    )
+}
+
+pub fn record_upstream_http_failure(
+    db: &Database,
+    cred: &CredentialRecord,
+    upstream_model: &str,
+    status_opt: Option<u16>,
+    details: String,
+    total_live_seats_for_provider: usize,
+) -> (u16, String, Option<u64>) {
     let status = status_opt.unwrap_or(502);
     let retry_after_secs = extract_retry_after_secs(&details);
     let now = now_ms();

@@ -225,9 +225,11 @@ pub async fn handle_gemini_model_action(
         est_cost,
     )?;
 
+    let include_thoughts = body["generationConfig"]["thinkingConfig"]["includeThoughts"]
+        .as_bool()
+        .unwrap_or(false);
     let request_id = format!("gem_{}", Uuid::new_v4().simple());
-    let oi = build_openinference_inputs(&req, None);
-    let raw_req = Some(body.to_string());
+    let (oi, raw_req) = prepare_telemetry_capture(&state, &principal, &req, &body, None);
     let started = Instant::now();
 
     state.telemetry.inc_active();
@@ -240,7 +242,8 @@ pub async fn handle_gemini_model_action(
         match res {
             Ok(gen_out) => {
                 let mut parts = Vec::new();
-                if let Some(r) = &gen_out.reasoning
+                if include_thoughts
+                    && let Some(r) = &gen_out.reasoning
                     && !r.is_empty()
                 {
                     parts.push(json!({ "text": r, "thought": true }));

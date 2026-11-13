@@ -284,9 +284,44 @@ aisdk_providers! {
     "openaicompatible" => OpenAICompatible, "Custom (OpenAI-compatible)";
 }
 
+/// Returns the canonical OpenAI-Chat-Completions `/v1` base URL for providers that natively speak
+/// the OpenAI `/chat/completions` wire protocol, enabling both warm `reqwest::Client` connection
+/// pooling and zero-DOM cut-through SSE streaming.
+pub fn openai_compatible_default_base_url(provider_id: &str) -> Option<&'static str> {
+    match provider_id {
+        "openrouter" => Some("https://openrouter.ai/api/v1"),
+        "openai"
+        | "openaicompatible"
+        | "custom"
+        | "openai-compatible"
+        | "openaichatcompletions" => Some("https://api.openai.com/v1"),
+        "groq" => Some("https://api.groq.com/openai/v1"),
+        "deepseek" => Some("https://api.deepseek.com/v1"),
+        "mistral" => Some("https://api.mistral.ai/v1"),
+        "together" | "togetherai" => Some("https://api.together.xyz/v1"),
+        "fireworks" | "fireworks-ai" => Some("https://api.fireworks.ai/inference/v1"),
+        "cerebras" => Some("https://api.cerebras.ai/v1"),
+        "xai" => Some("https://api.x.ai/v1"),
+        "perplexity" => Some("https://api.perplexity.ai"),
+        "nvidia" => Some("https://integrate.api.nvidia.com/v1"),
+        "nebius" => Some("https://api.studio.nebius.ai/v1"),
+        "novita-ai" => Some("https://api.novita.ai/v3/openai"),
+        "siliconflow" => Some("https://api.siliconflow.cn/v1"),
+        "moonshotai" => Some("https://api.moonshot.ai/v1"),
+        "chutes" => Some("https://llm.chutes.ai/v1"),
+        "privatemode-ai" => Some("http://127.0.0.1:8080/v1"),
+        "ollama" | "local" => Some("http://127.0.0.1:11434/v1"),
+        "lmstudio" | "lm-studio" => Some("http://127.0.0.1:1234/v1"),
+        "llamacpp" | "llama.cpp" | "llama-cpp" | "llama-server" => Some("http://127.0.0.1:8080/v1"),
+        "mlx" => Some("http://127.0.0.1:8085/v1"),
+        "vllm" => Some("http://127.0.0.1:8000/v1"),
+        _ => None,
+    }
+}
+
 /// Constructs an `AnyLanguageModel` for any OAuth seat, API-key provider, or local runtime.
 pub fn instantiate_model(req: ModelBuildRequest) -> Result<AnyLanguageModel> {
-    let http = req.http.unwrap_or_else(crate::build_inference_http_client);
+    let http = req.http.unwrap_or_else(crate::shared_inference_http_client);
     let base_override = req.base_url.as_deref().filter(|s| !s.trim().is_empty());
 
     match (req.provider_id.as_str(), req.secret) {
@@ -349,14 +384,20 @@ pub fn instantiate_model(req: ModelBuildRequest) -> Result<AnyLanguageModel> {
             Ok(AnyLanguageModel::with_upstream_meta(m, meta))
         }
         #[cfg(feature = "subscription-oauth")]
-        (_, Some(CredentialSecret::Xai { access, .. })) => build_aisdk_builtin_provider(
-            "xai",
-            &req.model_name,
-            Some(&access),
-            base_override,
-            req.headers,
-            req.body,
-        ),
+        (_, Some(CredentialSecret::Xai { access, .. })) => {
+            let url = base_override.unwrap_or("https://api.x.ai/v1");
+            let mut m = GitHubCopilotModel::openai_compatible(&req.model_name, url, Some(access))
+                .with_http(http)
+                .with_tools(req.tools);
+            if let Some(hdrs) = req.headers {
+                m = m.with_default_headers(hdrs);
+            }
+            if let Some(body) = req.body {
+                m = m.with_default_body(body);
+            }
+            let meta = m.upstream_meta_handle();
+            Ok(AnyLanguageModel::with_upstream_meta(m, meta))
+        }
         #[cfg(feature = "subscription-oauth")]
         (
             _,
@@ -394,14 +435,20 @@ pub fn instantiate_model(req: ModelBuildRequest) -> Result<AnyLanguageModel> {
             Ok(AnyLanguageModel::new(m))
         }
         #[cfg(feature = "subscription-oauth")]
-        (_, Some(CredentialSecret::Chutes { access, .. })) => build_aisdk_builtin_provider(
-            "chutes",
-            &req.model_name,
-            Some(&access),
-            base_override,
-            req.headers,
-            req.body,
-        ),
+        (_, Some(CredentialSecret::Chutes { access, .. })) => {
+            let url = base_override.unwrap_or("https://llm.chutes.ai/v1");
+            let mut m = GitHubCopilotModel::openai_compatible(&req.model_name, url, Some(access))
+                .with_http(http)
+                .with_tools(req.tools);
+            if let Some(hdrs) = req.headers {
+                m = m.with_default_headers(hdrs);
+            }
+            if let Some(body) = req.body {
+                m = m.with_default_body(body);
+            }
+            let meta = m.upstream_meta_handle();
+            Ok(AnyLanguageModel::with_upstream_meta(m, meta))
+        }
         #[cfg(not(feature = "subscription-oauth"))]
         (
             _,
@@ -442,30 +489,11 @@ pub fn instantiate_model(req: ModelBuildRequest) -> Result<AnyLanguageModel> {
             Ok(AnyLanguageModel::with_upstream_meta(m, meta))
         }
         (provider_id, secret_opt)
-            if matches!(
-                provider_id,
-                "ollama"
-                    | "lmstudio"
-                    | "lm-studio"
-                    | "llamacpp"
-                    | "llama.cpp"
-                    | "llama-cpp"
-                    | "llama-server"
-                    | "vllm"
-                    | "mlx"
-                    | "local"
-            ) || matches!(secret_opt, Some(CredentialSecret::LocalNoauth)) =>
+            if openai_compatible_default_base_url(provider_id).is_some()
+                || matches!(secret_opt, Some(CredentialSecret::LocalNoauth)) =>
         {
-            let default_url = match provider_id {
-                "ollama" => "http://127.0.0.1:11434/v1",
-                "lmstudio" | "lm-studio" => "http://127.0.0.1:1234/v1",
-                "llamacpp" | "llama.cpp" | "llama-cpp" | "llama-server" => {
-                    "http://127.0.0.1:8080/v1"
-                }
-                "mlx" => "http://127.0.0.1:8085/v1",
-                "vllm" => "http://127.0.0.1:8000/v1",
-                _ => "http://127.0.0.1:11434/v1",
-            };
+            let default_url =
+                openai_compatible_default_base_url(provider_id).unwrap_or("http://127.0.0.1:11434/v1");
             let url = base_override.unwrap_or(default_url);
             let key = secret_opt.and_then(|s| match s {
                 CredentialSecret::ApiKey { key } => Some(key),

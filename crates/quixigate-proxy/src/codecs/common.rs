@@ -97,27 +97,39 @@ pub fn parse_cache_preference(headers: &HeaderMap) -> Option<bool> {
 }
 
 /// Extracts prompt-cache affinity headers (`anthropic-beta`, `x-session-id`, etc.) and optional
-/// OpenRouter attribution overrides (`HTTP-Referer`, `X-Title`) to forward upstream.
-pub fn extract_passthrough_headers(headers: &HeaderMap) -> HashMap<String, String> {
-    let mut map = HashMap::new();
+/// OpenRouter attribution overrides (`HTTP-Referer`, `X-Title`) as a zero-alloc-when-empty `Vec`.
+#[inline]
+pub fn extract_passthrough_headers_vec(headers: &HeaderMap) -> Vec<(String, String)> {
+    let mut out = Vec::new();
     for key in ["anthropic-beta", "x-session-id", "prompt_cache_key"] {
-        if let Some(val) = headers.get(key).and_then(|v| v.to_str().ok())
-            && !val.trim().is_empty()
-        {
-            map.insert(key.to_owned(), val.trim().to_owned());
+        if let Some(val) = headers.get(key).and_then(|v| v.to_str().ok()) {
+            let trimmed = val.trim();
+            if !trimmed.is_empty() {
+                out.push((key.to_owned(), trimmed.to_owned()));
+            }
         }
     }
-    if let Some(val) = headers.get("http-referer").and_then(|v| v.to_str().ok())
-        && !val.trim().is_empty()
-    {
-        map.insert("HTTP-Referer".to_owned(), val.trim().to_owned());
+    if let Some(val) = headers.get("http-referer").and_then(|v| v.to_str().ok()) {
+        let trimmed = val.trim();
+        if !trimmed.is_empty() {
+            out.push(("HTTP-Referer".to_owned(), trimmed.to_owned()));
+        }
     }
-    if let Some(val) = headers.get("x-title").and_then(|v| v.to_str().ok())
-        && !val.trim().is_empty()
-    {
-        map.insert("X-Title".to_owned(), val.trim().to_owned());
+    if let Some(val) = headers.get("x-title").and_then(|v| v.to_str().ok()) {
+        let trimmed = val.trim();
+        if !trimmed.is_empty() {
+            out.push(("X-Title".to_owned(), trimmed.to_owned()));
+        }
     }
-    map
+    out
+}
+
+/// Extracts prompt-cache affinity headers (`anthropic-beta`, `x-session-id`, etc.) and optional
+/// OpenRouter attribution overrides (`HTTP-Referer`, `X-Title`) to forward upstream.
+pub fn extract_passthrough_headers(headers: &HeaderMap) -> HashMap<String, String> {
+    extract_passthrough_headers_vec(headers)
+        .into_iter()
+        .collect()
 }
 
 /// Extracts OpenRouter-specific request parameters (`provider`, `transforms`, `models`,
@@ -430,6 +442,30 @@ pub fn build_openinference_inputs(
     }
 }
 
+/// Lazily constructs `OpenInferencePayload` and serialized `raw_request_json` only when
+/// `capture_payloads` or `otlp_enabled` is active, avoiding DOM re-serialization on normal traffic.
+pub fn prepare_telemetry_capture(
+    state: &AppState,
+    principal: &AuthenticatedPrincipal,
+    req: &CanonicalRequest,
+    body: &Value,
+    session_id: Option<String>,
+) -> (OpenInferencePayload, Option<String>) {
+    let settings = state.db.settings_arc();
+    let capture_payloads = principal
+        .virtual_key
+        .as_ref()
+        .and_then(|k| k.log_payloads)
+        .unwrap_or(settings.capture_payloads_default);
+    let oi = if capture_payloads || settings.otlp_enabled {
+        build_openinference_inputs(req, session_id)
+    } else {
+        OpenInferencePayload::default()
+    };
+    let raw_req = capture_payloads.then(|| body.to_string());
+    (oi, raw_req)
+}
+
 pub fn attach_gateway_headers(
     headers: &mut HeaderMap,
     request_id: &str,
@@ -447,26 +483,38 @@ pub fn attach_gateway_headers(
     set(headers, "x-quixigate-request-id", request_id);
     set(headers, "x-quixigate-provider", provider_id);
     set(headers, "x-quixigate-model", resolved_model);
-    set(
-        headers,
+    headers.insert(
         "x-quixigate-cache",
-        if cache_hit { "HIT" } else { "MISS" },
+        if cache_hit {
+            HeaderValue::from_static("HIT")
+        } else {
+            HeaderValue::from_static("MISS")
+        },
     );
-    set(
-        headers,
-        "x-quixigate-cost-nanos",
-        &cost_nanos.nanos().to_string(),
-    );
-    set(
-        headers,
-        "x-litellm-response-cost",
-        &cost_nanos.to_decimal_string(),
-    );
-    set(
-        headers,
-        "x-quixigate-api-equiv-nanos",
-        &api_equiv_nanos.nanos().to_string(),
-    );
+    if cost_nanos.is_zero() {
+        headers.insert("x-quixigate-cost-nanos", HeaderValue::from_static("0"));
+        headers.insert("x-litellm-response-cost", HeaderValue::from_static("0.00"));
+    } else {
+        set(
+            headers,
+            "x-quixigate-cost-nanos",
+            &cost_nanos.nanos().to_string(),
+        );
+        set(
+            headers,
+            "x-litellm-response-cost",
+            &cost_nanos.to_decimal_string(),
+        );
+    }
+    if api_equiv_nanos.is_zero() {
+        headers.insert("x-quixigate-api-equiv-nanos", HeaderValue::from_static("0"));
+    } else {
+        set(
+            headers,
+            "x-quixigate-api-equiv-nanos",
+            &api_equiv_nanos.nanos().to_string(),
+        );
+    }
 }
 
 /// Extracts the concrete upstream `provider_id` when a request fails upstream so SQLite/OTel
@@ -625,7 +673,7 @@ pub fn authorize_inference_request(
     estimated_tokens: u64,
     estimated_paid_nanos: NanoUsd,
 ) -> quixigate_core::Result<(ConcurrencyGuard, BudgetGuard)> {
-    let settings = state.db.get_settings()?;
+    let settings = state.db.settings_arc();
     if let Some(json_body) = body {
         validate_enforced_params(&settings, headers, json_body)?;
     }
@@ -643,6 +691,75 @@ pub fn authorize_inference_request(
         budget_guard.set_suppress_log(true);
     }
     Ok((conc, budget_guard))
+}
+
+/// Fast zero-DOM completion accounting for Cut-Through `/v1/chat/completions` streams and JSON responses.
+#[allow(clippy::too_many_arguments)]
+pub fn finalize_cut_through_accounting(
+    state: &AppState,
+    principal: &AuthenticatedPrincipal,
+    budget_guard: BudgetGuard,
+    request_id: String,
+    requested_model: String,
+    resolved_model: String,
+    provider_id: String,
+    credential_id: Option<String>,
+    status_code: u16,
+    stream: bool,
+    fallback_attempts: u32,
+    ttft_ms: Option<u64>,
+    duration_ms: u64,
+    input_tokens: u64,
+    cached_input_tokens: u64,
+    reasoning_tokens: u64,
+    output_tokens: u64,
+    cost_nanos: NanoUsd,
+    api_equiv_nanos: NanoUsd,
+    error_message: Option<String>,
+) {
+    let tags = budget_guard.effective_tags().to_vec();
+    let suppress_log = budget_guard.suppress_log();
+    let _ = budget_guard.commit(cost_nanos);
+    if suppress_log {
+        return;
+    }
+
+    let settings = state.db.settings_arc();
+    let (_, trace_hex) = TelemetryHub::generate_trace_id();
+    let log = RequestLog {
+        id: request_id,
+        timestamp_ms: now_ms(),
+        ingress_protocol: IngressProtocol::ChatCompletions,
+        requested_model,
+        resolved_model,
+        provider_id,
+        credential_id,
+        user_id: Some(principal.user.id.clone()),
+        team_id: principal.effective_team_id(),
+        virtual_key_id: principal.virtual_key.as_ref().map(|k| k.id.clone()),
+        tags,
+        status_code,
+        stream,
+        fallback_attempts,
+        cache_hit: false,
+        ttft_ms,
+        duration_ms,
+        input_tokens,
+        cached_input_tokens,
+        reasoning_tokens,
+        output_tokens,
+        cost_nanos,
+        api_equiv_nanos,
+        otel_trace_id: Some(trace_hex),
+        error_message,
+        request_body_json: None,
+        response_body_json: None,
+    };
+
+    state
+        .telemetry
+        .record_completed_request(&log, &settings, false, None);
+    let _ = state.db.insert_request_log_owned(log);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -682,7 +799,7 @@ pub fn finalize_request_accounting(
         return;
     }
 
-    let settings = state.db.get_settings().unwrap_or_default();
+    let settings = state.db.settings_arc();
     let capture_payloads = principal
         .virtual_key
         .as_ref()
@@ -750,8 +867,8 @@ pub fn finalize_request_accounting(
         },
     };
 
-    let _ = state.db.insert_request_log(&log);
     state
         .telemetry
         .record_completed_request(&log, &settings, capture_payloads, Some(oi));
+    let _ = state.db.insert_request_log_owned(log);
 }

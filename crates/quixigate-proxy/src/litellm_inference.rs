@@ -378,7 +378,8 @@ async fn handle_deployment_chat_completions(
     Json(body): Json<Value>,
 ) -> ApiResult<Response> {
     let patched = inject_deployment_model(body, &model);
-    openai_chat::handle_chat_completions(State(state), headers, Json(patched)).await
+    let raw = Bytes::from(serde_json::to_vec(&patched).unwrap_or_default());
+    openai_chat::handle_chat_completions(State(state), headers, raw).await
 }
 
 async fn handle_deployment_completions(

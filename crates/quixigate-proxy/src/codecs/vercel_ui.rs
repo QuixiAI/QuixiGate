@@ -139,8 +139,13 @@ pub async fn handle_vercel_ui_chat(
     )?;
 
     let message_id = format!("msg_{}", Uuid::new_v4().simple());
-    let oi = build_openinference_inputs(&req, body["id"].as_str().map(str::to_owned));
-    let raw_req = Some(body.to_string());
+    let (oi, raw_req) = prepare_telemetry_capture(
+        &state,
+        &principal,
+        &req,
+        &body,
+        body["id"].as_str().map(str::to_owned),
+    );
     let started = Instant::now();
 
     state.telemetry.inc_active();

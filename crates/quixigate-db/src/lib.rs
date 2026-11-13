@@ -2,13 +2,17 @@
 //! `sk-qx-...` virtual key verifier, Argon2id user/session store, and live metrics.
 
 pub mod config_sync;
+pub mod dataplane;
 pub mod limiter;
 pub mod schema;
 
 use std::collections::BTreeMap;
+use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
+use arc_swap::ArcSwap;
 use argon2::Argon2;
 use argon2::password_hash::rand_core::OsRng;
 use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
@@ -16,7 +20,7 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 pub use limiter::ConcurrencyGuard;
 use limiter::RuntimeLimiter;
-use parking_lot::{Mutex, RwLock};
+use parking_lot::{Mutex, MutexGuard};
 use quixigate_core::*;
 use quixigate_vault::Vault;
 use rand::RngCore;
@@ -35,11 +39,46 @@ pub struct Database {
 }
 
 struct DatabaseInner {
-    conn: Mutex<Connection>,
+    conn: Arc<Mutex<Connection>>,
     db_path: PathBuf,
     vault: Vault,
     limiter: Arc<RuntimeLimiter>,
-    settings_cache: RwLock<GatewaySettings>,
+    spend_registry: dataplane::SpendRegistry,
+    write_behind: Arc<dataplane::WriteBehindEngine>,
+    snapshot: ArcSwap<dataplane::ControlSnapshot>,
+    flusher_handle: Mutex<Option<std::thread::JoinHandle<()>>>,
+}
+
+impl Drop for DatabaseInner {
+    fn drop(&mut self) {
+        self.write_behind.signal_shutdown();
+        if let Some(handle) = self.flusher_handle.lock().take() {
+            let _ = handle.join();
+        }
+        let residual = self.write_behind.take_pending();
+        if !residual.is_empty() {
+            let conn = self.conn.lock();
+            let _ = dataplane::apply_ops_locked(&conn, &residual);
+        }
+    }
+}
+
+struct MutatingConnGuard<'a> {
+    db: &'a Database,
+    guard: MutexGuard<'a, Connection>,
+}
+
+impl Deref for MutatingConnGuard<'_> {
+    type Target = Connection;
+    fn deref(&self) -> &Self::Target {
+        &self.guard
+    }
+}
+
+impl Drop for MutatingConnGuard<'_> {
+    fn drop(&mut self) {
+        self.db.rebuild_snapshot_from_locked(&self.guard);
+    }
 }
 
 /// Authenticated caller identity resolved from `sk-qx-...` virtual key, master key, session, or loopback.
@@ -67,7 +106,8 @@ impl AuthenticatedPrincipal {
 /// RAII reservation of estimated `NanoUsd` across virtual key, user, team, end-user, model, and tag budgets.
 pub struct BudgetGuard {
     db: Database,
-    scopes: Vec<String>,
+    scopes: Vec<Arc<str>>,
+    buckets: Vec<Arc<dataplane::SpendBucket>>,
     durable_scopes: Vec<String>,
     effective_tags: Vec<String>,
     suppress_log: bool,
@@ -92,38 +132,47 @@ impl BudgetGuard {
         self.suppress_log = suppress;
     }
 
-    /// Commits exact `actual_cost` to SQLite (`users`, `teams`, `virtual_keys`, `end_users`, `scoped_spend`)
-    /// and releases in-flight reservation.
+    /// Commits exact `actual_cost` atomically in RAM and enqueues batched WAL persistence.
+    #[inline]
     pub fn commit(mut self, actual_cost: NanoUsd) -> Result<()> {
-        for scope in &self.scopes {
-            self.db
-                .inner
-                .limiter
-                .add_in_flight(scope, -self.reserved.nanos());
+        let neg = -self.reserved.nanos();
+        if neg != 0 {
+            for scope in &self.scopes {
+                self.db.inner.limiter.add_in_flight_arc(scope, neg);
+            }
         }
         self.committed = true;
-        if actual_cost.nanos() > 0 {
-            self.db.record_spend_full(
-                self.user_id.as_deref(),
-                self.team_id.as_deref(),
-                self.virtual_key_id.as_deref(),
-                self.end_user_id.as_deref(),
-                &self.durable_scopes,
-                actual_cost,
-            )?;
+        let nanos = actual_cost.nanos();
+        if nanos > 0 {
+            for bucket in &self.buckets {
+                bucket.add_spend(nanos);
+            }
+            self.db
+                .inner
+                .write_behind
+                .push(dataplane::WriteBehindOp::Spend {
+                    user_id: self.user_id.take(),
+                    team_id: self.team_id.take(),
+                    virtual_key_id: self.virtual_key_id.take(),
+                    end_user_id: self.end_user_id.take(),
+                    durable_scopes: std::mem::take(&mut self.durable_scopes),
+                    nanos,
+                    now_ms: now_ms(),
+                });
         }
         Ok(())
     }
 }
 
 impl Drop for BudgetGuard {
+    #[inline]
     fn drop(&mut self) {
         if !self.committed {
-            for scope in &self.scopes {
-                self.db
-                    .inner
-                    .limiter
-                    .add_in_flight(scope, -self.reserved.nanos());
+            let neg = -self.reserved.nanos();
+            if neg != 0 {
+                for scope in &self.scopes {
+                    self.db.inner.limiter.add_in_flight_arc(scope, neg);
+                }
             }
         }
     }
@@ -183,6 +232,34 @@ pub struct LogFilter {
 }
 
 impl Database {
+    fn from_open_conn(conn: Connection, db_path: PathBuf, vault: Vault) -> Result<Self> {
+        schema::init_schema(&conn)?;
+        let settings = load_settings_from_conn(&conn)?;
+        let spend_registry = dataplane::SpendRegistry::default();
+        let initial_snapshot = dataplane::build_control_snapshot_locked(
+            &conn,
+            &vault,
+            settings,
+            None,
+            &spend_registry,
+        )?;
+        let conn_mutex = Arc::new(Mutex::new(conn));
+        let write_behind = dataplane::WriteBehindEngine::new();
+        let flusher = write_behind.spawn_flusher_thread(Arc::clone(&conn_mutex));
+        Ok(Self {
+            inner: Arc::new(DatabaseInner {
+                conn: conn_mutex,
+                db_path,
+                vault,
+                limiter: RuntimeLimiter::new(),
+                spend_registry,
+                write_behind,
+                snapshot: ArcSwap::from_pointee(initial_snapshot),
+                flusher_handle: Mutex::new(Some(flusher)),
+            }),
+        })
+    }
+
     pub fn open(db_path: &Path, vault: Vault) -> Result<Self> {
         if let Some(parent) = db_path.parent()
             && !parent.as_os_str().is_empty()
@@ -194,34 +271,48 @@ impl Database {
         let conn = Connection::open(db_path).map_err(|e| {
             QuixigateError::Storage(format!("cannot open SQLite {}: {e}", db_path.display()))
         })?;
-        schema::init_schema(&conn)?;
-
-        let settings = load_settings_from_conn(&conn)?;
-        Ok(Self {
-            inner: Arc::new(DatabaseInner {
-                conn: Mutex::new(conn),
-                db_path: db_path.to_owned(),
-                vault,
-                limiter: RuntimeLimiter::new(),
-                settings_cache: RwLock::new(settings),
-            }),
-        })
+        Self::from_open_conn(conn, db_path.to_owned(), vault)
     }
 
     pub fn open_in_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()
             .map_err(|e| QuixigateError::Storage(format!("cannot open in-memory SQLite: {e}")))?;
-        schema::init_schema(&conn)?;
-        let settings = load_settings_from_conn(&conn)?;
-        Ok(Self {
-            inner: Arc::new(DatabaseInner {
-                conn: Mutex::new(conn),
-                db_path: PathBuf::from(":memory:"),
-                vault: Vault::ephemeral(),
-                limiter: RuntimeLimiter::new(),
-                settings_cache: RwLock::new(settings),
-            }),
-        })
+        Self::from_open_conn(conn, PathBuf::from(":memory:"), Vault::ephemeral())
+    }
+
+    #[inline]
+    fn lock_conn_synced(&self) -> MutexGuard<'_, Connection> {
+        let guard = self.inner.conn.lock();
+        if self.inner.write_behind.has_pending() {
+            let batch = self.inner.write_behind.take_pending();
+            if !batch.is_empty() {
+                let _ = dataplane::apply_ops_locked(&guard, &batch);
+            }
+        }
+        guard
+    }
+
+    #[inline]
+    fn lock_conn_mutating(&self) -> MutatingConnGuard<'_> {
+        MutatingConnGuard {
+            db: self,
+            guard: self.lock_conn_synced(),
+        }
+    }
+
+    fn rebuild_snapshot_from_locked(&self, conn: &Connection) {
+        if let Ok(settings) = load_settings_from_conn(conn) {
+            let prev = self.inner.snapshot.load_full();
+            if let Ok(next) = dataplane::build_control_snapshot_locked(
+                conn,
+                &self.inner.vault,
+                settings,
+                Some(&prev),
+                &self.inner.spend_registry,
+            ) {
+                self.inner.snapshot.store(Arc::new(next));
+            }
+        }
     }
 
     pub fn db_path(&self) -> &Path {
@@ -238,31 +329,59 @@ impl Database {
 
     // ── Settings ─────────────────────────────────────────────────────────────
 
+    /// Zero-copy, lock-free `Arc<ControlSnapshot>` read for hot-path routing and auth.
+    #[inline]
+    pub fn control_snapshot_arc(&self) -> Arc<dataplane::ControlSnapshot> {
+        self.inner.snapshot.load_full()
+    }
+
+    /// Zero-copy, lock-free `Arc<GatewaySettings>` read for hot-path middleware and routing.
+    #[inline]
+    pub fn settings_arc(&self) -> Arc<GatewaySettings> {
+        Arc::clone(&self.inner.snapshot.load().settings)
+    }
+
+    #[inline]
     pub fn get_settings(&self) -> Result<GatewaySettings> {
-        Ok(self.inner.settings_cache.read().clone())
+        Ok((*self.inner.snapshot.load().settings).clone())
     }
 
     pub fn update_settings(&self, settings: &GatewaySettings) -> Result<()> {
         let json = serde_json::to_string(settings)
             .map_err(|e| QuixigateError::Storage(format!("settings serialize failed: {e}")))?;
         let now = now_ms();
-        {
-            let conn = self.inner.conn.lock();
-            conn.execute(
-                "INSERT INTO settings (key, value_json, updated_at_ms) VALUES (?1, ?2, ?3)
-                 ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, updated_at_ms = excluded.updated_at_ms",
-                params![SETTINGS_KEY, json, now],
-            )
-            .map_err(storage_err)?;
-        }
-        *self.inner.settings_cache.write() = settings.clone();
+        let conn = self.lock_conn_mutating();
+        conn.execute(
+            "INSERT INTO settings (key, value_json, updated_at_ms) VALUES (?1, ?2, ?3)
+             ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, updated_at_ms = excluded.updated_at_ms",
+            params![SETTINGS_KEY, json, now],
+        )
+        .map_err(storage_err)?;
         Ok(())
+    }
+
+    /// Lock-free hot-path user lookup by `id` or `username` (used for loopback/JWT auth).
+    #[inline]
+    pub fn get_user_fast(&self, id_or_username: &str) -> Option<User> {
+        let trimmed = id_or_username.trim();
+        let snap = self.inner.snapshot.load();
+        let cached = snap
+            .users_by_id
+            .get(trimmed)
+            .or_else(|| snap.users_by_username.get(trimmed))?;
+        let mut user = cached.user.clone();
+        user.spend_nanos = NanoUsd(
+            cached
+                .spend_bucket
+                .load_spend(now_ms(), &self.inner.write_behind),
+        );
+        Some(user)
     }
 
     // ── Users & Sessions ─────────────────────────────────────────────────────
 
     pub fn list_users(&self) -> Result<Vec<User>> {
-        let conn = self.inner.conn.lock();
+        let conn = self.lock_conn_synced();
         self.refresh_expired_windows_locked(&conn, now_ms())?;
         let mut stmt = conn
             .prepare(
@@ -281,7 +400,7 @@ impl Database {
 
     pub fn get_user(&self, id: &str) -> Result<User> {
         let trimmed = id.trim();
-        let conn = self.inner.conn.lock();
+        let conn = self.lock_conn_synced();
         self.refresh_expired_windows_locked(&conn, now_ms())?;
         conn.query_row(
             "SELECT id, username, display_name, role, password_hash, budget_limit_nanos,
@@ -303,7 +422,7 @@ impl Database {
             ));
         }
         {
-            let conn = self.inner.conn.lock();
+            let conn = self.lock_conn_mutating();
             conn.execute(
                 "UPDATE users SET blocked = ?1 WHERE id = ?2",
                 params![i32::from(blocked), existing.id],
@@ -368,7 +487,7 @@ impl Database {
             None => None,
         };
         {
-            let conn = self.inner.conn.lock();
+            let conn = self.lock_conn_mutating();
             conn.execute(
                 "INSERT INTO users (id, username, display_name, role, password_hash,
                                     budget_limit_nanos, budget_window, spend_nanos,
@@ -421,7 +540,7 @@ impl Database {
             _ => None,
         };
         {
-            let conn = self.inner.conn.lock();
+            let conn = self.lock_conn_mutating();
             if let Some(hash) = pw_hash_update {
                 conn.execute(
                     "UPDATE users SET display_name = ?1, role = ?2, password_hash = ?3,
@@ -465,14 +584,14 @@ impl Database {
                 "the built-in 'local' operator user cannot be deleted".to_owned(),
             ));
         }
-        let conn = self.inner.conn.lock();
+        let conn = self.lock_conn_mutating();
         conn.execute("DELETE FROM users WHERE id = ?1", params![existing.id])
             .map_err(storage_err)?;
         Ok(())
     }
 
     pub fn has_any_password_user(&self) -> Result<bool> {
-        let conn = self.inner.conn.lock();
+        let conn = self.lock_conn_synced();
         let count: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM users WHERE password_hash IS NOT NULL",
@@ -485,7 +604,7 @@ impl Database {
 
     pub fn authenticate_password(&self, username: &str, password: &str) -> Result<(User, String)> {
         let (user, stored_hash) = {
-            let conn = self.inner.conn.lock();
+            let conn = self.lock_conn_synced();
             conn.query_row(
                 "SELECT id, username, display_name, role, password_hash, budget_limit_nanos,
                         budget_window, spend_nanos, window_reset_at_ms, created_at_ms, blocked
@@ -534,7 +653,7 @@ impl Database {
         let digest = sha256_bytes(token.as_bytes());
         let now = now_ms();
         let expires = now + SESSION_TTL_MS;
-        let conn = self.inner.conn.lock();
+        let conn = self.lock_conn_synced();
         conn.execute(
             "INSERT INTO sessions (token_sha256, user_id, expires_at_ms, created_at_ms)
              VALUES (?1, ?2, ?3, ?4)",
@@ -548,7 +667,7 @@ impl Database {
         let digest = sha256_bytes(token.as_bytes());
         let now = now_ms();
         let user_id: String = {
-            let conn = self.inner.conn.lock();
+            let conn = self.lock_conn_synced();
             conn.query_row(
                 "SELECT user_id FROM sessions WHERE token_sha256 = ?1 AND expires_at_ms > ?2",
                 params![digest.as_slice(), now],
@@ -570,7 +689,7 @@ impl Database {
 
     pub fn revoke_session(&self, token: &str) -> Result<()> {
         let digest = sha256_bytes(token.as_bytes());
-        let conn = self.inner.conn.lock();
+        let conn = self.lock_conn_synced();
         conn.execute(
             "DELETE FROM sessions WHERE token_sha256 = ?1",
             params![digest.as_slice()],
@@ -582,7 +701,7 @@ impl Database {
     // ── Teams ────────────────────────────────────────────────────────────────
 
     pub fn list_teams(&self) -> Result<Vec<Team>> {
-        let conn = self.inner.conn.lock();
+        let conn = self.lock_conn_synced();
         self.refresh_expired_windows_locked(&conn, now_ms())?;
         let mut stmt = conn
             .prepare(
@@ -657,7 +776,7 @@ impl Database {
         let now = now_ms();
         let reset_at = budget_window.next_reset_ms(now);
         {
-            let conn = self.inner.conn.lock();
+            let conn = self.lock_conn_mutating();
             conn.execute(
                 "INSERT INTO teams (id, name, budget_limit_nanos, budget_window, spend_nanos, window_reset_at_ms, created_at_ms)
                  VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6)",
@@ -707,7 +826,7 @@ impl Database {
             existing.window_reset_at_ms
         };
         {
-            let conn = self.inner.conn.lock();
+            let conn = self.lock_conn_mutating();
             conn.execute(
                 "UPDATE teams SET name = ?1, budget_limit_nanos = ?2, budget_window = ?3, window_reset_at_ms = ?4
                  WHERE id = ?5",
@@ -738,7 +857,7 @@ impl Database {
     }
 
     pub fn delete_team(&self, id: &str) -> Result<()> {
-        let conn = self.inner.conn.lock();
+        let conn = self.lock_conn_mutating();
         conn.execute("DELETE FROM teams WHERE id = ?1", params![id])
             .map_err(storage_err)?;
         Ok(())
@@ -766,7 +885,7 @@ impl Database {
     ) -> Result<Team> {
         let existing = self.get_team(id)?;
         {
-            let conn = self.inner.conn.lock();
+            let conn = self.lock_conn_mutating();
             for (uid, role) in members {
                 let trimmed = uid.trim();
                 if !trimmed.is_empty() {
@@ -805,7 +924,7 @@ impl Database {
             return Ok(None);
         };
         {
-            let conn = self.inner.conn.lock();
+            let conn = self.lock_conn_mutating();
             let _ = conn.execute(
                 "INSERT OR IGNORE INTO team_members (team_id, user_id, role) VALUES (?1, ?2, 'member')",
                 params![team.id, user_id],
@@ -832,7 +951,7 @@ impl Database {
             None => serialize_model_budgets_json(&existing.model_budgets_nanos),
         };
         {
-            let conn = self.inner.conn.lock();
+            let conn = self.lock_conn_mutating();
             conn.execute(
                 "UPDATE teams SET tags_json = ?1, model_budgets_json = ?2 WHERE id = ?3",
                 params![next_tags, next_mb, existing.id],
@@ -845,7 +964,7 @@ impl Database {
     pub fn set_team_blocked(&self, id: &str, blocked: bool) -> Result<Team> {
         let existing = self.get_team(id)?;
         {
-            let conn = self.inner.conn.lock();
+            let conn = self.lock_conn_mutating();
             conn.execute(
                 "UPDATE teams SET blocked = ?1 WHERE id = ?2",
                 params![i32::from(blocked), existing.id],
@@ -858,7 +977,7 @@ impl Database {
     pub fn set_team_disable_logging(&self, id: &str, disable_logging: bool) -> Result<Team> {
         let existing = self.get_team(id)?;
         {
-            let conn = self.inner.conn.lock();
+            let conn = self.lock_conn_mutating();
             conn.execute(
                 "UPDATE teams SET disable_logging = ?1 WHERE id = ?2",
                 params![i32::from(disable_logging), existing.id],
@@ -873,7 +992,7 @@ impl Database {
         let normalized = normalize_string_list(models);
         let json = serde_json::to_string(&normalized).unwrap_or_else(|_| "[]".to_owned());
         {
-            let conn = self.inner.conn.lock();
+            let conn = self.lock_conn_mutating();
             conn.execute(
                 "UPDATE teams SET allowed_models_json = ?1 WHERE id = ?2",
                 params![json, existing.id],
@@ -884,7 +1003,7 @@ impl Database {
     }
 
     pub fn is_team_admin(&self, team_id: &str, user_id: &str) -> Result<bool> {
-        let conn = self.inner.conn.lock();
+        let conn = self.lock_conn_synced();
         let role: Option<String> = conn
             .query_row(
                 "SELECT role FROM team_members
@@ -899,7 +1018,7 @@ impl Database {
     }
 
     pub fn is_team_member(&self, team_id: &str, user_id: &str) -> Result<bool> {
-        let conn = self.inner.conn.lock();
+        let conn = self.lock_conn_synced();
         let present: Option<i32> = conn
             .query_row(
                 "SELECT 1 FROM team_members
@@ -914,7 +1033,7 @@ impl Database {
     }
 
     pub fn list_admin_team_ids(&self, user_id: &str) -> Result<Vec<String>> {
-        let conn = self.inner.conn.lock();
+        let conn = self.lock_conn_synced();
         let mut stmt = conn
             .prepare("SELECT team_id FROM team_members WHERE user_id = ?1 AND role = 'admin'")
             .map_err(storage_err)?;
@@ -929,7 +1048,7 @@ impl Database {
     pub fn remove_team_member(&self, id: &str, user_id: &str) -> Result<Team> {
         let existing = self.get_team(id)?;
         {
-            let conn = self.inner.conn.lock();
+            let conn = self.lock_conn_mutating();
             conn.execute(
                 "DELETE FROM team_members WHERE team_id = ?1 AND user_id = ?2",
                 params![existing.id, user_id.trim()],
@@ -1021,7 +1140,7 @@ impl Database {
         let models_json = serde_json::to_string(allowed_models).unwrap_or_else(|_| "[]".to_owned());
 
         {
-            let conn = self.inner.conn.lock();
+            let conn = self.lock_conn_mutating();
             conn.execute(
                 "INSERT INTO virtual_keys (
                     id, key_prefix, key_sha256, name, user_id, team_id,
@@ -1083,7 +1202,7 @@ impl Database {
             };
         let next_spend_read = allow_spend_read.unwrap_or(existing.allow_spend_read);
         {
-            let conn = self.inner.conn.lock();
+            let conn = self.lock_conn_mutating();
             conn.execute(
                 "UPDATE virtual_keys
                  SET tags_json = ?1, model_budgets_json = ?2, allowed_cidrs_json = ?3, allow_spend_read = ?4
@@ -1102,7 +1221,7 @@ impl Database {
     }
 
     pub fn list_virtual_keys(&self) -> Result<Vec<VirtualKey>> {
-        let conn = self.inner.conn.lock();
+        let conn = self.lock_conn_synced();
         self.refresh_expired_windows_locked(&conn, now_ms())?;
         let mut stmt = conn
             .prepare(&format!(
@@ -1118,7 +1237,7 @@ impl Database {
     }
 
     pub fn get_virtual_key(&self, id: &str) -> Result<VirtualKey> {
-        let conn = self.inner.conn.lock();
+        let conn = self.lock_conn_synced();
         self.refresh_expired_windows_locked(&conn, now_ms())?;
         conn.query_row(
             &format!("SELECT {VIRTUAL_KEY_COLUMNS} FROM virtual_keys WHERE id = ?1"),
@@ -1137,7 +1256,7 @@ impl Database {
         let (new_raw, new_prefix, new_digest) = generate_virtual_key_material();
         let now = now_ms();
         {
-            let conn = self.inner.conn.lock();
+            let conn = self.lock_conn_mutating();
             let old_digest: Vec<u8> = conn
                 .query_row(
                     "SELECT key_sha256 FROM virtual_keys WHERE id = ?1 AND revoked_at_ms IS NULL",
@@ -1173,7 +1292,7 @@ impl Database {
         let resolved = self.resolve_virtual_key_id(id)?;
         let now = now_ms();
         {
-            let conn = self.inner.conn.lock();
+            let conn = self.lock_conn_mutating();
             conn.execute(
                 "UPDATE virtual_keys SET revoked_at_ms = ?1 WHERE id = ?2",
                 params![now, resolved],
@@ -1191,7 +1310,7 @@ impl Database {
     pub fn unrevoke_virtual_key(&self, id: &str) -> Result<VirtualKey> {
         let resolved = self.resolve_virtual_key_id(id)?;
         {
-            let conn = self.inner.conn.lock();
+            let conn = self.lock_conn_mutating();
             conn.execute(
                 "UPDATE virtual_keys SET revoked_at_ms = NULL WHERE id = ?1",
                 params![resolved],
@@ -1209,7 +1328,7 @@ impl Database {
                 "key identifier cannot be empty".to_owned(),
             ));
         }
-        let conn = self.inner.conn.lock();
+        let conn = self.lock_conn_synced();
         if let Some(id) = conn
             .query_row(
                 "SELECT id FROM virtual_keys WHERE id = ?1",
@@ -1309,7 +1428,7 @@ impl Database {
         let next_exp = expires_at_ms.unwrap_or(existing.expires_at_ms);
 
         {
-            let conn = self.inner.conn.lock();
+            let conn = self.lock_conn_mutating();
             conn.execute(
                 "UPDATE virtual_keys
                  SET name = ?1, user_id = ?2, team_id = ?3, budget_limit_nanos = ?4,
@@ -1342,7 +1461,7 @@ impl Database {
         let target = self
             .resolve_virtual_key_id(id)
             .unwrap_or_else(|_| id.trim().to_owned());
-        let conn = self.inner.conn.lock();
+        let conn = self.lock_conn_mutating();
         conn.execute("DELETE FROM virtual_keys WHERE id = ?1", params![target])
             .map_err(storage_err)?;
         conn.execute(
@@ -1353,7 +1472,7 @@ impl Database {
         Ok(())
     }
 
-    /// Authenticates a `sk-qx-...` bearer token using constant-time SHA-256 verification.
+    /// Authenticates a `sk-qx-...` bearer token using lock-free in-memory constant-time SHA-256 verification.
     pub fn verify_virtual_key(&self, raw_token: &str) -> Result<AuthenticatedPrincipal> {
         let trimmed = raw_token.trim();
         if !quixigate_core::brand::is_virtual_key_token(trimmed) {
@@ -1363,60 +1482,33 @@ impl Database {
         }
         let candidate_digest = sha256_bytes(trimmed.as_bytes());
         let now = now_ms();
+        let snap = self.inner.snapshot.load();
 
-        let vk = {
-            let conn = self.inner.conn.lock();
-            self.refresh_expired_windows_locked(&conn, now)?;
-
-            let primary: Option<(VirtualKey, Vec<u8>)> = conn
-                .query_row(
-                    &format!(
-                        "SELECT {VIRTUAL_KEY_COLUMNS}, key_sha256 FROM virtual_keys WHERE key_sha256 = ?1"
-                    ),
-                    params![candidate_digest.as_slice()],
-                    |row| Ok((map_virtual_key_row(row)?, row.get::<_, Vec<u8>>(21)?)),
-                )
-                .optional()
-                .map_err(storage_err)?;
-
-            if let Some((vk, stored_digest)) = primary {
-                if stored_digest.ct_eq(&candidate_digest).unwrap_u8() != 1 {
-                    return Err(QuixigateError::Unauthorized(
-                        "invalid virtual key".to_owned(),
-                    ));
-                }
-                vk
-            } else {
-                // Check rotation grace table.
-                let rotated_id: Option<String> = conn
-                    .query_row(
-                        "SELECT virtual_key_id FROM virtual_key_rotations
-                         WHERE old_key_sha256 = ?1 AND valid_until_ms > ?2",
-                        params![candidate_digest.as_slice(), now],
-                        |r| r.get(0),
-                    )
-                    .optional()
-                    .map_err(storage_err)?;
-                let Some(vk_id) = rotated_id else {
-                    return Err(QuixigateError::Unauthorized(
-                        "invalid virtual key".to_owned(),
-                    ));
-                };
-                conn.query_row(
-                    &format!("SELECT {VIRTUAL_KEY_COLUMNS} FROM virtual_keys WHERE id = ?1"),
-                    params![vk_id],
-                    map_virtual_key_row,
-                )
-                .map_err(storage_err)?
+        let cached_vk = if let Some(primary) = snap.keys_by_sha256.get(&candidate_digest) {
+            if primary.key_sha256.ct_eq(&candidate_digest).unwrap_u8() != 1 {
+                return Err(QuixigateError::Unauthorized(
+                    "invalid virtual key".to_owned(),
+                ));
             }
+            primary
+        } else if let Some((vk_id, valid_until_ms)) =
+            snap.rotated_keys_by_sha256.get(&candidate_digest)
+            && *valid_until_ms > now
+            && let Some(rotated) = snap.keys_by_id.get(vk_id)
+        {
+            rotated
+        } else {
+            return Err(QuixigateError::Unauthorized(
+                "invalid virtual key".to_owned(),
+            ));
         };
 
-        if vk.revoked_at_ms.is_some() {
+        if cached_vk.vk.revoked_at_ms.is_some() {
             return Err(QuixigateError::Unauthorized(
                 "virtual key has been revoked".to_owned(),
             ));
         }
-        if let Some(exp) = vk.expires_at_ms
+        if let Some(exp) = cached_vk.vk.expires_at_ms
             && exp <= now
         {
             return Err(QuixigateError::Unauthorized(
@@ -1424,13 +1516,29 @@ impl Database {
             ));
         }
 
-        let user = self.get_user(&vk.user_id)?;
-        if user.blocked {
+        let cached_user = snap.users_by_id.get(&cached_vk.vk.user_id).ok_or_else(|| {
+            QuixigateError::NotFound(format!("user '{}' not found", cached_vk.vk.user_id))
+        })?;
+        if cached_user.user.blocked {
             return Err(QuixigateError::Forbidden(format!(
                 "user '{}' is blocked",
-                user.username
+                cached_user.user.username
             )));
         }
+
+        let mut vk = cached_vk.vk.clone();
+        vk.spend_nanos = NanoUsd(
+            cached_vk
+                .spend_bucket
+                .load_spend(now, &self.inner.write_behind),
+        );
+        let mut user = cached_user.user.clone();
+        user.spend_nanos = NanoUsd(
+            cached_user
+                .spend_bucket
+                .load_spend(now, &self.inner.write_behind),
+        );
+
         Ok(AuthenticatedPrincipal {
             user,
             virtual_key: Some(vk),
@@ -1495,10 +1603,17 @@ impl Database {
             )));
         }
 
-        let base_model = ModelSpec::parse(requested_model).base_model;
+        let snap = self.inner.snapshot.load();
+        let base_model_cow: std::borrow::Cow<'_, str> =
+            if !requested_model.contains(':') && !requested_model.contains('@') {
+                std::borrow::Cow::Borrowed(requested_model.trim())
+            } else {
+                std::borrow::Cow::Owned(ModelSpec::parse(requested_model).base_model)
+            };
+        let base_model = base_model_cow.as_ref();
 
-        // Enforce blocked & team-scoped custom model routes (`model_routes`).
-        if let Some(route) = self.get_model_route(&base_model)? {
+        // Enforce blocked & team-scoped custom model routes (`model_routes`) in RAM.
+        if let Some(route) = snap.routes_by_alias.get(base_model) {
             if route.blocked {
                 return Err(QuixigateError::Forbidden(format!(
                     "model '{requested_model}' is currently blocked"
@@ -1510,7 +1625,10 @@ impl Database {
             {
                 let eff_tid = principal.effective_team_id();
                 let eff_matches_team = eff_tid.as_deref() == Some(route_tid);
-                let user_in_team = self.is_team_member(route_tid, &principal.user.id)?;
+                let user_in_team = snap
+                    .teams_by_id
+                    .get(route_tid)
+                    .is_some_and(|t| t.member_ids.contains(&principal.user.id));
                 if !(eff_matches_team || (principal.virtual_key.is_none() && user_in_team)) {
                     return Err(QuixigateError::Forbidden(format!(
                         "model '{requested_model}' is scoped to team '{route_tid}'"
@@ -1519,140 +1637,109 @@ impl Database {
             }
         }
 
+        let cached_vk = principal
+            .virtual_key
+            .as_ref()
+            .and_then(|vk| snap.keys_by_id.get(&vk.id));
+
         let concurrency_guard = if let Some(vk) = &principal.virtual_key {
             if !vk.allowed_models.is_empty()
-                && !self.model_matches_allowlist(
-                    &vk.allowed_models,
-                    requested_model,
-                    &base_model,
-                )?
+                && !snap.model_matches_allowlist(&vk.allowed_models, requested_model, base_model)
             {
                 return Err(QuixigateError::Forbidden(format!(
                     "virtual key '{}' is not permitted to access model '{requested_model}'",
                     vk.name
                 )));
             }
-            let scope = format!("key:{}", vk.id);
-            self.inner.limiter.check_and_acquire(
-                &scope,
-                vk.rpm_limit,
-                vk.tpm_limit,
-                vk.max_concurrent,
-                estimated_tokens,
-            )?
+            if let Some(cvk) = cached_vk {
+                self.inner.limiter.check_and_acquire_arc(
+                    &cvk.rate_scope,
+                    vk.rpm_limit,
+                    vk.tpm_limit,
+                    vk.max_concurrent,
+                    estimated_tokens,
+                )?
+            } else {
+                let scope = format!("key:{}", vk.id);
+                self.inner.limiter.check_and_acquire(
+                    &scope,
+                    vk.rpm_limit,
+                    vk.tpm_limit,
+                    vk.max_concurrent,
+                    estimated_tokens,
+                )?
+            }
         } else {
-            self.inner.limiter.check_and_acquire(
-                "global:loopback",
-                None,
-                None,
-                None,
-                estimated_tokens,
-            )?
+            self.inner.limiter.acquire_unbounded()
         };
 
-        let mut scopes = Vec::new();
-        let mut durable_scopes = Vec::new();
+        let mut scopes: Vec<Arc<str>> = Vec::with_capacity(4);
+        let mut buckets: Vec<Arc<dataplane::SpendBucket>> = Vec::with_capacity(4);
+        let mut durable_scopes: Vec<String> = Vec::new();
         let mut suppress_log = false;
         let clean_end_user = end_user_id.map(str::trim).filter(|s| !s.is_empty());
-        let mut effective_tags: Vec<String> = request_tags
-            .iter()
-            .map(|s| s.trim())
-            .filter(|s| !s.is_empty())
-            .fold(Vec::new(), |mut acc, s| {
-                if !acc.iter().any(|existing| existing == s) {
-                    acc.push(s.to_owned());
-                }
-                acc
-            });
+        let mut effective_tags: Vec<String> = if request_tags.is_empty() {
+            Vec::new()
+        } else {
+            request_tags
+                .iter()
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .fold(Vec::new(), |mut acc, s| {
+                    if !acc.iter().any(|existing| existing == s) {
+                        acc.push(s.to_owned());
+                    }
+                    acc
+                })
+        };
 
-        // Pre-flight team & end_user policy checks (apply even when estimated_paid_nanos == 0).
-        {
-            let conn = self.inner.conn.lock();
-            self.refresh_expired_windows_locked(&conn, now_ms())?;
+        let eff_team_id = principal.effective_team_id();
+        let cached_team = eff_team_id
+            .as_deref()
+            .and_then(|tid| snap.teams_by_id.get(tid));
 
-            if let Some(tid) = principal.effective_team_id()
-                && let Some((t_name, t_blocked, t_disable_log, t_allowed_json)) = conn
-                    .query_row(
-                        "SELECT name, blocked, disable_logging, allowed_models_json
-                         FROM teams WHERE id = ?1",
-                        params![tid],
-                        |r| {
-                            Ok((
-                                r.get::<_, String>(0)?,
-                                r.get::<_, i32>(1).unwrap_or(0) != 0,
-                                r.get::<_, i32>(2).unwrap_or(0) != 0,
-                                r.get::<_, String>(3).unwrap_or_else(|_| "[]".to_owned()),
-                            ))
-                        },
-                    )
-                    .optional()
-                    .map_err(storage_err)?
-            {
-                if t_blocked {
-                    return Err(QuixigateError::Forbidden(format!(
-                        "team '{t_name}' is blocked"
-                    )));
-                }
-                if t_disable_log {
-                    suppress_log = true;
-                }
-                let t_allowed: Vec<String> =
-                    serde_json::from_str(&t_allowed_json).unwrap_or_default();
-                if !t_allowed.is_empty()
-                    && !model_matches_allowlist_locked(
-                        &conn,
-                        &t_allowed,
-                        requested_model,
-                        &base_model,
-                    )?
-                {
-                    return Err(QuixigateError::Forbidden(format!(
-                        "team '{t_name}' is not permitted to access model '{requested_model}'"
-                    )));
-                }
+        // Pre-flight team & end_user policy checks in RAM.
+        if let Some(team) = cached_team {
+            if team.blocked {
+                return Err(QuixigateError::Forbidden(format!(
+                    "team '{}' is blocked",
+                    team.name
+                )));
             }
-
-            if let Some(eu_id) = clean_end_user
-                && let Some((eu_blocked, eu_allowed_json)) = conn
-                    .query_row(
-                        "SELECT blocked, allowed_models_json FROM end_users WHERE user_id = ?1",
-                        params![eu_id],
-                        |r| {
-                            Ok((
-                                r.get::<_, i32>(0).unwrap_or(0) != 0,
-                                r.get::<_, String>(1).unwrap_or_else(|_| "[]".to_owned()),
-                            ))
-                        },
-                    )
-                    .optional()
-                    .map_err(storage_err)?
+            if team.disable_logging {
+                suppress_log = true;
+            }
+            if !team.allowed_models.is_empty()
+                && !snap.model_matches_allowlist(&team.allowed_models, requested_model, base_model)
             {
-                if eu_blocked {
-                    return Err(QuixigateError::Forbidden(format!(
-                        "end_user '{eu_id}' is blocked"
-                    )));
-                }
-                let eu_allowed: Vec<String> =
-                    serde_json::from_str(&eu_allowed_json).unwrap_or_default();
-                if !eu_allowed.is_empty()
-                    && !model_matches_allowlist_locked(
-                        &conn,
-                        &eu_allowed,
-                        requested_model,
-                        &base_model,
-                    )?
-                {
-                    return Err(QuixigateError::Forbidden(format!(
-                        "end_user '{eu_id}' is not permitted to access model '{requested_model}'"
-                    )));
-                }
+                return Err(QuixigateError::Forbidden(format!(
+                    "team '{}' is not permitted to access model '{requested_model}'",
+                    team.name
+                )));
+            }
+        }
+
+        let cached_eu = clean_end_user.and_then(|eu_id| snap.end_users_by_id.get(eu_id));
+        if let Some(eu) = cached_eu {
+            if eu.blocked {
+                return Err(QuixigateError::Forbidden(format!(
+                    "end_user '{}' is blocked",
+                    eu.user_id
+                )));
+            }
+            if !eu.allowed_models.is_empty()
+                && !snap.model_matches_allowlist(&eu.allowed_models, requested_model, base_model)
+            {
+                return Err(QuixigateError::Forbidden(format!(
+                    "end_user '{}' is not permitted to access model '{requested_model}'",
+                    eu.user_id
+                )));
             }
         }
 
         if estimated_paid_nanos.nanos() >= 0 {
-            let settings = self.inner.settings_cache.read().clone();
-            let conn = self.inner.conn.lock();
-            self.refresh_expired_windows_locked(&conn, now_ms())?;
+            let now = now_ms();
+            let wb = &self.inner.write_behind;
 
             if let Some(vk) = &principal.virtual_key {
                 for t in &vk.tags {
@@ -1660,29 +1747,25 @@ impl Database {
                         effective_tags.push(t.clone());
                     }
                 }
-                let (spend, limit): (i64, Option<i64>) = conn
-                    .query_row(
-                        "SELECT spend_nanos, budget_limit_nanos FROM virtual_keys WHERE id = ?1",
-                        params![vk.id],
-                        |r| Ok((r.get(0)?, r.get(1)?)),
-                    )
-                    .map_err(storage_err)?;
-                let key_scope = format!("budget:key:{}", vk.id);
-                self.inner.limiter.check_scope_budget(
-                    &format!("virtual key '{}'", vk.name),
-                    &key_scope,
-                    NanoUsd(spend),
-                    limit.map(NanoUsd),
-                    estimated_paid_nanos,
-                )?;
-                scopes.push(key_scope);
+                if let Some(cvk) = cached_vk {
+                    let spend = cvk.spend_bucket.load_spend(now, wb);
+                    self.inner.limiter.check_scope_budget(
+                        &cvk.label,
+                        &cvk.limiter_budget_scope,
+                        NanoUsd(spend),
+                        cvk.vk.budget_limit_nanos,
+                        estimated_paid_nanos,
+                    )?;
+                    scopes.push(Arc::clone(&cvk.limiter_budget_scope));
+                    buckets.push(Arc::clone(&cvk.spend_bucket));
+                }
 
-                // Per-model max budget on Virtual Key (`model_max_budget`)
                 for (pat, model_limit) in &vk.model_budgets_nanos {
-                    if glob_matches(pat, requested_model) || glob_matches(pat, &base_model) {
+                    if glob_matches(pat, requested_model) || glob_matches(pat, base_model) {
                         let db_scope = format!("key_model:{}:{pat}", vk.id);
-                        let lim_scope = format!("budget:{db_scope}");
-                        let cur_spend = query_scoped_spend_locked(&conn, &db_scope)?;
+                        let lim_scope: Arc<str> = Arc::from(format!("budget:{db_scope}"));
+                        let bucket = self.inner.spend_registry.get_or_init_scoped(&db_scope, 0);
+                        let cur_spend = bucket.load_spend(now, wb);
                         self.inner.limiter.check_scope_budget(
                             &format!("virtual key '{}' model '{pat}'", vk.name),
                             &lim_scope,
@@ -1691,150 +1774,96 @@ impl Database {
                             estimated_paid_nanos,
                         )?;
                         scopes.push(lim_scope);
+                        buckets.push(bucket);
                         durable_scopes.push(db_scope);
                     }
                 }
             }
 
-            let (u_spend, u_limit): (i64, Option<i64>) = conn
-                .query_row(
-                    "SELECT spend_nanos, budget_limit_nanos FROM users WHERE id = ?1",
-                    params![principal.user.id],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
-                )
-                .map_err(storage_err)?;
-            let user_scope = format!("budget:user:{}", principal.user.id);
-            self.inner.limiter.check_scope_budget(
-                &format!("user '{}'", principal.user.username),
-                &user_scope,
-                NanoUsd(u_spend),
-                u_limit.map(NanoUsd),
-                estimated_paid_nanos,
-            )?;
-            scopes.push(user_scope);
-
-            let team_id = principal.effective_team_id();
-            if let Some(tid) = &team_id
-                && let Some((t_name, t_spend, t_limit, t_tags_json, t_mb_json)) = conn
-                    .query_row(
-                        "SELECT name, spend_nanos, budget_limit_nanos, tags_json, model_budgets_json
-                         FROM teams WHERE id = ?1",
-                        params![tid],
-                        |r| {
-                            Ok((
-                                r.get::<_, String>(0)?,
-                                r.get::<_, i64>(1)?,
-                                r.get::<_, Option<i64>>(2)?,
-                                r.get::<_, String>(3)?,
-                                r.get::<_, String>(4)?,
-                            ))
-                        },
-                    )
-                    .optional()
-                    .map_err(storage_err)?
-            {
-                let team_scope = format!("budget:team:{tid}");
+            if let Some(cu) = snap.users_by_id.get(&principal.user.id) {
+                let u_spend = cu.spend_bucket.load_spend(now, wb);
                 self.inner.limiter.check_scope_budget(
-                    &format!("team '{t_name}'"),
-                    &team_scope,
-                    NanoUsd(t_spend),
-                    t_limit.map(NanoUsd),
+                    &cu.label,
+                    &cu.limiter_budget_scope,
+                    NanoUsd(u_spend),
+                    cu.user.budget_limit_nanos,
                     estimated_paid_nanos,
                 )?;
-                scopes.push(team_scope);
+                scopes.push(Arc::clone(&cu.limiter_budget_scope));
+                buckets.push(Arc::clone(&cu.spend_bucket));
+            }
 
-                let t_tags: Vec<String> = serde_json::from_str(&t_tags_json).unwrap_or_default();
-                for t in t_tags {
-                    if !effective_tags.contains(&t) {
-                        effective_tags.push(t);
+            if let Some(team) = cached_team {
+                let t_spend = team.spend_bucket.load_spend(now, wb);
+                self.inner.limiter.check_scope_budget(
+                    &team.label,
+                    &team.limiter_budget_scope,
+                    NanoUsd(t_spend),
+                    team.budget_limit_nanos,
+                    estimated_paid_nanos,
+                )?;
+                scopes.push(Arc::clone(&team.limiter_budget_scope));
+                buckets.push(Arc::clone(&team.spend_bucket));
+
+                for t in &team.tags {
+                    if !effective_tags.contains(t) {
+                        effective_tags.push(t.clone());
                     }
                 }
-                let t_mb = parse_model_budgets_json(&t_mb_json);
-                for (pat, model_limit) in &t_mb {
-                    if glob_matches(pat, requested_model) || glob_matches(pat, &base_model) {
-                        let db_scope = format!("team_model:{tid}:{pat}");
-                        let lim_scope = format!("budget:{db_scope}");
-                        let cur_spend = query_scoped_spend_locked(&conn, &db_scope)?;
+                for (pat, model_limit) in &team.model_budgets_nanos {
+                    if glob_matches(pat, requested_model) || glob_matches(pat, base_model) {
+                        let db_scope = format!("team_model:{}:{pat}", team.id);
+                        let lim_scope: Arc<str> = Arc::from(format!("budget:{db_scope}"));
+                        let bucket = self.inner.spend_registry.get_or_init_scoped(&db_scope, 0);
+                        let cur_spend = bucket.load_spend(now, wb);
                         self.inner.limiter.check_scope_budget(
-                            &format!("team '{t_name}' model '{pat}'"),
+                            &format!("team '{}' model '{pat}'", team.name),
                             &lim_scope,
                             NanoUsd(cur_spend),
                             Some(*model_limit),
                             estimated_paid_nanos,
                         )?;
                         scopes.push(lim_scope);
+                        buckets.push(bucket);
                         durable_scopes.push(db_scope);
                     }
                 }
             }
 
-            // End-user / Customer budget gate (`end_users` + linked `budgets`)
             if let Some(eu_id) = clean_end_user {
-                if let Some((eu_spend, eu_limit, eu_budget_id)) = conn
-                    .query_row(
-                        "SELECT spend_nanos, budget_limit_nanos, budget_id
-                         FROM end_users WHERE user_id = ?1",
-                        params![eu_id],
-                        |r| {
-                            Ok((
-                                r.get::<_, i64>(0)?,
-                                r.get::<_, Option<i64>>(1)?,
-                                r.get::<_, Option<String>>(2)?,
-                            ))
-                        },
-                    )
-                    .optional()
-                    .map_err(storage_err)?
-                {
-                    let linked_limit = match eu_budget_id.as_deref() {
-                        Some(bid) => conn
-                            .query_row(
-                                "SELECT max_budget_nanos FROM budgets WHERE budget_id = ?1",
-                                params![bid],
-                                |r| r.get::<_, Option<i64>>(0),
-                            )
-                            .optional()
-                            .map_err(storage_err)?
-                            .flatten(),
-                        None => None,
-                    };
-                    let eff_limit = eu_limit.or(linked_limit);
-                    let eu_scope = format!("budget:end_user:{eu_id}");
+                if let Some(eu) = cached_eu {
+                    let eu_spend = eu.spend_bucket.load_spend(now, wb);
                     self.inner.limiter.check_scope_budget(
-                        &format!("end_user '{eu_id}'"),
-                        &eu_scope,
+                        &eu.label,
+                        &eu.limiter_budget_scope,
                         NanoUsd(eu_spend),
-                        eff_limit.map(NanoUsd),
+                        eu.effective_limit_nanos,
                         estimated_paid_nanos,
                     )?;
-                    scopes.push(eu_scope);
+                    scopes.push(Arc::clone(&eu.limiter_budget_scope));
+                    buckets.push(Arc::clone(&eu.spend_bucket));
                 }
-                durable_scopes.push(format!("end_user:{eu_id}"));
+                let eu_db_scope = format!("end_user:{eu_id}");
+                buckets.push(
+                    self.inner
+                        .spend_registry
+                        .get_or_init_scoped(&eu_db_scope, 0),
+                );
+                durable_scopes.push(eu_db_scope);
             }
 
-            // Global tag-based max budgets (`settings.tag_budgets_nanos` + `tags` table)
             for tag in &effective_tags {
                 let db_scope = format!("tag:{tag}");
-                let table_limit: Option<i64> = conn
-                    .query_row(
-                        "SELECT COALESCE(t.max_budget_nanos, b.max_budget_nanos)
-                         FROM tags t
-                         LEFT JOIN budgets b ON t.budget_id = b.budget_id
-                         WHERE t.tag_name = ?1",
-                        params![tag],
-                        |r| r.get::<_, Option<i64>>(0),
-                    )
-                    .optional()
-                    .map_err(storage_err)?
-                    .flatten();
-                let eff_tag_limit = settings
+                let eff_tag_limit = snap
+                    .settings
                     .tag_budgets_nanos
                     .get(tag)
                     .copied()
-                    .or_else(|| table_limit.map(NanoUsd));
+                    .or_else(|| snap.tag_limits_nanos.get(tag).copied().map(NanoUsd));
+                let bucket = self.inner.spend_registry.get_or_init_scoped(&db_scope, 0);
                 if let Some(tag_limit) = eff_tag_limit {
-                    let lim_scope = format!("budget:{db_scope}");
-                    let cur_spend = query_scoped_spend_locked(&conn, &db_scope)?;
+                    let lim_scope: Arc<str> = Arc::from(format!("budget:{db_scope}"));
+                    let cur_spend = bucket.load_spend(now, wb);
                     self.inner.limiter.check_scope_budget(
                         &format!("tag '{tag}'"),
                         &lim_scope,
@@ -1844,27 +1873,30 @@ impl Database {
                     )?;
                     scopes.push(lim_scope);
                 }
+                buckets.push(bucket);
                 if !durable_scopes.contains(&db_scope) {
                     durable_scopes.push(db_scope);
                 }
             }
 
-            for scope in &scopes {
-                self.inner
-                    .limiter
-                    .add_in_flight(scope, estimated_paid_nanos.nanos());
+            let res_nanos = estimated_paid_nanos.nanos();
+            if res_nanos > 0 {
+                for scope in &scopes {
+                    self.inner.limiter.add_in_flight_arc(scope, res_nanos);
+                }
             }
         }
 
         let budget_guard = BudgetGuard {
             db: self.clone(),
             scopes,
+            buckets,
             durable_scopes,
             effective_tags,
             suppress_log,
             reserved: estimated_paid_nanos,
             user_id: Some(principal.user.id.clone()),
-            team_id: principal.effective_team_id(),
+            team_id: eff_team_id,
             virtual_key_id: principal.virtual_key.as_ref().map(|k| k.id.clone()),
             end_user_id: clean_end_user.map(str::to_owned),
             committed: false,
@@ -1902,51 +1934,48 @@ impl Database {
         durable_scopes: &[String],
         cost: NanoUsd,
     ) -> Result<()> {
-        if cost.nanos() <= 0 {
+        let nanos = cost.nanos();
+        if nanos <= 0 {
             return Ok(());
         }
-        let nanos = cost.nanos();
-        let now = now_ms();
-        let conn = self.inner.conn.lock();
-        if let Some(uid) = user_id {
-            conn.execute(
-                "UPDATE users SET spend_nanos = spend_nanos + ?1 WHERE id = ?2",
-                params![nanos, uid],
-            )
-            .map_err(storage_err)?;
+        let snap = self.inner.snapshot.load();
+        if let Some(uid) = user_id
+            && let Some(cu) = snap.users_by_id.get(uid)
+        {
+            cu.spend_bucket.add_spend(nanos);
         }
-        if let Some(tid) = team_id {
-            conn.execute(
-                "UPDATE teams SET spend_nanos = spend_nanos + ?1 WHERE id = ?2",
-                params![nanos, tid],
-            )
-            .map_err(storage_err)?;
+        if let Some(tid) = team_id
+            && let Some(ct) = snap.teams_by_id.get(tid)
+        {
+            ct.spend_bucket.add_spend(nanos);
         }
-        if let Some(kid) = virtual_key_id {
-            conn.execute(
-                "UPDATE virtual_keys SET spend_nanos = spend_nanos + ?1 WHERE id = ?2",
-                params![nanos, kid],
-            )
-            .map_err(storage_err)?;
+        if let Some(kid) = virtual_key_id
+            && let Some(ck) = snap.keys_by_id.get(kid)
+        {
+            ck.spend_bucket.add_spend(nanos);
         }
-        if let Some(eu_id) = end_user_id {
-            conn.execute(
-                "UPDATE end_users SET spend_nanos = spend_nanos + ?1, updated_at_ms = ?2 WHERE user_id = ?3",
-                params![nanos, now, eu_id],
-            )
-            .map_err(storage_err)?;
+        if let Some(eu_id) = end_user_id
+            && let Some(ceu) = snap.end_users_by_id.get(eu_id)
+        {
+            ceu.spend_bucket.add_spend(nanos);
         }
         for scope in durable_scopes {
-            conn.execute(
-                "INSERT INTO scoped_spend (scope_key, spend_nanos, updated_at_ms)
-                 VALUES (?1, ?2, ?3)
-                 ON CONFLICT(scope_key) DO UPDATE SET
-                    spend_nanos = spend_nanos + excluded.spend_nanos,
-                    updated_at_ms = excluded.updated_at_ms",
-                params![scope, nanos, now],
-            )
-            .map_err(storage_err)?;
+            self.inner
+                .spend_registry
+                .get_or_init_scoped(scope, 0)
+                .add_spend(nanos);
         }
+        self.inner
+            .write_behind
+            .push(dataplane::WriteBehindOp::Spend {
+                user_id: user_id.map(str::to_owned),
+                team_id: team_id.map(str::to_owned),
+                virtual_key_id: virtual_key_id.map(str::to_owned),
+                end_user_id: end_user_id.map(str::to_owned),
+                durable_scopes: durable_scopes.to_vec(),
+                nanos,
+                now_ms: now_ms(),
+            });
         Ok(())
     }
 
@@ -1961,7 +1990,7 @@ impl Database {
             Some(k) => Some(self.resolve_virtual_key_id(k)?),
             None => None,
         };
-        let conn = self.inner.conn.lock();
+        let conn = self.lock_conn_mutating();
         if reset_all {
             conn.execute("UPDATE users SET spend_nanos = 0", [])
                 .map_err(storage_err)?;
@@ -1973,6 +2002,7 @@ impl Database {
                 .map_err(storage_err)?;
             conn.execute("DELETE FROM scoped_spend", [])
                 .map_err(storage_err)?;
+            self.inner.spend_registry.clear_all();
             return Ok(());
         }
         if let Some(uid) = user_id {
@@ -2011,6 +2041,7 @@ impl Database {
     }
 
     fn refresh_expired_windows_locked(&self, conn: &Connection, now: i64) -> Result<()> {
+        let mut updated_any = false;
         for (table, id_col) in [
             ("users", "id"),
             ("teams", "id"),
@@ -2038,7 +2069,11 @@ impl Database {
                     params![next_reset, id],
                 )
                 .map_err(storage_err)?;
+                updated_any = true;
             }
+        }
+        if updated_any {
+            self.rebuild_snapshot_from_locked(conn);
         }
         Ok(())
     }
@@ -2066,7 +2101,7 @@ impl Database {
         let expires_at = secret.expires_at_ms();
         let now = now_ms();
         {
-            let conn = self.inner.conn.lock();
+            let conn = self.lock_conn_mutating();
             conn.execute(
                 "INSERT INTO credentials (
                     id, provider_id, label, auth_kind, base_url, priority,
@@ -2115,7 +2150,7 @@ impl Database {
     ) -> Result<()> {
         let encrypted = self.inner.vault.encrypt_json(id, secret)?;
         let expires_at = secret.expires_at_ms();
-        let conn = self.inner.conn.lock();
+        let conn = self.lock_conn_mutating();
         let updated = if let Some(url) = new_base_url {
             conn.execute(
                 "UPDATE credentials
@@ -2162,7 +2197,7 @@ impl Database {
         let next_enabled = enabled.unwrap_or(existing.enabled);
         let next_overflow = allow_api_overflow.unwrap_or(existing.allow_api_overflow);
         {
-            let conn = self.inner.conn.lock();
+            let conn = self.lock_conn_mutating();
             conn.execute(
                 "UPDATE credentials
                  SET label = ?1, base_url = ?2, priority = ?3, enabled = ?4, allow_api_overflow = ?5
@@ -2182,55 +2217,51 @@ impl Database {
     }
 
     pub fn list_credentials(&self) -> Result<Vec<CredentialRecord>> {
-        let conn = self.inner.conn.lock();
         let now = now_ms();
-        // Auto-clear expired credential-wide cooldowns.
-        conn.execute(
-            "UPDATE credentials SET status = 'ok', status_reason = NULL, cooldown_until_ms = NULL
-             WHERE status = 'exhausted' AND cooldown_until_ms IS NOT NULL AND cooldown_until_ms <= ?1",
-            params![now],
-        )
-        .map_err(storage_err)?;
-
-        let mut stmt = conn
-            .prepare(
-                "SELECT id, provider_id, label, auth_kind, base_url, priority, enabled,
-                        allow_api_overflow, status, status_reason, cooldown_until_ms,
-                        model_cooldowns_json, quota_snapshot_json, expires_at_ms,
-                        last_used_at_ms, created_at_ms
-                 FROM credentials ORDER BY priority ASC, created_at_ms ASC",
-            )
-            .map_err(storage_err)?;
-        let rows = stmt
-            .query_map([], map_credential_row)
-            .map_err(storage_err)?
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(storage_err)?;
-        Ok(rows)
+        let snap = self.inner.snapshot.load();
+        Ok(snap
+            .credentials
+            .iter()
+            .map(|c| c.snapshot_record(now))
+            .collect())
     }
 
     pub fn get_credential(&self, id: &str) -> Result<CredentialRecord> {
-        let conn = self.inner.conn.lock();
-        conn.query_row(
-            "SELECT id, provider_id, label, auth_kind, base_url, priority, enabled,
-                    allow_api_overflow, status, status_reason, cooldown_until_ms,
-                    model_cooldowns_json, quota_snapshot_json, expires_at_ms,
-                    last_used_at_ms, created_at_ms
-             FROM credentials WHERE id = ?1",
-            params![id],
-            map_credential_row,
-        )
-        .optional()
-        .map_err(storage_err)?
-        .ok_or_else(|| QuixigateError::NotFound(format!("credential '{id}' not found")))
+        let snap = self.inner.snapshot.load();
+        snap.credentials_by_id
+            .get(id)
+            .map(|c| c.snapshot_record(now_ms()))
+            .ok_or_else(|| QuixigateError::NotFound(format!("credential '{id}' not found")))
+    }
+
+    /// Zero-clone hot-path lookup returning `(CredentialRecord, Arc<CredentialSecret>)`.
+    #[inline]
+    pub fn get_credential_secret_arc(
+        &self,
+        id: &str,
+    ) -> Result<(CredentialRecord, Arc<CredentialSecret>)> {
+        let snap = self.inner.snapshot.load();
+        if let Some(cached) = snap.credentials_by_id.get(id)
+            && let Some(sec) = &cached.secret
+        {
+            return Ok((cached.snapshot_record(now_ms()), Arc::clone(sec)));
+        }
+        let (record, secret) = self.get_credential_with_secret(id)?;
+        Ok((record, Arc::new(secret)))
     }
 
     pub fn get_credential_with_secret(
         &self,
         id: &str,
     ) -> Result<(CredentialRecord, CredentialSecret)> {
+        let snap = self.inner.snapshot.load();
+        if let Some(cached) = snap.credentials_by_id.get(id)
+            && let Some(sec) = &cached.secret
+        {
+            return Ok((cached.snapshot_record(now_ms()), (**sec).clone()));
+        }
         let (record, blob): (CredentialRecord, Vec<u8>) = {
-            let conn = self.inner.conn.lock();
+            let conn = self.lock_conn_synced();
             conn.query_row(
                 "SELECT id, provider_id, label, auth_kind, base_url, priority, enabled,
                         allow_api_overflow, status, status_reason, cooldown_until_ms,
@@ -2249,24 +2280,30 @@ impl Database {
     }
 
     pub fn delete_credential(&self, id: &str) -> Result<()> {
-        let conn = self.inner.conn.lock();
+        let conn = self.lock_conn_mutating();
         conn.execute("DELETE FROM credentials WHERE id = ?1", params![id])
             .map_err(storage_err)?;
         Ok(())
     }
 
+    #[inline]
     pub fn mark_credential_used(&self, id: &str) -> Result<()> {
-        let conn = self.inner.conn.lock();
-        conn.execute(
-            "UPDATE credentials SET last_used_at_ms = ?1 WHERE id = ?2",
-            params![now_ms(), id],
-        )
-        .map_err(storage_err)?;
+        let now = now_ms();
+        let snap = self.inner.snapshot.load();
+        if let Some(cached) = snap.credentials_by_id.get(id) {
+            cached.last_used_at_ms.store(now, Ordering::Relaxed);
+        }
+        self.inner
+            .write_behind
+            .push(dataplane::WriteBehindOp::CredentialUsed {
+                id: id.to_owned(),
+                at_ms: now,
+            });
         Ok(())
     }
 
     pub fn record_credential_cooldown(&self, id: &str, until_ms: i64, reason: &str) -> Result<()> {
-        let conn = self.inner.conn.lock();
+        let conn = self.lock_conn_mutating();
         conn.execute(
             "UPDATE credentials
              SET status = 'exhausted', status_reason = ?1, cooldown_until_ms = ?2
@@ -2278,7 +2315,7 @@ impl Database {
     }
 
     pub fn record_model_cooldown(&self, id: &str, model: &str, until_ms: i64) -> Result<()> {
-        let conn = self.inner.conn.lock();
+        let conn = self.lock_conn_mutating();
         let raw: Option<String> = conn
             .query_row(
                 "SELECT model_cooldowns_json FROM credentials WHERE id = ?1",
@@ -2305,7 +2342,7 @@ impl Database {
     }
 
     pub fn mark_credential_dead(&self, id: &str, reason: &str) -> Result<()> {
-        let conn = self.inner.conn.lock();
+        let conn = self.lock_conn_mutating();
         conn.execute(
             "UPDATE credentials SET status = 'dead', status_reason = ?1 WHERE id = ?2",
             params![reason, id],
@@ -2316,7 +2353,7 @@ impl Database {
 
     pub fn reset_credential_health(&self, id: &str) -> Result<CredentialRecord> {
         {
-            let conn = self.inner.conn.lock();
+            let conn = self.lock_conn_mutating();
             conn.execute(
                 "UPDATE credentials
                  SET status = 'ok', status_reason = NULL, cooldown_until_ms = NULL, model_cooldowns_json = '{}'
@@ -2332,7 +2369,7 @@ impl Database {
         let json = serde_json::to_string(snapshot).map_err(|e| {
             QuixigateError::Storage(format!("quota snapshot serialize failed: {e}"))
         })?;
-        let conn = self.inner.conn.lock();
+        let conn = self.lock_conn_mutating();
         conn.execute(
             "UPDATE credentials SET quota_snapshot_json = ?1 WHERE id = ?2",
             params![json, id],
@@ -2344,7 +2381,7 @@ impl Database {
     // ── Model Routes & Aliases ───────────────────────────────────────────────
 
     pub fn list_model_routes(&self) -> Result<Vec<ModelRoute>> {
-        let conn = self.inner.conn.lock();
+        let conn = self.lock_conn_synced();
         let mut stmt = conn
             .prepare(&format!(
                 "SELECT {MODEL_ROUTE_COLUMNS} FROM model_routes ORDER BY alias ASC"
@@ -2358,15 +2395,25 @@ impl Database {
         Ok(rows)
     }
 
+    #[inline]
+    pub fn get_model_route_arc(&self, alias: &str) -> Option<Arc<ModelRoute>> {
+        self.inner
+            .snapshot
+            .load()
+            .routes_by_alias
+            .get(alias)
+            .cloned()
+    }
+
+    #[inline]
     pub fn get_model_route(&self, alias: &str) -> Result<Option<ModelRoute>> {
-        let conn = self.inner.conn.lock();
-        conn.query_row(
-            &format!("SELECT {MODEL_ROUTE_COLUMNS} FROM model_routes WHERE alias = ?1"),
-            params![alias],
-            map_model_route_row,
-        )
-        .optional()
-        .map_err(storage_err)
+        Ok(self
+            .inner
+            .snapshot
+            .load()
+            .routes_by_alias
+            .get(alias)
+            .map(|r| (**r).clone()))
     }
 
     pub fn upsert_model_route(&self, route: &ModelRoute) -> Result<ModelRoute> {
@@ -2390,7 +2437,7 @@ impl Database {
             .map(str::trim)
             .filter(|s| !s.is_empty());
         {
-            let conn = self.inner.conn.lock();
+            let conn = self.lock_conn_mutating();
             conn.execute(
                 "INSERT INTO model_routes (
                     alias, targets_json, pool_strategy, allow_paid_overflow, blocked,
@@ -2470,20 +2517,24 @@ impl Database {
     }
 
     pub fn delete_model_route(&self, alias: &str) -> Result<()> {
-        let conn = self.inner.conn.lock();
+        let conn = self.lock_conn_mutating();
         conn.execute("DELETE FROM model_routes WHERE alias = ?1", params![alias])
             .map_err(storage_err)?;
         Ok(())
     }
 
+    #[allow(dead_code)]
     fn model_matches_allowlist(
         &self,
         patterns: &[String],
         requested_model: &str,
         base_model: &str,
     ) -> Result<bool> {
-        let conn = self.inner.conn.lock();
-        model_matches_allowlist_locked(&conn, patterns, requested_model, base_model)
+        Ok(self.inner.snapshot.load().model_matches_allowlist(
+            patterns,
+            requested_model,
+            base_model,
+        ))
     }
 
     // ── End-Users / Customers (`end_users`) ──────────────────────────────────
@@ -2557,7 +2608,7 @@ impl Database {
             .map(|e| e.spend_nanos.nanos())
             .unwrap_or(0);
         {
-            let conn = self.inner.conn.lock();
+            let conn = self.lock_conn_mutating();
             conn.execute(
                 "INSERT INTO end_users (
                     user_id, alias, blocked, budget_id, budget_limit_nanos, budget_window,
@@ -2596,7 +2647,7 @@ impl Database {
 
     pub fn get_end_user(&self, user_id: &str) -> Result<EndUser> {
         let trimmed = user_id.trim();
-        let conn = self.inner.conn.lock();
+        let conn = self.lock_conn_synced();
         self.refresh_expired_windows_locked(&conn, now_ms())?;
         conn.query_row(
             "SELECT user_id, alias, blocked, budget_id, budget_limit_nanos, budget_window,
@@ -2612,7 +2663,7 @@ impl Database {
     }
 
     pub fn list_end_users(&self) -> Result<Vec<EndUser>> {
-        let conn = self.inner.conn.lock();
+        let conn = self.lock_conn_synced();
         self.refresh_expired_windows_locked(&conn, now_ms())?;
         let mut stmt = conn
             .prepare(
@@ -2635,7 +2686,7 @@ impl Database {
     }
 
     pub fn delete_end_users(&self, user_ids: &[String]) -> Result<usize> {
-        let conn = self.inner.conn.lock();
+        let conn = self.lock_conn_mutating();
         let mut deleted = 0usize;
         for uid in user_ids {
             let trimmed = uid.trim();
@@ -2666,7 +2717,7 @@ impl Database {
         let created_at = existing.as_ref().map(|e| e.created_at_ms).unwrap_or(now);
         let mmb_json = serialize_model_budgets_json(&b.model_max_budget_nanos);
         {
-            let conn = self.inner.conn.lock();
+            let conn = self.lock_conn_mutating();
             conn.execute(
                 "INSERT INTO budgets (
                     budget_id, max_budget_nanos, soft_budget_nanos, max_parallel_requests,
@@ -2704,7 +2755,7 @@ impl Database {
 
     pub fn get_budget(&self, budget_id: &str) -> Result<BudgetRecord> {
         let trimmed = budget_id.trim();
-        let conn = self.inner.conn.lock();
+        let conn = self.lock_conn_synced();
         conn.query_row(
             "SELECT budget_id, max_budget_nanos, soft_budget_nanos, max_parallel_requests,
                     tpm_limit, rpm_limit, budget_duration, model_max_budget_json,
@@ -2719,7 +2770,7 @@ impl Database {
     }
 
     pub fn list_budgets(&self) -> Result<Vec<BudgetRecord>> {
-        let conn = self.inner.conn.lock();
+        let conn = self.lock_conn_synced();
         let mut stmt = conn
             .prepare(
                 "SELECT budget_id, max_budget_nanos, soft_budget_nanos, max_parallel_requests,
@@ -2737,7 +2788,7 @@ impl Database {
     }
 
     pub fn delete_budget(&self, budget_id: &str) -> Result<()> {
-        let conn = self.inner.conn.lock();
+        let conn = self.lock_conn_mutating();
         conn.execute(
             "DELETE FROM budgets WHERE budget_id = ?1",
             params![budget_id.trim()],
@@ -2762,7 +2813,7 @@ impl Database {
             .unwrap_or_else(|_| "[]".to_owned());
         let meta_json = serde_json::to_string(&tag.metadata).unwrap_or_else(|_| "{}".to_owned());
         {
-            let conn = self.inner.conn.lock();
+            let conn = self.lock_conn_mutating();
             conn.execute(
                 "INSERT INTO tags (
                     tag_name, description, models_json, budget_id, max_budget_nanos,
@@ -2793,7 +2844,7 @@ impl Database {
 
     pub fn get_tag(&self, tag_name: &str) -> Result<TagRecord> {
         let trimmed = tag_name.trim();
-        let conn = self.inner.conn.lock();
+        let conn = self.lock_conn_synced();
         let mut rec = conn
             .query_row(
                 "SELECT tag_name, description, models_json, budget_id, max_budget_nanos,
@@ -2810,7 +2861,7 @@ impl Database {
     }
 
     pub fn list_tags(&self) -> Result<Vec<TagRecord>> {
-        let conn = self.inner.conn.lock();
+        let conn = self.lock_conn_synced();
         let mut stmt = conn
             .prepare(
                 "SELECT tag_name, description, models_json, budget_id, max_budget_nanos,
@@ -2834,7 +2885,7 @@ impl Database {
     }
 
     pub fn delete_tag(&self, tag_name: &str) -> Result<()> {
-        let conn = self.inner.conn.lock();
+        let conn = self.lock_conn_mutating();
         conn.execute(
             "DELETE FROM tags WHERE tag_name = ?1",
             params![tag_name.trim()],
@@ -2860,7 +2911,7 @@ impl Database {
         let mcp_json = serde_json::to_string(&normalize_string_list(&ag.mcp_server_ids))
             .unwrap_or_else(|_| "[]".to_owned());
         {
-            let conn = self.inner.conn.lock();
+            let conn = self.lock_conn_mutating();
             conn.execute(
                 "INSERT INTO access_groups (
                     access_group, description, model_names_json, mcp_server_ids_json,
@@ -2893,7 +2944,7 @@ impl Database {
 
     pub fn get_access_group(&self, access_group: &str) -> Result<AccessGroupRecord> {
         let trimmed = access_group.trim();
-        let conn = self.inner.conn.lock();
+        let conn = self.lock_conn_synced();
         let mut rec = conn
             .query_row(
                 "SELECT access_group, description, model_names_json, mcp_server_ids_json,
@@ -2915,7 +2966,7 @@ impl Database {
     }
 
     pub fn list_access_groups(&self) -> Result<Vec<AccessGroupRecord>> {
-        let conn = self.inner.conn.lock();
+        let conn = self.lock_conn_synced();
         let mut stmt = conn
             .prepare(
                 "SELECT access_group, description, model_names_json, mcp_server_ids_json,
@@ -2939,7 +2990,7 @@ impl Database {
     }
 
     pub fn delete_access_group(&self, access_group: &str) -> Result<()> {
-        let conn = self.inner.conn.lock();
+        let conn = self.lock_conn_mutating();
         conn.execute(
             "DELETE FROM access_groups WHERE access_group = ?1",
             params![access_group.trim()],
@@ -2952,7 +3003,7 @@ impl Database {
 
     pub fn get_cached_response(&self, cache_key: &str) -> Result<Option<String>> {
         let now = now_ms();
-        let conn = self.inner.conn.lock();
+        let conn = self.lock_conn_synced();
         conn.query_row(
             "SELECT response_json FROM response_cache WHERE cache_key = ?1 AND expires_at_ms > ?2",
             params![cache_key, now],
@@ -2971,7 +3022,7 @@ impl Database {
     ) -> Result<()> {
         let now = now_ms();
         let expires = now + (ttl_secs as i64) * 1000;
-        let conn = self.inner.conn.lock();
+        let conn = self.lock_conn_synced();
         conn.execute(
             "INSERT OR REPLACE INTO response_cache (cache_key, model, response_json, expires_at_ms, created_at_ms)
              VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -2982,14 +3033,14 @@ impl Database {
     }
 
     pub fn clear_response_cache(&self) -> Result<usize> {
-        let conn = self.inner.conn.lock();
+        let conn = self.lock_conn_synced();
         conn.execute("DELETE FROM response_cache", [])
             .map_err(storage_err)
     }
 
     pub fn count_cached_responses(&self) -> Result<usize> {
         let now = now_ms();
-        let conn = self.inner.conn.lock();
+        let conn = self.lock_conn_synced();
         let count: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM response_cache WHERE expires_at_ms > ?1",
@@ -3002,64 +3053,20 @@ impl Database {
 
     // ── Request Logs & Dashboard Analytics ───────────────────────────────────
 
-    pub fn insert_request_log(&self, log: &RequestLog) -> Result<()> {
-        let max_rows = self.inner.settings_cache.read().max_trace_rows.max(100);
-        let tags_json = serde_json::to_string(&log.tags).unwrap_or_else(|_| "[]".to_owned());
-        let conn = self.inner.conn.lock();
-        conn.execute(
-            "INSERT INTO request_logs (
-                id, timestamp_ms, ingress_protocol, requested_model, resolved_model,
-                provider_id, credential_id, user_id, team_id, virtual_key_id, tags_json,
-                status_code, stream, fallback_attempts, cache_hit, ttft_ms,
-                duration_ms, input_tokens, cached_input_tokens, reasoning_tokens,
-                output_tokens, cost_nanos, api_equiv_nanos, otel_trace_id,
-                error_message, request_body_json, response_body_json
-             ) VALUES (
-                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
-                ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20,
-                ?21, ?22, ?23, ?24, ?25, ?26, ?27
-             )",
-            params![
-                log.id,
-                log.timestamp_ms,
-                log.ingress_protocol.as_str(),
-                log.requested_model,
-                log.resolved_model,
-                log.provider_id,
-                log.credential_id,
-                log.user_id,
-                log.team_id,
-                log.virtual_key_id,
-                tags_json,
-                log.status_code,
-                i32::from(log.stream),
-                log.fallback_attempts,
-                i32::from(log.cache_hit),
-                log.ttft_ms.map(|v| v as i64),
-                log.duration_ms as i64,
-                log.input_tokens as i64,
-                log.cached_input_tokens as i64,
-                log.reasoning_tokens as i64,
-                log.output_tokens as i64,
-                log.cost_nanos.nanos(),
-                log.api_equiv_nanos.nanos(),
-                log.otel_trace_id,
-                log.error_message,
-                log.request_body_json,
-                log.response_body_json,
-            ],
-        )
-        .map_err(storage_err)?;
-
-        // Periodic ring-buffer prune so SQLite stays fast indefinitely.
-        conn.execute(
-            "DELETE FROM request_logs WHERE id IN (
-                SELECT id FROM request_logs ORDER BY timestamp_ms DESC LIMIT -1 OFFSET ?1
-             )",
-            params![max_rows as i64],
-        )
-        .map_err(storage_err)?;
+    #[inline]
+    pub fn insert_request_log_owned(&self, log: RequestLog) -> Result<()> {
+        let max_rows = self.inner.snapshot.load().settings.max_trace_rows.max(100);
+        self.inner
+            .write_behind
+            .push(dataplane::WriteBehindOp::RequestLog {
+                log: Box::new(log),
+                max_rows,
+            });
         Ok(())
+    }
+
+    pub fn insert_request_log(&self, log: &RequestLog) -> Result<()> {
+        self.insert_request_log_owned(log.clone())
     }
 
     pub fn list_request_logs(&self, filter: &LogFilter) -> Result<Vec<RequestLog>> {
@@ -3075,7 +3082,7 @@ impl Database {
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(|t| format!("\"{}\"", t.replace('"', "")));
-        let conn = self.inner.conn.lock();
+        let conn = self.lock_conn_synced();
         let mut stmt = conn
             .prepare(&format!(
                 "SELECT {REQUEST_LOG_COLUMNS}
@@ -3117,7 +3124,7 @@ impl Database {
     }
 
     pub fn clear_request_logs(&self, before_ms: Option<i64>) -> Result<usize> {
-        let conn = self.inner.conn.lock();
+        let conn = self.lock_conn_synced();
         match before_ms {
             Some(cutoff) => conn
                 .execute(
@@ -3132,7 +3139,7 @@ impl Database {
     }
 
     pub fn get_request_log(&self, id: &str) -> Result<RequestLog> {
-        let conn = self.inner.conn.lock();
+        let conn = self.lock_conn_synced();
         conn.query_row(
             &format!("SELECT {REQUEST_LOG_COLUMNS} FROM request_logs WHERE id = ?1"),
             params![id],
@@ -3165,7 +3172,7 @@ impl Database {
             .map(|t| format!("\"{}\"", t.replace('"', "")));
 
         let rows = {
-            let conn = self.inner.conn.lock();
+            let conn = self.lock_conn_synced();
             let mut stmt = conn
                 .prepare(&format!(
                     "SELECT {REQUEST_LOG_COLUMNS}
@@ -3324,8 +3331,8 @@ impl Database {
             .updated_values
             .as_ref()
             .and_then(|v| serde_json::to_string(v).ok());
-        let max_rows = self.inner.settings_cache.read().max_trace_rows.max(500) as i64;
-        let conn = self.inner.conn.lock();
+        let max_rows = self.inner.snapshot.load().settings.max_trace_rows.max(500) as i64;
+        let conn = self.lock_conn_synced();
         conn.execute(
             "INSERT INTO audit_logs (
                 id, timestamp_ms, actor_id, actor_role, action, table_name,
@@ -3364,7 +3371,7 @@ impl Database {
     ) -> Result<Vec<AuditLogEntry>> {
         let lim = limit.clamp(1, 500) as i64;
         let off = offset as i64;
-        let conn = self.inner.conn.lock();
+        let conn = self.lock_conn_synced();
         let mut stmt = conn
             .prepare(
                 "SELECT id, timestamp_ms, actor_id, actor_role, action, table_name,
@@ -3390,7 +3397,7 @@ impl Database {
     }
 
     pub fn get_audit_log(&self, id: &str) -> Result<AuditLogEntry> {
-        let conn = self.inner.conn.lock();
+        let conn = self.lock_conn_synced();
         conn.query_row(
             "SELECT id, timestamp_ms, actor_id, actor_role, action, table_name,
                     object_id, before_value_json, updated_values_json
@@ -3407,7 +3414,7 @@ impl Database {
         let now = now_ms();
         let since_24h = now - 24 * 60 * 60 * 1000;
         let since_30d = now - 30 * 24 * 60 * 60 * 1000;
-        let conn = self.inner.conn.lock();
+        let conn = self.lock_conn_synced();
 
         let (total_24h, err_24h, hits_24h, in_24h, out_24h, cached_24h, dur_24h, spend_24h): (
             i64,
@@ -3734,41 +3741,6 @@ fn map_credential_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CredentialRec
         last_used_at_ms: row.get(14)?,
         created_at_ms: row.get(15)?,
     })
-}
-
-fn model_matches_allowlist_locked(
-    conn: &Connection,
-    patterns: &[String],
-    requested_model: &str,
-    base_model: &str,
-) -> Result<bool> {
-    for pat in patterns {
-        if glob_matches(pat, requested_model) || glob_matches(pat, base_model) {
-            return Ok(true);
-        }
-        let ag_key = pat
-            .trim()
-            .strip_prefix("access_group:")
-            .unwrap_or(pat.trim());
-        if let Some(models_json) = conn
-            .query_row(
-                "SELECT model_names_json FROM access_groups WHERE access_group = ?1",
-                params![ag_key],
-                |r| r.get::<_, String>(0),
-            )
-            .optional()
-            .map_err(storage_err)?
-        {
-            let ag_models: Vec<String> = serde_json::from_str(&models_json).unwrap_or_default();
-            if ag_models
-                .iter()
-                .any(|m| glob_matches(m, requested_model) || glob_matches(m, base_model))
-            {
-                return Ok(true);
-            }
-        }
-    }
-    Ok(false)
 }
 
 fn map_end_user_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<EndUser> {

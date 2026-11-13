@@ -242,8 +242,7 @@ pub async fn handle_messages(
 
     let stream_requested = body["stream"].as_bool().unwrap_or(false);
     let msg_id = format!("msg_{}", Uuid::new_v4().simple());
-    let oi = build_openinference_inputs(&req, None);
-    let raw_req = Some(body.to_string());
+    let (oi, raw_req) = prepare_telemetry_capture(&state, &principal, &req, &body, None);
     let started = Instant::now();
 
     state.telemetry.inc_active();

@@ -116,6 +116,17 @@ impl AppState {
         self
     }
 
+    /// Creates a core-local `AppState` clone with a dedicated outbound `reqwest::Client` connection
+    /// pool pinned to the calling worker thread's Tokio reactor, while sharing `Database`,
+    /// `ModelCatalog`, `PoolSelector`, and `TelemetryHub`.
+    pub fn fork_for_worker_core(&self) -> Self {
+        let mut forked = self.clone();
+        forked.router = self
+            .router
+            .fork_with_http(quixigate_providers::build_inference_http_client());
+        forked
+    }
+
     pub const fn is_ui_compiled_in() -> bool {
         cfg!(feature = "ui")
     }
@@ -149,7 +160,7 @@ impl AppState {
 
     pub fn ui_status_json(&self) -> Value {
         let compiled_in = Self::is_ui_compiled_in();
-        let persisted = self.db.get_settings().map(|s| s.ui_enabled).unwrap_or(true);
+        let persisted = self.db.settings_arc().ui_enabled;
         let runtime_override = self.ui_runtime_override();
         let enabled = self.is_ui_enabled();
         json!({
@@ -186,7 +197,7 @@ impl AppState {
         if let Some(forced) = *self.ui_override.lock() {
             return forced;
         }
-        self.db.get_settings().map(|s| s.ui_enabled).unwrap_or(true)
+        self.db.settings_arc().ui_enabled
     }
 }
 

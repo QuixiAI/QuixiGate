@@ -50,7 +50,7 @@ impl GoogleCodeAssistModel {
             project_id: project_id.into(),
             base_url: DEFAULT_CODE_ASSIST_BASE_URL.to_owned(),
             tools: Vec::new(),
-            http: crate::build_inference_http_client(),
+            http: crate::shared_inference_http_client(),
         }
     }
 

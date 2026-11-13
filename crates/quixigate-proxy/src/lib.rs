@@ -12,7 +12,10 @@ pub mod litellm_unsupported;
 pub mod mcp;
 pub mod oidc;
 pub mod openapi;
+pub mod server;
 pub mod state;
+
+pub use server::{resolve_worker_count, serve_sharded_per_core};
 
 use axum::Json;
 use axum::Router;

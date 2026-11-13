@@ -133,6 +133,7 @@ futures = "0.3"
 hex = "0.4"
 http = "1.1"
 inquire = "0.7"
+memchr = "2.7"
 mime_guess = "2.0"
 moka = { version = "0.12", features = ["future"] }
 open = "5.3"

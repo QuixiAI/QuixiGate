@@ -79,6 +79,21 @@ impl CredentialRefresher {
         &self.http
     }
 
+    /// Zero-clone fast path returning `(CredentialRecord, Arc<CredentialSecret>)` when the
+    /// cached credential does not require OAuth token rotation.
+    #[inline]
+    pub async fn ensure_fresh_arc(
+        &self,
+        credential_id: &str,
+    ) -> Result<(CredentialRecord, Arc<CredentialSecret>)> {
+        let (record, secret_arc) = self.db.get_credential_secret_arc(credential_id)?;
+        if !needs_refresh(&secret_arc) {
+            return Ok((record, secret_arc));
+        }
+        let (refreshed_rec, refreshed_sec) = self.ensure_fresh(credential_id).await?;
+        Ok((refreshed_rec, Arc::new(refreshed_sec)))
+    }
+
     /// Returns a guaranteed-fresh `(CredentialRecord, CredentialSecret)` for `credential_id`.
     /// Concurrent callers for the same expiring OAuth credential coalesce onto a single upstream
     /// refresh POST and receive the persisted rotated credential.

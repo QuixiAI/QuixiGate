@@ -22,6 +22,7 @@ bytes.workspace = true
 chrono.workspace = true
 dashmap.workspace = true
 futures.workspace = true
+memchr.workspace = true
 parking_lot.workspace = true
 reqwest.workspace = true
 schemars.workspace = true

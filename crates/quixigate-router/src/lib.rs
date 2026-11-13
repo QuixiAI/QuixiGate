@@ -3,9 +3,15 @@
 
 pub mod cache;
 pub mod catalog;
+pub mod cut_through;
 pub mod guardrails;
 pub mod pool;
 pub mod tools;
+
+pub use cut_through::{
+    CutThroughActiveStream, CutThroughJsonOutcome, CutThroughJsonResult, CutThroughStreamOutcome,
+    FlybyUsage, PreparedCutThroughPlan, parse_flyby_sse_usage, splice_openai_chat_request,
+};
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::pin::Pin;
@@ -182,7 +188,7 @@ pub struct RoutedEmbeddings {
 pub struct GatewayRouter {
     db: Database,
     refresher: CredentialRefresher,
-    inference_http: reqwest::Client,
+    inference_pool: quixigate_providers::ShardedHttpPool,
     catalog: ModelCatalog,
     pool: Arc<PoolSelector>,
     cache: ResponseCache,
@@ -214,7 +220,9 @@ impl GatewayRouter {
         Self {
             db,
             refresher,
-            inference_http: quixigate_providers::build_inference_http_client(),
+            inference_pool: quixigate_providers::ShardedHttpPool::from_single(
+                quixigate_providers::shared_inference_http_client(),
+            ),
             catalog,
             pool: Arc::new(PoolSelector::new()),
             cache,
@@ -226,8 +234,21 @@ impl GatewayRouter {
     }
 
     pub fn with_inference_http(mut self, http: reqwest::Client) -> Self {
-        self.inference_http = http;
+        self.inference_pool = quixigate_providers::ShardedHttpPool::from_single(http);
         self
+    }
+
+    pub fn with_sharded_http_pool(mut self, shards: usize) -> Self {
+        self.inference_pool = quixigate_providers::ShardedHttpPool::new(shards);
+        self
+    }
+
+    /// Creates a worker-pinned clone sharing `Database`, `ModelCatalog`, `PoolSelector`, and
+    /// `ResponseCache`, while binding outbound HTTP connections to a core-local `reqwest::Client`.
+    pub fn fork_with_http(&self, http: reqwest::Client) -> Self {
+        let mut forked = self.clone();
+        forked.inference_pool = quixigate_providers::ShardedHttpPool::from_single(http);
+        forked
     }
 
     pub fn with_web_search_url(mut self, url: impl Into<String>) -> Self {
@@ -238,6 +259,11 @@ impl GatewayRouter {
     pub fn with_mcp_urls(mut self, urls: Vec<String>) -> Self {
         self.mcp_urls = urls;
         self
+    }
+
+    #[inline]
+    pub fn has_mcp_urls(&self) -> bool {
+        self.mcp_urls.iter().any(|u| !u.trim().is_empty())
     }
 
     pub fn catalog(&self) -> &ModelCatalog {
@@ -256,8 +282,9 @@ impl GatewayRouter {
         &self.refresher
     }
 
+    #[inline]
     pub fn inference_http(&self) -> &reqwest::Client {
-        &self.inference_http
+        self.inference_pool.get()
     }
 
     pub fn pool(&self) -> &PoolSelector {
@@ -271,8 +298,12 @@ impl GatewayRouter {
         requested_model: &str,
     ) -> Result<Vec<ResolvedHttpCandidate>> {
         let spec = ModelSpec::parse(requested_model);
-        let settings = self.db.get_settings()?;
-        let route = self.db.get_model_route(&spec.base_model)?;
+        let snap = self.db.control_snapshot_arc();
+        let settings = &snap.settings;
+        let route = snap
+            .routes_by_alias
+            .get(&spec.base_model)
+            .map(|r| (**r).clone());
         if route.as_ref().is_some_and(|r| r.blocked) {
             return Err(QuixigateError::Forbidden(format!(
                 "model '{requested_model}' is currently blocked"
@@ -285,7 +316,7 @@ impl GatewayRouter {
             &creds,
             &self.catalog,
             &self.local_scanner,
-            &settings,
+            settings,
         );
         let mut out = Vec::with_capacity(candidates.len());
         for cand in &candidates {
@@ -428,14 +459,11 @@ impl GatewayRouter {
 
     pub fn list_available_models(&self) -> Vec<CatalogModel> {
         let locals = self.local_scanner.list_statuses();
-        let openrouter_connected = self
-            .db
-            .list_credentials()
-            .map(|cs| {
-                cs.iter()
-                    .any(|c| c.enabled && c.provider_id == "openrouter")
-            })
-            .unwrap_or(false);
+        let snap = self.db.control_snapshot_arc();
+        let openrouter_connected = snap
+            .credentials
+            .iter()
+            .any(|c| c.record.enabled && c.record.provider_id == "openrouter");
         self.catalog
             .list_models_with_context(&locals, openrouter_connected)
     }
@@ -448,42 +476,8 @@ impl GatewayRouter {
         est_input_tokens: u64,
         max_out: u64,
     ) -> Result<(u64, NanoUsd)> {
-        let spec = ModelSpec::parse(requested_model);
-        let route = self.db.get_model_route(&spec.base_model)?;
-        if route.as_ref().is_some_and(|r| r.blocked) {
-            return Err(QuixigateError::Forbidden(format!(
-                "model '{requested_model}' is currently blocked"
-            )));
-        }
-        let creds = self.db.list_credentials()?;
-        let settings = self.db.get_settings()?;
-        let candidates = self.pool.resolve_candidates(
-            &spec,
-            route.as_ref(),
-            &creds,
-            &self.catalog,
-            &self.local_scanner,
-            &settings,
-        );
-        let est_total_tokens = est_input_tokens.saturating_add(max_out);
-        let Some(first) = candidates.first() else {
-            return Ok((est_total_tokens, NanoUsd::ZERO));
-        };
-        let auth_kind = first
-            .credential
-            .as_ref()
-            .map(|c| c.auth_kind)
-            .unwrap_or(AuthKind::LocalNoauth);
-        let (cost, _) = self.catalog.compute_cost(
-            &first.provider_id,
-            auth_kind,
-            &first.upstream_model,
-            est_input_tokens,
-            0,
-            max_out,
-            route.as_ref(),
-        );
-        Ok((est_total_tokens, cost))
+        let plan = self.prepare_cut_through_plan(requested_model, est_input_tokens, max_out)?;
+        Ok((plan.est_total_tokens, plan.est_cost))
     }
 
     /// Executes a non-streaming generation across the multi-seat pool with automatic
@@ -492,9 +486,10 @@ impl GatewayRouter {
     pub async fn execute_text(&self, mut req: CanonicalRequest) -> Result<RoutedGeneration> {
         let started = Instant::now();
         let spec = ModelSpec::parse(&req.requested_model);
-        let settings = self.db.get_settings()?;
-        guardrails::apply_request_guardrails(&mut req, &settings)?;
-        let route = self.db.get_model_route(&spec.base_model)?;
+        let snap = self.db.control_snapshot_arc();
+        let settings = &snap.settings;
+        guardrails::apply_request_guardrails(&mut req, settings)?;
+        let route = snap.routes_by_alias.get(&spec.base_model).cloned();
         if route.as_ref().is_some_and(|r| r.blocked) {
             return Err(QuixigateError::Forbidden(format!(
                 "model '{}' is currently blocked",
@@ -519,7 +514,7 @@ impl GatewayRouter {
                 hit.input_tokens,
                 hit.cached_input_tokens,
                 hit.output_tokens,
-                route.as_ref(),
+                route.as_deref(),
             );
             let tool_calls = hit
                 .tool_calls
@@ -558,11 +553,11 @@ impl GatewayRouter {
         let creds = self.db.list_credentials()?;
         let candidates = self.pool.resolve_candidates(
             &spec,
-            route.as_ref(),
+            route.as_deref(),
             &creds,
             &self.catalog,
             &self.local_scanner,
-            &settings,
+            settings,
         );
         if candidates.is_empty() {
             return Err(QuixigateError::NoAvailableRoute(
@@ -579,7 +574,7 @@ impl GatewayRouter {
             let (cand_req, cand_tools, cand_server_tools) =
                 self.adapt_for_candidate(cand, &spec, &req, &all_tools, &server_tools_map);
             let prepared = match self
-                .instantiate_candidate(cand, cand_tools.clone(), &settings, &cand_req)
+                .instantiate_candidate(cand, cand_tools.clone(), settings, &cand_req)
                 .await
             {
                 Ok(p) => p,
@@ -623,7 +618,7 @@ impl GatewayRouter {
                         step_out.input_tokens,
                         step_out.cached_input_tokens,
                         step_out.output_tokens,
-                        route.as_ref(),
+                        route.as_deref(),
                     );
                     let (cost_nanos, api_equiv_nanos) = match meta.exact_cost_nanos {
                         Some(exact) => (
@@ -698,9 +693,10 @@ impl GatewayRouter {
     pub async fn execute_stream(&self, mut req: CanonicalRequest) -> Result<RoutedStream> {
         let started = Instant::now();
         let spec = ModelSpec::parse(&req.requested_model);
-        let settings = self.db.get_settings()?;
-        guardrails::apply_request_guardrails(&mut req, &settings)?;
-        let route = self.db.get_model_route(&spec.base_model)?;
+        let snap = self.db.control_snapshot_arc();
+        let settings = &snap.settings;
+        guardrails::apply_request_guardrails(&mut req, settings)?;
+        let route = snap.routes_by_alias.get(&spec.base_model).cloned();
         if route.as_ref().is_some_and(|r| r.blocked) {
             return Err(QuixigateError::Forbidden(format!(
                 "model '{}' is currently blocked",
@@ -725,7 +721,7 @@ impl GatewayRouter {
                 hit.input_tokens,
                 hit.cached_input_tokens,
                 hit.output_tokens,
-                route.as_ref(),
+                route.as_deref(),
             );
             let mut events = Vec::new();
             if let Some(r) = &hit.reasoning
@@ -796,11 +792,11 @@ impl GatewayRouter {
         let creds = self.db.list_credentials()?;
         let candidates = self.pool.resolve_candidates(
             &spec,
-            route.as_ref(),
+            route.as_deref(),
             &creds,
             &self.catalog,
             &self.local_scanner,
-            &settings,
+            settings,
         );
         if candidates.is_empty() {
             return Err(QuixigateError::NoAvailableRoute(
@@ -817,7 +813,7 @@ impl GatewayRouter {
             let (cand_req, cand_tools, cand_server_tools) =
                 self.adapt_for_candidate(cand, &spec, &req, &all_tools, &server_tools_map);
             let prepared = match self
-                .instantiate_candidate(cand, cand_tools.clone(), &settings, &cand_req)
+                .instantiate_candidate(cand, cand_tools.clone(), settings, &cand_req)
                 .await
             {
                 Ok(p) => p,
@@ -852,7 +848,7 @@ impl GatewayRouter {
                         provider_id: provider_id.clone(),
                         credential_id: cred_id.clone(),
                         auth_kind,
-                        route: route.clone(),
+                        route: route.as_deref().cloned(),
                         cache_key: cache_key.clone(),
                         cache_ttl_secs: settings.cache_ttl_secs.max(1),
                         started,
@@ -902,8 +898,9 @@ impl GatewayRouter {
     ) -> Result<RoutedEmbeddings> {
         let started = Instant::now();
         let spec = ModelSpec::parse(requested_model);
-        let settings = self.db.get_settings()?;
-        let route = self.db.get_model_route(&spec.base_model)?;
+        let snap = self.db.control_snapshot_arc();
+        let settings = &snap.settings;
+        let route = snap.routes_by_alias.get(&spec.base_model).cloned();
         if route.as_ref().is_some_and(|r| r.blocked) {
             return Err(QuixigateError::Forbidden(format!(
                 "model '{requested_model}' is currently blocked"
@@ -912,11 +909,11 @@ impl GatewayRouter {
         let creds = self.db.list_credentials()?;
         let candidates = self.pool.resolve_candidates(
             &spec,
-            route.as_ref(),
+            route.as_deref(),
             &creds,
             &self.catalog,
             &self.local_scanner,
-            &settings,
+            settings,
         );
         if candidates.is_empty() {
             return Err(QuixigateError::NoAvailableRoute(requested_model.to_owned()));
@@ -952,7 +949,7 @@ impl GatewayRouter {
             };
 
             match embed_texts(
-                &self.inference_http,
+                self.inference_http(),
                 &cand.provider_id,
                 &cand.upstream_model,
                 api_key.as_deref(),
@@ -973,7 +970,7 @@ impl GatewayRouter {
                         output.prompt_tokens,
                         0,
                         0,
-                        route.as_ref(),
+                        route.as_deref(),
                     );
                     return Ok(RoutedEmbeddings {
                         resolved_model: cand.upstream_model.clone(),
@@ -1153,7 +1150,7 @@ impl GatewayRouter {
                 headers,
                 body,
                 tools,
-                http: Some(self.inference_http.clone()),
+                http: Some(self.inference_http().clone()),
             })?;
             Ok((model, fresh_rec.auth_kind, Some(fresh_rec.id)))
         } else {
@@ -1169,7 +1166,7 @@ impl GatewayRouter {
                 headers,
                 body,
                 tools,
-                http: Some(self.inference_http.clone()),
+                http: Some(self.inference_http().clone()),
             })?;
             Ok((model, AuthKind::LocalNoauth, None))
         }

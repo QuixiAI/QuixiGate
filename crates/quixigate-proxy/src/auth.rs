@@ -195,7 +195,7 @@ pub async fn peer_trust_middleware(
     req.headers_mut().remove(INTERNAL_PEER_CHECKED_HEADER);
     req.headers_mut().remove(INTERNAL_PEER_IP_HEADER);
 
-    let settings = state.db.get_settings().unwrap_or_default();
+    let settings = state.db.settings_arc();
     let trust_containers = settings.trust_local_containers;
     let trusted_cidrs = &settings.trusted_cidrs;
 
@@ -205,10 +205,15 @@ pub async fn peer_trust_middleware(
         None => None,
     };
 
-    if let Some(ip) = peer_ip
-        && let Ok(hv) = HeaderValue::from_str(&ip.to_string())
-    {
-        req.headers_mut().insert(INTERNAL_PEER_IP_HEADER, hv);
+    if let Some(ip) = peer_ip {
+        let hv_opt = match ip {
+            IpAddr::V4(Ipv4Addr::LOCALHOST) => Some(HeaderValue::from_static("127.0.0.1")),
+            IpAddr::V6(Ipv6Addr::LOCALHOST) => Some(HeaderValue::from_static("::1")),
+            other => HeaderValue::from_str(&other.to_string()).ok(),
+        };
+        if let Some(hv) = hv_opt {
+            req.headers_mut().insert(INTERNAL_PEER_IP_HEADER, hv);
+        }
     }
 
     // Gateway-wide IP/CIDR allowlist (`settings.allowed_cidrs` / `QUIXIGATE_ALLOWED_IPS`).
@@ -244,14 +249,19 @@ pub async fn peer_trust_middleware(
     // Live-configurable request body limit (`settings.max_request_size_mb` / `MAX_REQUEST_SIZE_MB`).
     let max_mb = settings.max_request_size_mb.clamp(1, 512);
     let max_bytes = max_mb.saturating_mul(1024 * 1024);
+    let mut known_bounded_content_length = false;
     if let Some(cl_raw) = req
         .headers()
         .get(header::CONTENT_LENGTH)
         .and_then(|v| v.to_str().ok())
         && let Ok(cl) = cl_raw.trim().parse::<usize>()
-        && cl > max_bytes
     {
-        return payload_too_large_response(max_mb);
+        if cl > max_bytes {
+            return payload_too_large_response(max_mb);
+        }
+        if !req.headers().contains_key(header::TRANSFER_ENCODING) {
+            known_bounded_content_length = true;
+        }
     }
 
     let tcp_peer_trusted = match req.extensions().get::<ConnectInfo<SocketAddr>>() {
@@ -290,15 +300,27 @@ pub async fn peer_trust_middleware(
         );
     }
 
-    // Warm OIDC Discovery / JWKS cache asynchronously before synchronous route handlers run.
-    let query_key_opt = req.uri().query().and_then(|q| {
-        q.split('&').find_map(|kv| {
-            let (k, v) = kv.split_once('=')?;
-            (k == "key").then_some(v)
-        })
-    });
-    if let Some(tok) = extract_api_token(req.headers(), query_key_opt) {
-        state.oidc.warm_for_token_if_needed(&settings, &tok).await;
+    // Warm OIDC Discovery / JWKS cache asynchronously only when OIDC is configured.
+    if crate::oidc::OidcVerifier::is_configured(&settings) {
+        let query_key_opt = req.uri().query().and_then(|q| {
+            q.split('&').find_map(|kv| {
+                let (k, v) = kv.split_once('=')?;
+                (k == "key").then_some(v)
+            })
+        });
+        if let Some(tok) = extract_api_token_str(req.headers(), query_key_opt) {
+            state.oidc.warm_for_token_if_needed(&settings, tok).await;
+        }
+    }
+
+    // Fast path: when `Content-Length <= max_bytes` is already verified (99.9% of HTTP/1.1 & HTTP/2 JSON POSTs),
+    // Hyper natively enforces the exact byte count without wrapping `Body` or allocating `Arc<AtomicBool>`.
+    if known_bounded_content_length {
+        let resp = next.run(req).await;
+        if resp.status() == StatusCode::PAYLOAD_TOO_LARGE {
+            return payload_too_large_response(max_mb);
+        }
+        return resp;
     }
 
     // Enforce byte cap even on chunked transfer-encoded streams without `Content-Length`.
@@ -349,12 +371,7 @@ pub async fn enforce_inference_plane_enabled(
     req: Request,
     next: Next,
 ) -> Response {
-    if state
-        .db
-        .get_settings()
-        .map(|s| s.disable_inference_endpoints)
-        .unwrap_or(false)
-    {
+    if state.db.settings_arc().disable_inference_endpoints {
         return (
             StatusCode::FORBIDDEN,
             Json(json!({
@@ -377,12 +394,7 @@ pub async fn enforce_admin_plane_enabled(
     req: Request,
     next: Next,
 ) -> Response {
-    if state
-        .db
-        .get_settings()
-        .map(|s| s.disable_admin_endpoints)
-        .unwrap_or(false)
-    {
+    if state.db.settings_arc().disable_admin_endpoints {
         return (
             StatusCode::FORBIDDEN,
             Json(json!({
@@ -430,9 +442,14 @@ pub fn is_direct_loopback(state: &AppState, headers: &HeaderMap) -> bool {
     }
 }
 
-/// Extracts raw token candidate from `Authorization: Bearer ...`, `x-quixigate-admin-key`,
-/// `x-litellm-api-key`, Anthropic `x-api-key`, Google `x-goog-api-key`, or Gemini `?key=`.
-pub fn extract_api_token(headers: &HeaderMap, query_key: Option<&str>) -> Option<String> {
+/// Zero-allocation borrowed token extractor across `Authorization: Bearer ...`,
+/// `x-quixigate-admin-key`, `x-litellm-api-key`, `x-api-key`, `x-goog-api-key`, `api-key`, and `?key=`.
+#[inline]
+pub fn extract_api_token_str<'a>(
+    headers: &'a HeaderMap,
+    query_key: Option<&'a str>,
+) -> Option<&'a str> {
+    // Check `Authorization: Bearer ...` first when neither admin header is present (the 99.9% SDK path).
     for hdr_name in ["x-quixigate-admin-key", "x-litellm-api-key"] {
         if let Some(val) = headers.get(hdr_name).and_then(|v| v.to_str().ok()) {
             let trimmed = val.trim();
@@ -442,7 +459,7 @@ pub fn extract_api_token(headers: &HeaderMap, query_key: Option<&str>) -> Option
                 .map(str::trim)
                 .unwrap_or(trimmed);
             if !tok.is_empty() {
-                return Some(tok.to_owned());
+                return Some(tok);
             }
         }
     }
@@ -457,7 +474,7 @@ pub fn extract_api_token(headers: &HeaderMap, query_key: Option<&str>) -> Option
         {
             let tok = rest.trim();
             if !tok.is_empty() {
-                return Some(tok.to_owned());
+                return Some(tok);
             }
         }
     }
@@ -470,17 +487,23 @@ pub fn extract_api_token(headers: &HeaderMap, query_key: Option<&str>) -> Option
         if let Some(val) = headers.get(hdr_name).and_then(|v| v.to_str().ok()) {
             let tok = val.trim();
             if !tok.is_empty() {
-                return Some(tok.to_owned());
+                return Some(tok);
             }
         }
     }
     if let Some(qk) = query_key {
         let tok = qk.trim();
         if !tok.is_empty() {
-            return Some(tok.to_owned());
+            return Some(tok);
         }
     }
     None
+}
+
+/// Extracts raw token candidate from `Authorization: Bearer ...`, `x-quixigate-admin-key`,
+/// `x-litellm-api-key`, Anthropic `x-api-key`, Google `x-goog-api-key`, or Gemini `?key=`.
+pub fn extract_api_token(headers: &HeaderMap, query_key: Option<&str>) -> Option<String> {
+    extract_api_token_str(headers, query_key).map(str::to_owned)
 }
 
 /// Extracts `quixigate_session` cookie value if present.
@@ -688,14 +711,17 @@ pub fn authenticate_inference(
     headers: &HeaderMap,
     query_key: Option<&str>,
 ) -> Result<AuthenticatedPrincipal> {
-    let settings = state.db.get_settings()?;
+    let settings = state.db.settings_arc();
     let direct_loopback = is_direct_loopback(state, headers);
     let explicit_admin_hdr =
         headers.contains_key("x-quixigate-admin-key") || headers.contains_key("x-litellm-api-key");
 
-    if let Some(raw_token) = extract_api_token(headers, query_key) {
-        if state.verify_master_key(&raw_token) {
-            let mut user = state.db.get_user("local")?;
+    if let Some(raw_token) = extract_api_token_str(headers, query_key) {
+        if state.verify_master_key(raw_token) {
+            let mut user = state
+                .db
+                .get_user_fast("local")
+                .ok_or_else(|| QuixigateError::NotFound("user 'local' not found".to_owned()))?;
             user.role = UserRole::Admin;
             return Ok(AuthenticatedPrincipal {
                 user,
@@ -706,12 +732,12 @@ pub fn authenticate_inference(
                 jwt_team_id: None,
             });
         }
-        if quixigate_core::brand::is_virtual_key_token(&raw_token) {
-            let principal = state.db.verify_virtual_key(&raw_token)?;
+        if quixigate_core::brand::is_virtual_key_token(raw_token) {
+            let principal = state.db.verify_virtual_key(raw_token)?;
             return enforce_principal_policies(state, headers, principal);
         }
-        if quixigate_core::brand::is_session_token(&raw_token) {
-            let user = state.db.validate_session(&raw_token)?;
+        if quixigate_core::brand::is_session_token(raw_token) {
+            let user = state.db.validate_session(raw_token)?;
             return enforce_principal_policies(
                 state,
                 headers,
@@ -726,14 +752,14 @@ pub fn authenticate_inference(
             );
         }
         if raw_token.matches('.').count() == 2 {
-            if crate::oidc::peek_asymmetric_jwt_header(&raw_token).is_some()
+            if crate::oidc::peek_asymmetric_jwt_header(raw_token).is_some()
                 && crate::oidc::OidcVerifier::is_configured(&settings)
             {
-                let principal = state.oidc.verify_jwt(state, &settings, &raw_token)?;
+                let principal = state.oidc.verify_jwt(state, &settings, raw_token)?;
                 return enforce_principal_policies(state, headers, principal);
             }
             if let Some(secret) = state.jwt_secret() {
-                let principal = verify_hs256_jwt(state, &raw_token, secret)?;
+                let principal = verify_hs256_jwt(state, raw_token, secret)?;
                 return enforce_principal_policies(state, headers, principal);
             }
         }
@@ -764,7 +790,10 @@ pub fn authenticate_inference(
     }
 
     if !settings.require_auth && direct_loopback {
-        let user = state.db.get_user("local")?;
+        let user = state
+            .db
+            .get_user_fast("local")
+            .ok_or_else(|| QuixigateError::NotFound("user 'local' not found".to_owned()))?;
         return enforce_principal_policies(
             state,
             headers,

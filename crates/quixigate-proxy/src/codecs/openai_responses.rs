@@ -270,8 +270,7 @@ pub async fn handle_responses_post(
     let stream_requested = body["stream"].as_bool().unwrap_or(false);
     let response_id = format!("resp_{}", Uuid::new_v4().simple());
     let created_sec = now_ms() / 1000;
-    let oi = build_openinference_inputs(&req, None);
-    let raw_req = Some(body.to_string());
+    let (oi, raw_req) = prepare_telemetry_capture(&state, &principal, &req, &body, None);
     let started = Instant::now();
 
     state.telemetry.inc_active();

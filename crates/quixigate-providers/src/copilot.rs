@@ -63,7 +63,7 @@ impl GitHubCopilotModel {
             default_headers: HashMap::new(),
             default_body: None,
             upstream_meta: Arc::new(Mutex::new(UpstreamResponseMeta::default())),
-            http: crate::build_inference_http_client(),
+            http: crate::shared_inference_http_client(),
         }
     }
 
@@ -84,7 +84,7 @@ impl GitHubCopilotModel {
             default_headers: HashMap::new(),
             default_body: None,
             upstream_meta: Arc::new(Mutex::new(UpstreamResponseMeta::default())),
-            http: crate::build_inference_http_client(),
+            http: crate::shared_inference_http_client(),
         }
     }
 
@@ -350,6 +350,7 @@ impl LanguageModel for GitHubCopilotModel {
             tool_calls: BTreeMap::new(),
             usage: None,
             stream_cost: None,
+            captured_model: false,
             upstream_meta: self.upstream_meta.clone(),
             ready: VecDeque::new(),
             ended: false,
@@ -359,6 +360,32 @@ impl LanguageModel for GitHubCopilotModel {
             |mut state| async move { state.next().await.map(|item| (item, state)) },
         )))
     }
+}
+
+#[derive(serde::Deserialize)]
+struct FastStreamChunk<'a> {
+    #[serde(borrow, default)]
+    model: Option<std::borrow::Cow<'a, str>>,
+    #[serde(borrow, default)]
+    choices: Vec<FastStreamChoice<'a>>,
+}
+
+#[derive(serde::Deserialize)]
+struct FastStreamChoice<'a> {
+    #[serde(borrow, default)]
+    finish_reason: Option<std::borrow::Cow<'a, str>>,
+    #[serde(borrow, default)]
+    delta: Option<FastStreamDelta<'a>>,
+}
+
+#[derive(serde::Deserialize)]
+struct FastStreamDelta<'a> {
+    #[serde(borrow, default)]
+    content: Option<std::borrow::Cow<'a, str>>,
+    #[serde(borrow, default)]
+    reasoning_content: Option<std::borrow::Cow<'a, str>>,
+    #[serde(borrow, default)]
+    reasoning: Option<std::borrow::Cow<'a, str>>,
 }
 
 #[derive(Default)]
@@ -379,6 +406,7 @@ struct CopilotStreamState {
     tool_calls: BTreeMap<usize, AccToolCall>,
     usage: Option<Usage>,
     stream_cost: Option<NanoUsd>,
+    captured_model: bool,
     upstream_meta: Arc<Mutex<UpstreamResponseMeta>>,
     ready: VecDeque<Result<Vec<LanguageModelStreamChunk>>>,
     ended: bool,
@@ -417,6 +445,44 @@ impl CopilotStreamState {
         }
     }
 
+    #[inline]
+    fn emit_text_or_reasoning_deltas(&mut self, reasoning: Option<&str>, content: Option<&str>) {
+        let mut chunks = Vec::new();
+        if let Some(r) = reasoning.filter(|s| !s.is_empty()) {
+            if !self.reasoning_started {
+                self.reasoning_started = true;
+                chunks.push(LanguageModelStreamChunk::Delta(
+                    LanguageModelStreamChunkType::ReasoningStart,
+                ));
+            }
+            self.acc_reasoning.push_str(r);
+            chunks.push(LanguageModelStreamChunk::Delta(
+                LanguageModelStreamChunkType::ReasoningDelta(r.to_owned()),
+            ));
+        }
+        if let Some(c) = content.filter(|s| !s.is_empty()) {
+            if self.reasoning_started {
+                self.reasoning_started = false;
+                chunks.push(LanguageModelStreamChunk::Delta(
+                    LanguageModelStreamChunkType::ReasoningEnd,
+                ));
+            }
+            if !self.text_started {
+                self.text_started = true;
+                chunks.push(LanguageModelStreamChunk::Delta(
+                    LanguageModelStreamChunkType::TextStart,
+                ));
+            }
+            self.acc_text.push_str(c);
+            chunks.push(LanguageModelStreamChunk::Delta(
+                LanguageModelStreamChunkType::TextDelta(c.to_owned()),
+            ));
+        }
+        if !chunks.is_empty() {
+            self.ready.push_back(Ok(chunks));
+        }
+    }
+
     fn on_event(&mut self, data: &str) {
         if self.ended {
             return;
@@ -426,6 +492,41 @@ impl CopilotStreamState {
             self.ended = true;
             return;
         }
+
+        // Fast zero-DOM path for the 99%+ of SSE chunks carrying plain text/reasoning deltas.
+        let bytes = data.as_bytes();
+        if memchr::memmem::find(bytes, b"\"usage\"").is_none()
+            && memchr::memmem::find(bytes, b"\"tool_calls\"").is_none()
+            && memchr::memmem::find(bytes, b"\"error\"").is_none()
+            && memchr::memmem::find(bytes, b"\"timings\"").is_none()
+            && let Ok(fast) = serde_json::from_str::<FastStreamChunk<'_>>(data)
+        {
+            if !self.captured_model
+                && let Some(m) = fast.model.as_deref().filter(|s| !s.trim().is_empty())
+            {
+                self.captured_model = true;
+                self.upstream_meta.lock().resolved_model = Some(m.to_owned());
+            }
+            if let Some(choice) = fast.choices.first() {
+                if let Some(fr) = choice
+                    .finish_reason
+                    .as_deref()
+                    .filter(|s| !s.trim().is_empty())
+                {
+                    self.upstream_meta.lock().finish_reason = Some(fr.to_owned());
+                }
+                if let Some(delta) = &choice.delta {
+                    let r = delta
+                        .reasoning_content
+                        .as_deref()
+                        .or(delta.reasoning.as_deref());
+                    let c = delta.content.as_deref();
+                    self.emit_text_or_reasoning_deltas(r, c);
+                }
+            }
+            return;
+        }
+
         let Ok(payload) = serde_json::from_str::<Value>(data) else {
             return;
         };
@@ -436,7 +537,10 @@ impl CopilotStreamState {
             self.fail(msg);
             return;
         }
-        if let Some(m) = payload["model"].as_str().filter(|s| !s.trim().is_empty()) {
+        if !self.captured_model
+            && let Some(m) = payload["model"].as_str().filter(|s| !s.trim().is_empty())
+        {
+            self.captured_model = true;
             self.upstream_meta.lock().resolved_model = Some(m.to_owned());
         }
         if let Some(fr) = payload["choices"][0]["finish_reason"]
