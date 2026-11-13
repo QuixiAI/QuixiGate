@@ -1,24 +1,29 @@
 //! `POST /v1beta/models/{*model_action}` — Google Gemini `:generateContent` &
-//! `:streamGenerateContent` codec (native Gemini CLI & `@google/genai` compatibility).
+//! `:streamGenerateContent` codec (native Gemini CLI & `@google/genai` compatibility)
+//! with zero-spawn `BytesMut` streaming state machine (`GeminiTranscodeSseStream`).
 
-use std::convert::Infallible;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use std::time::Instant;
 
 use aisdk::core::language_model::{LanguageModelResponseContentType, ReasoningEffort};
 use aisdk::core::tools::ToolDetails;
 use aisdk::core::{AssistantMessage, Message, ToolCallInfo, ToolResultInfo, UserMessage};
 use axum::Json;
+use axum::body::{Body, Bytes};
 use axum::extract::{Path, Query, State};
-use axum::http::HeaderMap;
-use axum::response::sse::{Event, KeepAlive, Sse};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use futures::StreamExt;
-use quixigate_core::{IngressProtocol, QuixigateError};
-use quixigate_router::{CanonicalRequest, ClientToolSpec, RoutedStreamEvent};
+use bytes::BytesMut;
+use futures::Stream;
+use quixigate_core::{IngressProtocol, NanoUsd, QuixigateError};
+use quixigate_db::{AuthenticatedPrincipal, BudgetGuard, ConcurrencyGuard};
+use quixigate_router::{
+    CanonicalRequest, ClientToolSpec, RoutedStream, RoutedStreamEvent, StreamCompletionSummary,
+};
+use quixigate_telemetry::{OpenInferencePayload, TelemetryHub};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
-use tokio_stream::wrappers::ReceiverStream;
-use uuid::Uuid;
 
 use crate::auth::authenticate_inference;
 use crate::codecs::common::*;
@@ -68,7 +73,7 @@ fn parse_gemini_canonical(
                     let id = fc["id"]
                         .as_str()
                         .map(str::to_owned)
-                        .unwrap_or_else(|| format!("call_{}", Uuid::new_v4().simple()));
+                        .unwrap_or_else(|| TelemetryHub::fast_prefixed_id("call_"));
                     let args = fc.get("args").cloned().unwrap_or_else(|| json!({}));
                     messages.push(Message::Assistant(AssistantMessage::new(
                         LanguageModelResponseContentType::ToolCall(ToolCallInfo {
@@ -207,6 +212,14 @@ pub async fn handle_gemini_model_action(
         ))));
     }
 
+    let settings = state.db.settings_arc();
+    let capture_payloads = principal
+        .virtual_key
+        .as_ref()
+        .and_then(|k| k.log_payloads)
+        .unwrap_or(settings.capture_payloads_default);
+    let need_deep_telemetry = capture_payloads || settings.otlp_enabled;
+
     let req = parse_gemini_canonical(model_name, &body, &headers)?;
     let requested_model = req.requested_model.clone();
     let max_out = u64::from(req.max_output_tokens.unwrap_or(2048));
@@ -228,7 +241,7 @@ pub async fn handle_gemini_model_action(
     let include_thoughts = body["generationConfig"]["thinkingConfig"]["includeThoughts"]
         .as_bool()
         .unwrap_or(false);
-    let request_id = format!("gem_{}", Uuid::new_v4().simple());
+    let request_id = TelemetryHub::fast_prefixed_id("gem_");
     let (oi, raw_req) = prepare_telemetry_capture(&state, &principal, &req, &body, None);
     let started = Instant::now();
 
@@ -283,17 +296,22 @@ pub async fn handle_gemini_model_action(
                     "responseId": request_id
                 });
 
-                let oi_tools = gen_out
-                    .tool_calls
-                    .iter()
-                    .map(|tc| {
-                        (
-                            tc.tool.id.clone(),
-                            tc.tool.name.clone(),
-                            tc.input.to_string(),
-                        )
-                    })
-                    .collect();
+                let raw_resp_str = capture_payloads.then(|| resp_json.to_string());
+                let oi_tools = if need_deep_telemetry {
+                    gen_out
+                        .tool_calls
+                        .iter()
+                        .map(|tc| {
+                            (
+                                tc.tool.id.clone(),
+                                tc.tool.name.clone(),
+                                tc.input.to_string(),
+                            )
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
 
                 finalize_request_accounting(
                     &state,
@@ -319,9 +337,9 @@ pub async fn handle_gemini_model_action(
                     gen_out.api_equiv_nanos,
                     None,
                     raw_req,
-                    Some(resp_json.to_string()),
+                    raw_resp_str,
                     oi,
-                    Some(gen_out.text),
+                    need_deep_telemetry.then_some(gen_out.text),
                     oi_tools,
                 );
 
@@ -358,8 +376,8 @@ pub async fn handle_gemini_model_action(
                     0,
                     0,
                     0,
-                    quixigate_core::NanoUsd::ZERO,
-                    quixigate_core::NanoUsd::ZERO,
+                    NanoUsd::ZERO,
+                    NanoUsd::ZERO,
                     Some(err.to_string()),
                     raw_req,
                     None,
@@ -396,8 +414,8 @@ pub async fn handle_gemini_model_action(
                     0,
                     0,
                     0,
-                    quixigate_core::NanoUsd::ZERO,
-                    quixigate_core::NanoUsd::ZERO,
+                    NanoUsd::ZERO,
+                    NanoUsd::ZERO,
                     Some(err.to_string()),
                     raw_req,
                     None,
@@ -409,111 +427,242 @@ pub async fn handle_gemini_model_action(
             }
         };
 
-        let resolved_model = routed.resolved_model.clone();
-        let provider_id = routed.provider_id.clone();
+        let resolved_hdr = routed.resolved_model.clone();
+        let provider_hdr = routed.provider_id.clone();
         let cache_hit = routed.cache_hit;
         let hdr_req_id = request_id.clone();
-        let (tx, rx) = tokio::sync::mpsc::channel::<std::result::Result<Event, Infallible>>(64);
-        let state_bg = state.clone();
 
-        tokio::spawn(async move {
-            let _conc = conc_guard;
-            let mut events = routed.events;
-            let mut completed_summary = None;
-            let mut stream_err = None;
+        let sse_stream = GeminiTranscodeSseStream::new(
+            routed,
+            state,
+            principal,
+            conc_guard,
+            budget_guard,
+            request_id,
+            requested_model,
+            started,
+            need_deep_telemetry,
+            raw_req,
+            oi,
+        );
 
-            while let Some(ev) = events.next().await {
-                match ev {
-                    RoutedStreamEvent::ReasoningDelta(delta) => {
-                        if delta.is_empty() {
-                            continue;
-                        }
-                        let chunk = json!({
-                            "candidates": [{
-                                "content": {
-                                    "role": "model",
-                                    "parts": [{ "text": delta, "thought": true }]
-                                },
-                                "index": 0
-                            }],
-                            "modelVersion": resolved_model
-                        });
-                        let _ = tx.send(Ok(Event::default().data(chunk.to_string()))).await;
+        let mut resp = Response::new(Body::from_stream(sse_stream));
+        *resp.status_mut() = StatusCode::OK;
+        let hdrs = resp.headers_mut();
+        hdrs.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/event-stream"),
+        );
+        hdrs.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+        attach_gateway_headers(
+            hdrs,
+            &hdr_req_id,
+            &provider_hdr,
+            &resolved_hdr,
+            cache_hit,
+            NanoUsd::ZERO,
+            NanoUsd::ZERO,
+        );
+        Ok(resp)
+    }
+}
+
+// ── Zero-Spawn `GeminiTranscodeSseStream` ────────────────────────────────────
+
+const TRANSCODE_BATCH_CAP: usize = 32 * 1024;
+
+struct GeminiTranscodeSseStream {
+    events: Pin<Box<dyn Stream<Item = RoutedStreamEvent> + Send>>,
+    state: AppState,
+    principal: AuthenticatedPrincipal,
+    conc_guard: Option<ConcurrencyGuard>,
+    budget_guard: Option<BudgetGuard>,
+    request_id: String,
+    requested_model: String,
+    resolved_model: String,
+    provider_id: String,
+    credential_id: Option<String>,
+    fallback_attempts: u32,
+    cache_hit: bool,
+    started: Instant,
+    need_deep_telemetry: bool,
+    raw_req: Option<String>,
+    oi: Option<OpenInferencePayload>,
+    text_suffix: Bytes,
+    thought_suffix: Bytes,
+    buf: BytesMut,
+    completed_summary: Option<StreamCompletionSummary>,
+    stream_err: Option<String>,
+    eof: bool,
+}
+
+impl GeminiTranscodeSseStream {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        routed: RoutedStream,
+        state: AppState,
+        principal: AuthenticatedPrincipal,
+        conc_guard: ConcurrencyGuard,
+        budget_guard: BudgetGuard,
+        request_id: String,
+        requested_model: String,
+        started: Instant,
+        need_deep_telemetry: bool,
+        raw_req: Option<String>,
+        oi: OpenInferencePayload,
+    ) -> Self {
+        let mut ts = BytesMut::with_capacity(64 + routed.resolved_model.len());
+        ts.extend_from_slice(b"}]},\"index\":0}],\"modelVersion\":");
+        put_json_escaped_str(&mut ts, &routed.resolved_model);
+        ts.extend_from_slice(b"}\n\n");
+        let text_suffix = ts.freeze();
+
+        let mut ths = BytesMut::with_capacity(80 + routed.resolved_model.len());
+        ths.extend_from_slice(b",\"thought\":true}]},\"index\":0}],\"modelVersion\":");
+        put_json_escaped_str(&mut ths, &routed.resolved_model);
+        ths.extend_from_slice(b"}\n\n");
+        let thought_suffix = ths.freeze();
+
+        Self {
+            events: routed.events,
+            state,
+            principal,
+            conc_guard: Some(conc_guard),
+            budget_guard: Some(budget_guard),
+            request_id,
+            requested_model,
+            resolved_model: routed.resolved_model,
+            provider_id: routed.provider_id,
+            credential_id: routed.credential_id,
+            fallback_attempts: routed.fallback_attempts,
+            cache_hit: routed.cache_hit,
+            started,
+            need_deep_telemetry,
+            raw_req,
+            oi: Some(oi),
+            text_suffix,
+            thought_suffix,
+            buf: BytesMut::with_capacity(1024),
+            completed_summary: None,
+            stream_err: None,
+            eof: false,
+        }
+    }
+
+    fn encode_event(&mut self, ev: RoutedStreamEvent) {
+        match ev {
+            RoutedStreamEvent::ReasoningDelta(delta) => {
+                if delta.is_empty() {
+                    return;
+                }
+                self.buf.extend_from_slice(
+                    b"data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":",
+                );
+                put_json_escaped_str(&mut self.buf, &delta);
+                self.buf.extend_from_slice(&self.thought_suffix);
+            }
+            RoutedStreamEvent::TextDelta(delta) => {
+                if delta.is_empty() {
+                    return;
+                }
+                self.buf.extend_from_slice(
+                    b"data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"text\":",
+                );
+                put_json_escaped_str(&mut self.buf, &delta);
+                self.buf.extend_from_slice(&self.text_suffix);
+            }
+            RoutedStreamEvent::ToolCallReady(tc) => {
+                self.buf.extend_from_slice(
+                    b"data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[{\"functionCall\":{\"id\":",
+                );
+                put_json_escaped_str(&mut self.buf, &tc.tool.id);
+                self.buf.extend_from_slice(b",\"name\":");
+                put_json_escaped_str(&mut self.buf, &tc.tool.name);
+                self.buf.extend_from_slice(b",\"args\":");
+                put_json_value(&mut self.buf, &tc.input);
+                self.buf
+                    .extend_from_slice(b"}}]},\"index\":0}],\"modelVersion\":");
+                put_json_escaped_str(&mut self.buf, &self.resolved_model);
+                self.buf.extend_from_slice(b"}\n\n");
+            }
+            RoutedStreamEvent::Finish(sum) => {
+                self.buf.extend_from_slice(
+                    b"data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\":[]},\"finishReason\":\"STOP\",\"index\":0}],\"usageMetadata\":{\"promptTokenCount\":",
+                );
+                put_u64_dec(&mut self.buf, sum.input_tokens);
+                self.buf.extend_from_slice(b",\"cachedContentTokenCount\":");
+                put_u64_dec(&mut self.buf, sum.cached_input_tokens);
+                self.buf.extend_from_slice(b",\"candidatesTokenCount\":");
+                put_u64_dec(&mut self.buf, sum.output_tokens);
+                self.buf.extend_from_slice(b",\"thoughtsTokenCount\":");
+                put_u64_dec(&mut self.buf, sum.reasoning_tokens);
+                self.buf.extend_from_slice(b",\"totalTokenCount\":");
+                put_u64_dec(&mut self.buf, sum.input_tokens + sum.output_tokens);
+                self.buf.extend_from_slice(b"},\"modelVersion\":");
+                put_json_escaped_str(&mut self.buf, &sum.resolved_model);
+                self.buf.extend_from_slice(b"}\n\n");
+                self.completed_summary = Some(sum);
+                self.eof = true;
+            }
+            RoutedStreamEvent::Error(err_msg) => {
+                self.stream_err = Some(err_msg);
+                self.eof = true;
+            }
+            _ => {}
+        }
+    }
+}
+
+impl Stream for GeminiTranscodeSseStream {
+    type Item = std::result::Result<Bytes, std::io::Error>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        loop {
+            if this.eof {
+                if !this.buf.is_empty() {
+                    return Poll::Ready(Some(Ok(this.buf.split().freeze())));
+                }
+                return Poll::Ready(None);
+            }
+            match this.events.as_mut().poll_next(cx) {
+                Poll::Ready(Some(ev)) => {
+                    this.encode_event(ev);
+                    if this.buf.len() >= TRANSCODE_BATCH_CAP {
+                        return Poll::Ready(Some(Ok(this.buf.split().freeze())));
                     }
-                    RoutedStreamEvent::TextDelta(delta) => {
-                        if delta.is_empty() {
-                            continue;
-                        }
-                        let chunk = json!({
-                            "candidates": [{
-                                "content": {
-                                    "role": "model",
-                                    "parts": [{ "text": delta }]
-                                },
-                                "index": 0
-                            }],
-                            "modelVersion": resolved_model
-                        });
-                        if tx
-                            .send(Ok(Event::default().data(chunk.to_string())))
-                            .await
-                            .is_err()
-                        {
-                            break;
-                        }
+                }
+                Poll::Ready(None) => {
+                    this.eof = true;
+                    if !this.buf.is_empty() {
+                        return Poll::Ready(Some(Ok(this.buf.split().freeze())));
                     }
-                    RoutedStreamEvent::ToolCallReady(tc) => {
-                        let chunk = json!({
-                            "candidates": [{
-                                "content": {
-                                    "role": "model",
-                                    "parts": [{
-                                        "functionCall": {
-                                            "id": tc.tool.id,
-                                            "name": tc.tool.name,
-                                            "args": tc.input
-                                        }
-                                    }]
-                                },
-                                "index": 0
-                            }],
-                            "modelVersion": resolved_model
-                        });
-                        let _ = tx.send(Ok(Event::default().data(chunk.to_string()))).await;
+                    return Poll::Ready(None);
+                }
+                Poll::Pending => {
+                    if !this.buf.is_empty() {
+                        return Poll::Ready(Some(Ok(this.buf.split().freeze())));
                     }
-                    RoutedStreamEvent::Finish(sum) => {
-                        let final_chunk = json!({
-                            "candidates": [{
-                                "content": { "role": "model", "parts": [] },
-                                "finishReason": "STOP",
-                                "index": 0
-                            }],
-                            "usageMetadata": {
-                                "promptTokenCount": sum.input_tokens,
-                                "cachedContentTokenCount": sum.cached_input_tokens,
-                                "candidatesTokenCount": sum.output_tokens,
-                                "thoughtsTokenCount": sum.reasoning_tokens,
-                                "totalTokenCount": sum.input_tokens + sum.output_tokens
-                            },
-                            "modelVersion": sum.resolved_model
-                        });
-                        let _ = tx
-                            .send(Ok(Event::default().data(final_chunk.to_string())))
-                            .await;
-                        completed_summary = Some(sum);
-                    }
-                    RoutedStreamEvent::Error(err_msg) => {
-                        stream_err = Some(err_msg);
-                        break;
-                    }
-                    _ => {}
+                    return Poll::Pending;
                 }
             }
+        }
+    }
+}
 
-            state_bg.telemetry.dec_active();
-            if let Some(sum) = completed_summary {
-                let oi_tools = sum
-                    .tool_calls
+impl Drop for GeminiTranscodeSseStream {
+    fn drop(&mut self) {
+        self.state.telemetry.dec_active();
+        drop(self.conc_guard.take());
+        let Some(budget_guard) = self.budget_guard.take() else {
+            return;
+        };
+        let oi = self.oi.take().unwrap_or_default();
+        let raw_req = self.raw_req.take();
+
+        if let Some(sum) = self.completed_summary.take() {
+            let oi_tools = if self.need_deep_telemetry {
+                sum.tool_calls
                     .iter()
                     .map(|tc| {
                         (
@@ -522,81 +671,69 @@ pub async fn handle_gemini_model_action(
                             tc.input.to_string(),
                         )
                     })
-                    .collect();
-                finalize_request_accounting(
-                    &state_bg,
-                    &principal,
-                    budget_guard,
-                    request_id,
-                    IngressProtocol::Gemini,
-                    requested_model,
-                    sum.resolved_model,
-                    sum.provider_id,
-                    sum.credential_id,
-                    200,
-                    true,
-                    sum.fallback_attempts,
-                    cache_hit,
-                    sum.ttft_ms,
-                    sum.duration_ms,
-                    sum.input_tokens,
-                    sum.cached_input_tokens,
-                    sum.reasoning_tokens,
-                    sum.output_tokens,
-                    sum.cost_nanos,
-                    sum.api_equiv_nanos,
-                    None,
-                    raw_req,
-                    None,
-                    oi,
-                    Some(sum.text),
-                    oi_tools,
-                );
+                    .collect()
             } else {
-                finalize_request_accounting(
-                    &state_bg,
-                    &principal,
-                    budget_guard,
-                    request_id,
-                    IngressProtocol::Gemini,
-                    requested_model,
-                    resolved_model,
-                    provider_id,
-                    routed.credential_id,
-                    if stream_err.is_some() { 502 } else { 200 },
-                    true,
-                    routed.fallback_attempts,
-                    cache_hit,
-                    None,
-                    started.elapsed().as_millis() as u64,
-                    0,
-                    0,
-                    0,
-                    0,
-                    quixigate_core::NanoUsd::ZERO,
-                    quixigate_core::NanoUsd::ZERO,
-                    stream_err,
-                    raw_req,
-                    None,
-                    oi,
-                    None,
-                    Vec::new(),
-                );
-            }
-        });
-
-        let mut resp = Sse::new(ReceiverStream::new(rx))
-            .keep_alive(KeepAlive::default())
-            .into_response();
-        attach_gateway_headers(
-            resp.headers_mut(),
-            &hdr_req_id,
-            &routed.provider_id,
-            &routed.resolved_model,
-            cache_hit,
-            quixigate_core::NanoUsd::ZERO,
-            quixigate_core::NanoUsd::ZERO,
-        );
-        Ok(resp)
+                Vec::new()
+            };
+            finalize_request_accounting(
+                &self.state,
+                &self.principal,
+                budget_guard,
+                std::mem::take(&mut self.request_id),
+                IngressProtocol::Gemini,
+                std::mem::take(&mut self.requested_model),
+                sum.resolved_model,
+                sum.provider_id,
+                sum.credential_id,
+                200,
+                true,
+                sum.fallback_attempts,
+                self.cache_hit,
+                sum.ttft_ms,
+                sum.duration_ms,
+                sum.input_tokens,
+                sum.cached_input_tokens,
+                sum.reasoning_tokens,
+                sum.output_tokens,
+                sum.cost_nanos,
+                sum.api_equiv_nanos,
+                None,
+                raw_req,
+                None,
+                oi,
+                self.need_deep_telemetry.then_some(sum.text),
+                oi_tools,
+            );
+        } else {
+            finalize_request_accounting(
+                &self.state,
+                &self.principal,
+                budget_guard,
+                std::mem::take(&mut self.request_id),
+                IngressProtocol::Gemini,
+                std::mem::take(&mut self.requested_model),
+                std::mem::take(&mut self.resolved_model),
+                std::mem::take(&mut self.provider_id),
+                self.credential_id.take(),
+                if self.stream_err.is_some() { 502 } else { 200 },
+                true,
+                self.fallback_attempts,
+                self.cache_hit,
+                None,
+                self.started.elapsed().as_millis() as u64,
+                0,
+                0,
+                0,
+                0,
+                NanoUsd::ZERO,
+                NanoUsd::ZERO,
+                self.stream_err.take(),
+                raw_req,
+                None,
+                oi,
+                None,
+                Vec::new(),
+            );
+        }
     }
 }

@@ -15,7 +15,9 @@ pub mod openapi;
 pub mod server;
 pub mod state;
 
-pub use server::{resolve_worker_count, serve_sharded_per_core};
+pub use server::{
+    bind_reuseport_or_standard_listener, resolve_worker_count, serve_sharded_per_core,
+};
 
 use axum::Json;
 use axum::Router;
@@ -38,6 +40,18 @@ struct EmbeddedUiAssets;
 /// - API root & OpenAPI 3.1 docs (`/`, `/docs`, `/openapi.json`, `/api/admin/openapi.json`)
 /// - Optional `/ui` convenience SPA (only when compiled with `feature = "ui"` AND `state.is_ui_enabled()`)
 pub fn build_router(state: AppState) -> Router {
+    let peer_state = state.clone();
+    build_router_without_peer_trust(state).layer(auth::PeerTrustLayer::new(peer_state))
+}
+
+/// Builds the concrete per-worker service stack (`PeerTrustService<Router>`) without wrapping the
+/// outermost layer in `axum`'s `BoxCloneSyncService`, saving a heap-boxed future per HTTP request.
+pub(crate) fn build_worker_service(state: AppState) -> auth::PeerTrustService<Router> {
+    let peer_state = state.clone();
+    auth::PeerTrustService::new(build_router_without_peer_trust(state), peer_state)
+}
+
+fn build_router_without_peer_trust(state: AppState) -> Router {
     let inference_cors = CorsLayer::new()
         .allow_origin(Any)
         .allow_methods(Any)
@@ -94,10 +108,7 @@ pub fn build_router(state: AppState) -> Router {
         )
         .merge(litellm_inference::router())
         .method_not_allowed_fallback(litellm_unsupported::method_not_allowed_handler)
-        .layer(axum::middleware::from_fn_with_state(
-            state.clone(),
-            auth::enforce_inference_plane_enabled,
-        ))
+        .layer(auth::InferenceGateLayer::new(state.clone()))
         .layer(inference_cors);
 
     let admin_routes = Router::new()
@@ -314,12 +325,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/ui/", get(serve_ui_index))
         .route("/ui/{*path}", get(serve_ui_subpath))
         .method_not_allowed_fallback(litellm_unsupported::method_not_allowed_handler)
-        .layer(axum::middleware::from_fn_with_state(
-            state.clone(),
-            auth::enforce_admin_plane_enabled,
-        ));
-
-    let peer_state = state.clone();
+        .layer(auth::AdminGateLayer::new(state.clone()));
 
     Router::new()
         .route("/", get(openapi::handle_api_root))
@@ -342,10 +348,6 @@ pub fn build_router(state: AppState) -> Router {
         .fallback(litellm_unsupported::fallback_handler)
         .layer(DefaultBodyLimit::max(512 * 1024 * 1024))
         .with_state(state)
-        .layer(axum::middleware::from_fn_with_state(
-            peer_state,
-            auth::peer_trust_middleware,
-        ))
 }
 
 async fn handle_robots_txt(State(state): State<AppState>) -> Response {

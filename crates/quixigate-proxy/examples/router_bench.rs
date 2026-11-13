@@ -8,6 +8,9 @@
 //!   Suite 4: Pure Streaming Bit-Shuffling Ceiling (10,000 tokens/stream, c=64, 128 streams total)
 //!            -> amortizes per-request SQLite setup to isolate pure per-token CPU & memory cost!
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -46,6 +49,7 @@ struct MockUpstreamState {
     chat_10k_batches: Arc<Vec<Bytes>>,
     resp_1_tok: Bytes,
     resp_300_batches: Arc<Vec<Bytes>>,
+    anth_300_batches: Arc<Vec<Bytes>>,
 }
 
 fn detect_mode(body: &[u8]) -> u32 {
@@ -160,6 +164,43 @@ fn build_responses_batches(total_tokens: usize, tokens_per_chunk: usize) -> Vec<
     batches
 }
 
+fn build_anthropic_batches(total_tokens: usize, tokens_per_chunk: usize) -> Vec<Bytes> {
+    let start_ev = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_b1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-sonnet-4-5\",\"content\":[],\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":16,\"output_tokens\":1}}}\n\nevent: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n";
+    let tok_ev = "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\" token\"}}\n\n";
+    let end_ev = format!(
+        "event: content_block_stop\ndata: {{\"type\":\"content_block_stop\",\"index\":0}}\n\nevent: message_delta\ndata: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"end_turn\",\"stop_sequence\":null}},\"usage\":{{\"output_tokens\":{total_tokens}}}}}\n\nevent: message_stop\ndata: {{\"type\":\"message_stop\"}}\n\n"
+    );
+    let num_batches = total_tokens / tokens_per_chunk;
+    let mut batches = Vec::with_capacity(num_batches);
+    for b in 0..num_batches {
+        let mut buf = BytesMut::with_capacity(tok_ev.len() * (tokens_per_chunk + 2));
+        if b == 0 {
+            buf.extend_from_slice(start_ev.as_bytes());
+        }
+        for _ in 0..tokens_per_chunk {
+            buf.extend_from_slice(tok_ev.as_bytes());
+        }
+        if b + 1 == num_batches {
+            buf.extend_from_slice(end_ev.as_bytes());
+        }
+        batches.push(buf.freeze());
+    }
+    batches
+}
+
+async fn mock_anthropic_messages(State(st): State<MockUpstreamState>) -> Response {
+    let frames = st.anth_300_batches.clone();
+    let stream = futures::stream::iter(
+        (0..frames.len()).map(move |i| Ok::<Bytes, Infallible>(frames[i].clone())),
+    );
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "text/event-stream")],
+        Body::from_stream(stream),
+    )
+        .into_response()
+}
+
 async fn spawn_mock_upstream() -> SocketAddr {
     let single_chat = concat!(
         "data: {\"id\":\"chatcmpl-b\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"gpt-4o-mini\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\n",
@@ -178,6 +219,7 @@ async fn spawn_mock_upstream() -> SocketAddr {
         chat_10k_batches: Arc::new(build_chat_batches(10_000, 25)),
         resp_1_tok: Bytes::from_static(single_resp.as_bytes()),
         resp_300_batches: Arc::new(build_responses_batches(300, 10)),
+        anth_300_batches: Arc::new(build_anthropic_batches(300, 10)),
     };
 
     let app = Router::new()
@@ -185,6 +227,8 @@ async fn spawn_mock_upstream() -> SocketAddr {
         .route("/v1/chat/completions", post(mock_chat_completions))
         .route("/responses", post(mock_openai_responses))
         .route("/v1/responses", post(mock_openai_responses))
+        .route("/messages", post(mock_anthropic_messages))
+        .route("/v1/messages", post(mock_anthropic_messages))
         .with_state(state);
 
     let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
@@ -285,21 +329,34 @@ async fn spawn_quixigate_instance(upstream_addr: SocketAddr, provider_id: &str) 
     settings.require_auth = true;
     db.update_settings(&settings).unwrap();
 
-    let base_url = if provider_id == "openai" {
-        format!("http://{upstream_addr}")
-    } else {
-        format!("http://{upstream_addr}/v1")
+    let base_url = match provider_id {
+        "openai" | "anthropic-token" | "openai-codex" => format!("http://{upstream_addr}"),
+        _ => format!("http://{upstream_addr}/v1"),
     };
 
-    let (auth_kind, secret) = if provider_id == "ollama" {
-        (AuthKind::LocalNoauth, CredentialSecret::LocalNoauth)
-    } else {
-        (
+    let (auth_kind, secret) = match provider_id {
+        "ollama" => (AuthKind::LocalNoauth, CredentialSecret::LocalNoauth),
+        "anthropic-token" => (
+            AuthKind::SetupToken,
+            CredentialSecret::AnthropicSetupToken {
+                token: "sk-ant-oat01-bench-token".to_owned(),
+            },
+        ),
+        "openai-codex" => (
+            AuthKind::Oauth,
+            CredentialSecret::Codex {
+                access: "eyJhbGciOiJIUzI1NiJ9.e30.bench".to_owned(),
+                refresh: "rt-bench".to_owned(),
+                expires_ms: 4_102_444_800_000,
+                account_id: "acct_bench".to_owned(),
+            },
+        ),
+        _ => (
             AuthKind::ApiKey,
             CredentialSecret::ApiKey {
                 key: "sk-bench-upstream".to_owned(),
             },
-        )
+        ),
     };
 
     db.upsert_credential(
@@ -409,7 +466,11 @@ struct BenchResult {
 fn count_sse_token_events(buf: &[u8]) -> u64 {
     let mut data_json_frames = 0u64;
     for line in buf.split(|&b| b == b'\n') {
-        if line.starts_with(b"data: {") && line.windows(10).any(|w| w == b"\"content\":") {
+        if line.starts_with(b"data: {")
+            && (memchr::memmem::find(line, b"\"content\":").is_some()
+                || memchr::memmem::find(line, b"response.output_text.delta").is_some()
+                || memchr::memmem::find(line, b"\"text_delta\"").is_some())
+        {
             data_json_frames += 1;
         }
     }
@@ -424,17 +485,38 @@ async fn run_load(
     concurrency: usize,
     total_requests: usize,
 ) -> BenchResult {
+    let body = format!(
+        "{{\"model\":\"gpt-4o-mini\",\"stream\":true,\"messages\":[{{\"role\":\"user\",\"content\":\"{prompt_tag} benchmark prompt\"}}]}}"
+    );
+    run_load_endpoint(
+        label,
+        target_addr,
+        "/v1/chat/completions",
+        bearer_token,
+        Bytes::from(body),
+        concurrency,
+        total_requests,
+    )
+    .await
+}
+
+async fn run_load_endpoint(
+    label: &str,
+    target_addr: SocketAddr,
+    endpoint_path: &str,
+    bearer_token: &str,
+    body_bytes: Bytes,
+    concurrency: usize,
+    total_requests: usize,
+) -> BenchResult {
     let client = reqwest::Client::builder()
         .tcp_nodelay(true)
         .pool_max_idle_per_host(concurrency * 2)
         .build()
         .unwrap();
 
-    let url = format!("http://{target_addr}/v1/chat/completions");
+    let url = format!("http://{target_addr}{endpoint_path}");
     let auth_val = format!("Bearer {bearer_token}");
-    let body_bytes = Bytes::from(format!(
-        "{{\"model\":\"gpt-4o-mini\",\"stream\":true,\"messages\":[{{\"role\":\"user\",\"content\":\"{prompt_tag} benchmark prompt\"}}]}}"
-    ));
 
     for _ in 0..8 {
         if let Ok(resp) = client
@@ -509,7 +591,7 @@ async fn run_load(
                             }
                             bytes += chunk.len() as u64;
                             line_rem.extend_from_slice(&chunk);
-                            if let Some(last_nl) = line_rem.iter().rposition(|&b| b == b'\n') {
+                            if let Some(last_nl) = memchr::memrchr(b'\n', &line_rem) {
                                 req_tokens += count_sse_token_events(&line_rem[..=last_nl]);
                                 line_rem.drain(..=last_nl);
                             }
@@ -770,5 +852,66 @@ async fn main() {
     print_table(
         "SUITE 4 — PURE BIT-SHUFFLING CEILING (10,000 tokens/stream, c=64 — Isolates Per-Token Pipeline)",
         &[zc_10k, qg_or_10k],
+    );
+
+    // Suite 5: Polyglot Ingress Codecs (`/v1/responses` & Anthropic `/v1/messages`, 300 tok/stream, c=64)
+    let qg_codex = spawn_quixigate_instance(upstream_addr, "openai-codex").await;
+    let qg_anth = spawn_quixigate_instance(upstream_addr, "anthropic-token").await;
+    let resp_codex_body = Bytes::from_static(
+        b"{\"model\":\"openai-codex/gpt-5-codex\",\"stream\":true,\"input\":\"BENCH_300 codex prompt\"}",
+    );
+    let resp_or_body = Bytes::from_static(
+        b"{\"model\":\"gpt-4o-mini\",\"stream\":true,\"input\":\"BENCH_300 responses transcode\"}",
+    );
+    let anth_native_body = Bytes::from_static(
+        b"{\"model\":\"claude-sonnet-4-5\",\"max_tokens\":1024,\"stream\":true,\"messages\":[{\"role\":\"user\",\"content\":\"BENCH_300 claude prompt\"}]}",
+    );
+    let anth_or_body = Bytes::from_static(
+        b"{\"model\":\"gpt-4o-mini\",\"max_tokens\":1024,\"stream\":true,\"messages\":[{\"role\":\"user\",\"content\":\"BENCH_300 claude transcode\"}]}",
+    );
+
+    let r_codex = run_load_endpoint(
+        "1. /v1/responses -> Codex Native (c=64)",
+        qg_codex.addr,
+        "/v1/responses",
+        &qg_codex.virtual_key,
+        resp_codex_body,
+        c1,
+        3_000,
+    )
+    .await;
+    let r_or = run_load_endpoint(
+        "2. /v1/responses -> OpenRouter (c=64)",
+        qg_openrouter.addr,
+        "/v1/responses",
+        &qg_openrouter.virtual_key,
+        resp_or_body,
+        c1,
+        3_000,
+    )
+    .await;
+    let a_native = run_load_endpoint(
+        "3. /v1/messages -> Anthropic Native (c=64)",
+        qg_anth.addr,
+        "/v1/messages",
+        &qg_anth.virtual_key,
+        anth_native_body,
+        c1,
+        3_000,
+    )
+    .await;
+    let a_or = run_load_endpoint(
+        "4. /v1/messages -> OpenRouter (c=64)",
+        qg_openrouter.addr,
+        "/v1/messages",
+        &qg_openrouter.virtual_key,
+        anth_or_body,
+        c1,
+        3_000,
+    )
+    .await;
+    print_table(
+        "SUITE 5 — POLYGLOT INGRESS STREAMING (/v1/responses & Anthropic /v1/messages, 300 tokens/stream, c=64)",
+        &[r_codex, r_or, a_native, a_or],
     );
 }

@@ -7,7 +7,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -225,8 +225,11 @@ impl CachedCredential {
     }
 }
 
+static NEXT_SNAPSHOT_GENERATION: AtomicU64 = AtomicU64::new(1);
+
 #[derive(Default)]
 pub struct ControlSnapshot {
+    pub generation: u64,
     pub settings: Arc<GatewaySettings>,
     pub users_by_id: HashMap<String, Arc<CachedUser>>,
     pub users_by_username: HashMap<String, Arc<CachedUser>>,
@@ -940,6 +943,7 @@ pub fn build_control_snapshot_locked(
     }
 
     Ok(ControlSnapshot {
+        generation: NEXT_SNAPSHOT_GENERATION.fetch_add(1, Ordering::Relaxed),
         settings: Arc::new(settings),
         users_by_id,
         users_by_username,

@@ -17,7 +17,6 @@ use prost::Message as ProstMessage;
 use quixigate_core::{
     GatewaySettings, IngressProtocol, OtlpProtocol, QuixigateError, RequestLog, Result, now_ms,
 };
-use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::sync::broadcast;
@@ -46,13 +45,77 @@ pub struct TestSpanResult {
     pub message: String,
 }
 
+const HEX_LOWER: &[u8; 16] = b"0123456789abcdef";
+
+#[inline]
+fn write_u64_hex16(out: &mut [u8; 16], val: u64) {
+    let bytes = val.to_be_bytes();
+    for (i, &b) in bytes.iter().enumerate() {
+        out[i * 2] = HEX_LOWER[(b >> 4) as usize];
+        out[i * 2 + 1] = HEX_LOWER[(b & 0x0f) as usize];
+    }
+}
+
+#[derive(Default)]
+struct ModelStatusCounters {
+    status_200: AtomicU64,
+    other_statuses: DashMap<u16, AtomicU64>,
+}
+
+impl ModelStatusCounters {
+    #[inline]
+    fn inc(&self, status_code: u16) {
+        if status_code == 200 {
+            self.status_200.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        if let Some(c) = self.other_statuses.get(&status_code) {
+            c.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        self.other_statuses
+            .entry(status_code)
+            .or_insert_with(|| AtomicU64::new(0))
+            .fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[derive(Default)]
+struct ProviderMetrics {
+    input_tokens: AtomicU64,
+    output_tokens: AtomicU64,
+    cached_tokens: AtomicU64,
+    models: DashMap<String, ModelStatusCounters>,
+}
+
+impl ProviderMetrics {
+    #[inline]
+    fn record(
+        &self,
+        resolved_model: &str,
+        status_code: u16,
+        in_tok: u64,
+        out_tok: u64,
+        cached_tok: u64,
+    ) {
+        self.input_tokens.fetch_add(in_tok, Ordering::Relaxed);
+        self.output_tokens.fetch_add(out_tok, Ordering::Relaxed);
+        self.cached_tokens.fetch_add(cached_tok, Ordering::Relaxed);
+        if let Some(m) = self.models.get(resolved_model) {
+            m.inc(status_code);
+            return;
+        }
+        self.models
+            .entry(resolved_model.to_owned())
+            .or_default()
+            .inc(status_code);
+    }
+}
+
 #[derive(Default)]
 struct MetricsRegistry {
     active_requests: AtomicI64,
-    requests_by_key: DashMap<(String, String, u16), AtomicU64>,
-    input_tokens_by_provider: DashMap<String, AtomicU64>,
-    output_tokens_by_provider: DashMap<String, AtomicU64>,
-    cached_tokens_by_provider: DashMap<String, AtomicU64>,
+    by_provider: DashMap<String, ProviderMetrics>,
     cache_hits_total: AtomicU64,
     spend_nanos_total: AtomicI64,
     savings_nanos_total: AtomicI64,
@@ -102,23 +165,46 @@ impl TelemetryHub {
         self.metrics.active_requests.fetch_sub(1, Ordering::Relaxed);
     }
 
+    #[inline]
+    pub fn fast_trace_id_hex() -> String {
+        let hi = fastrand::u64(..);
+        let lo = fastrand::u64(..).max(1);
+        let mut buf = [0u8; 32];
+        let (left, right) = buf.split_at_mut(16);
+        write_u64_hex16(left.try_into().unwrap(), hi);
+        write_u64_hex16(right.try_into().unwrap(), lo);
+        std::str::from_utf8(&buf).unwrap().to_owned()
+    }
+
+    #[inline]
+    pub fn fast_prefixed_id(prefix: &str) -> String {
+        let hi = fastrand::u64(..);
+        let lo = fastrand::u64(..).max(1);
+        let mut hex_buf = [0u8; 32];
+        let (left, right) = hex_buf.split_at_mut(16);
+        write_u64_hex16(left.try_into().unwrap(), hi);
+        write_u64_hex16(right.try_into().unwrap(), lo);
+        let mut out = String::with_capacity(prefix.len() + 24);
+        out.push_str(prefix);
+        out.push_str(std::str::from_utf8(&hex_buf[..24]).unwrap());
+        out
+    }
+
     pub fn generate_trace_id() -> ([u8; 16], String) {
+        let hi = fastrand::u64(..);
+        let lo = fastrand::u64(..).max(1);
         let mut bytes = [0u8; 16];
-        rand::thread_rng().fill_bytes(&mut bytes);
-        if bytes.iter().all(|&b| b == 0) {
-            bytes[15] = 1;
-        }
-        let hex_str = hex::encode(bytes);
-        (bytes, hex_str)
+        bytes[..8].copy_from_slice(&hi.to_be_bytes());
+        bytes[8..].copy_from_slice(&lo.to_be_bytes());
+        let mut hex_buf = [0u8; 32];
+        let (left, right) = hex_buf.split_at_mut(16);
+        write_u64_hex16(left.try_into().unwrap(), hi);
+        write_u64_hex16(right.try_into().unwrap(), lo);
+        (bytes, std::str::from_utf8(&hex_buf).unwrap().to_owned())
     }
 
     fn generate_span_id() -> [u8; 8] {
-        let mut bytes = [0u8; 8];
-        rand::thread_rng().fill_bytes(&mut bytes);
-        if bytes.iter().all(|&b| b == 0) {
-            bytes[7] = 1;
-        }
-        bytes
+        fastrand::u64(..).max(1).to_be_bytes()
     }
 
     /// Updates Prometheus counters, broadcasts to SSE trace inspector, and asynchronously
@@ -130,34 +216,28 @@ impl TelemetryHub {
         capture_payloads: bool,
         oi: Option<OpenInferencePayload>,
     ) {
-        // 1. Update lock-free Prometheus counters
-        self.metrics
-            .requests_by_key
-            .entry((
-                log.provider_id.clone(),
-                log.resolved_model.clone(),
+        // 1. Update lock-free Prometheus counters (read-locked fast path: 0 String clones!)
+        if let Some(prov) = self.metrics.by_provider.get(log.provider_id.as_str()) {
+            prov.record(
+                &log.resolved_model,
                 log.status_code,
-            ))
-            .or_insert_with(|| AtomicU64::new(0))
-            .fetch_add(1, Ordering::Relaxed);
-
-        self.metrics
-            .input_tokens_by_provider
-            .entry(log.provider_id.clone())
-            .or_insert_with(|| AtomicU64::new(0))
-            .fetch_add(log.input_tokens, Ordering::Relaxed);
-
-        self.metrics
-            .output_tokens_by_provider
-            .entry(log.provider_id.clone())
-            .or_insert_with(|| AtomicU64::new(0))
-            .fetch_add(log.output_tokens, Ordering::Relaxed);
-
-        self.metrics
-            .cached_tokens_by_provider
-            .entry(log.provider_id.clone())
-            .or_insert_with(|| AtomicU64::new(0))
-            .fetch_add(log.cached_input_tokens, Ordering::Relaxed);
+                log.input_tokens,
+                log.output_tokens,
+                log.cached_input_tokens,
+            );
+        } else {
+            self.metrics
+                .by_provider
+                .entry(log.provider_id.clone())
+                .or_default()
+                .record(
+                    &log.resolved_model,
+                    log.status_code,
+                    log.input_tokens,
+                    log.output_tokens,
+                    log.cached_input_tokens,
+                );
+        }
 
         if log.cache_hit {
             self.metrics
@@ -185,8 +265,10 @@ impl TelemetryHub {
             .fetch_add(log.duration_ms, Ordering::Relaxed);
         self.metrics.duration_count.fetch_add(1, Ordering::Relaxed);
 
-        // 2. Broadcast to live SSE subscribers
-        let _ = self.trace_tx.send(log.clone());
+        // 2. Broadcast to live SSE subscribers ONLY when at least one UI / SSE subscriber is listening
+        if self.trace_tx.receiver_count() > 0 {
+            let _ = self.trace_tx.send(log.clone());
+        }
 
         // 3. Export OTLP OpenInference span asynchronously if enabled
         if settings.otlp_enabled && !settings.otlp_endpoint.trim().is_empty() {
@@ -330,45 +412,49 @@ impl TelemetryHub {
             out,
             "# HELP quixigate_requests_total Total gateway requests by provider, model, and HTTP status.\n# TYPE quixigate_requests_total counter"
         );
-        for item in self.metrics.requests_by_key.iter() {
-            let (prov, model, status) = item.key();
-            let count = item.value().load(Ordering::Relaxed);
-            let _ = writeln!(
-                out,
-                "quixigate_requests_total{{provider=\"{}\",model=\"{}\",status=\"{}\"}} {}",
-                escape_prom(prov),
-                escape_prom(model),
-                status,
-                count
-            );
+        for prov_entry in self.metrics.by_provider.iter() {
+            let prov = escape_prom(prov_entry.key());
+            for model_entry in prov_entry.value().models.iter() {
+                let model = escape_prom(model_entry.key());
+                let c200 = model_entry.value().status_200.load(Ordering::Relaxed);
+                if c200 > 0 {
+                    let _ = writeln!(
+                        out,
+                        "quixigate_requests_total{{provider=\"{prov}\",model=\"{model}\",status=\"200\"}} {c200}"
+                    );
+                }
+                for st_entry in model_entry.value().other_statuses.iter() {
+                    let status = *st_entry.key();
+                    let count = st_entry.value().load(Ordering::Relaxed);
+                    let _ = writeln!(
+                        out,
+                        "quixigate_requests_total{{provider=\"{prov}\",model=\"{model}\",status=\"{status}\"}} {count}"
+                    );
+                }
+            }
         }
 
         let _ = writeln!(
             out,
             "# HELP quixigate_tokens_total Total tokens processed by provider and direction.\n# TYPE quixigate_tokens_total counter"
         );
-        for item in self.metrics.input_tokens_by_provider.iter() {
+        for prov_entry in self.metrics.by_provider.iter() {
+            let prov = escape_prom(prov_entry.key());
+            let v = prov_entry.value();
             let _ = writeln!(
                 out,
-                "quixigate_tokens_total{{provider=\"{}\",kind=\"input\"}} {}",
-                escape_prom(item.key()),
-                item.value().load(Ordering::Relaxed)
+                "quixigate_tokens_total{{provider=\"{prov}\",kind=\"input\"}} {}",
+                v.input_tokens.load(Ordering::Relaxed)
             );
-        }
-        for item in self.metrics.output_tokens_by_provider.iter() {
             let _ = writeln!(
                 out,
-                "quixigate_tokens_total{{provider=\"{}\",kind=\"output\"}} {}",
-                escape_prom(item.key()),
-                item.value().load(Ordering::Relaxed)
+                "quixigate_tokens_total{{provider=\"{prov}\",kind=\"output\"}} {}",
+                v.output_tokens.load(Ordering::Relaxed)
             );
-        }
-        for item in self.metrics.cached_tokens_by_provider.iter() {
             let _ = writeln!(
                 out,
-                "quixigate_tokens_total{{provider=\"{}\",kind=\"cached_input\"}} {}",
-                escape_prom(item.key()),
-                item.value().load(Ordering::Relaxed)
+                "quixigate_tokens_total{{provider=\"{prov}\",kind=\"cached_input\"}} {}",
+                v.cached_tokens.load(Ordering::Relaxed)
             );
         }
         out

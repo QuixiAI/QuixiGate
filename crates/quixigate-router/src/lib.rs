@@ -9,8 +9,10 @@ pub mod pool;
 pub mod tools;
 
 pub use cut_through::{
-    CutThroughActiveStream, CutThroughJsonOutcome, CutThroughJsonResult, CutThroughStreamOutcome,
-    FlybyUsage, PreparedCutThroughPlan, parse_flyby_sse_usage, splice_openai_chat_request,
+    CachedModelPlan, CutThroughActiveStream, CutThroughJsonOutcome, CutThroughJsonResult,
+    CutThroughStreamOutcome, CutThroughWireFormat, FlybyUsage, PreparedCutThroughPlan,
+    parse_flyby_anthropic_usage, parse_flyby_responses_usage, parse_flyby_sse_usage,
+    splice_anthropic_messages_request, splice_codex_responses_request, splice_openai_chat_request,
 };
 
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -191,6 +193,7 @@ pub struct GatewayRouter {
     inference_pool: quixigate_providers::ShardedHttpPool,
     catalog: ModelCatalog,
     pool: Arc<PoolSelector>,
+    plan_cache: Arc<dashmap::DashMap<String, Arc<CachedModelPlan>>>,
     cache: ResponseCache,
     local_scanner: LocalRuntimeScanner,
     web_search_engine: Arc<tools::WebSearchEngine>,
@@ -225,6 +228,7 @@ impl GatewayRouter {
             ),
             catalog,
             pool: Arc::new(PoolSelector::new()),
+            plan_cache: Arc::new(dashmap::DashMap::new()),
             cache,
             local_scanner,
             web_search_engine,
@@ -550,15 +554,9 @@ impl GatewayRouter {
             });
         }
 
-        let creds = self.db.list_credentials()?;
-        let candidates = self.pool.resolve_candidates(
-            &spec,
-            route.as_deref(),
-            &creds,
-            &self.catalog,
-            &self.local_scanner,
-            settings,
-        );
+        let cached_plan = self.resolve_cached_model_plan(&req.requested_model, &snap)?;
+        let creds = &cached_plan.creds;
+        let candidates = &cached_plan.candidates;
         if candidates.is_empty() {
             return Err(QuixigateError::NoAvailableRoute(
                 req.requested_model.clone(),
@@ -679,7 +677,7 @@ impl GatewayRouter {
                     });
                 }
                 Err(sdk_err) => {
-                    last_err = Some(self.handle_candidate_error(cand, &creds, &sdk_err));
+                    last_err = Some(self.handle_candidate_error(cand, creds, &sdk_err));
                 }
             }
         }
@@ -789,15 +787,9 @@ impl GatewayRouter {
             });
         }
 
-        let creds = self.db.list_credentials()?;
-        let candidates = self.pool.resolve_candidates(
-            &spec,
-            route.as_deref(),
-            &creds,
-            &self.catalog,
-            &self.local_scanner,
-            settings,
-        );
+        let cached_plan = self.resolve_cached_model_plan(&req.requested_model, &snap)?;
+        let creds = &cached_plan.creds;
+        let candidates = &cached_plan.candidates;
         if candidates.is_empty() {
             return Err(QuixigateError::NoAvailableRoute(
                 req.requested_model.clone(),
@@ -833,6 +825,41 @@ impl GatewayRouter {
                     let fallback_attempts = attempt_idx as u32;
                     let resolved_model = cand.upstream_model.clone();
                     let provider_id = cand.provider_id.clone();
+
+                    if cand_server_tools.is_empty() && cache_key.is_none() {
+                        let fast = FastStreamDriver {
+                            router: self.clone(),
+                            model,
+                            stream: Some(first_stream),
+                            requested_model: req.requested_model.clone(),
+                            resolved_model: resolved_model.clone(),
+                            provider_id: provider_id.clone(),
+                            credential_id: cred_id.clone(),
+                            auth_kind,
+                            route: route.clone(),
+                            started,
+                            ttft_ms: None,
+                            fallback_attempts,
+                            acc_text: String::new(),
+                            acc_reasoning: String::new(),
+                            client_tool_calls: Vec::new(),
+                            input_tokens: 0,
+                            cached_input_tokens: 0,
+                            reasoning_tokens: 0,
+                            output_tokens: 0,
+                            ready: VecDeque::new(),
+                            finished: false,
+                        };
+                        return Ok(RoutedStream {
+                            resolved_model,
+                            provider_id,
+                            credential_id: cred_id,
+                            auth_kind,
+                            fallback_attempts,
+                            cache_hit: false,
+                            events: Box::pin(fast),
+                        });
+                    }
 
                     let driver = StreamDriver {
                         router: self.clone(),
@@ -882,7 +909,7 @@ impl GatewayRouter {
                     });
                 }
                 Err(sdk_err) => {
-                    last_err = Some(self.handle_candidate_error(cand, &creds, &sdk_err));
+                    last_err = Some(self.handle_candidate_error(cand, creds, &sdk_err));
                 }
             }
         }
@@ -1710,6 +1737,235 @@ impl StreamDriver {
                 duration_ms,
                 fallback_attempts: self.fallback_attempts,
             }));
+    }
+}
+
+/// Zero-`unfold` synchronous `Stream` driver for the >99% of streaming requests that do not run
+/// multi-step server-side `:online`/MCP tools or write to the exact response cache.
+struct FastStreamDriver {
+    router: GatewayRouter,
+    model: AnyLanguageModel,
+    stream: Option<ProviderStream>,
+    requested_model: String,
+    resolved_model: String,
+    provider_id: String,
+    credential_id: Option<String>,
+    auth_kind: AuthKind,
+    route: Option<Arc<ModelRoute>>,
+    started: Instant,
+    ttft_ms: Option<u64>,
+    fallback_attempts: u32,
+    acc_text: String,
+    acc_reasoning: String,
+    client_tool_calls: Vec<ToolCallInfo>,
+    input_tokens: u64,
+    cached_input_tokens: u64,
+    reasoning_tokens: u64,
+    output_tokens: u64,
+    ready: VecDeque<RoutedStreamEvent>,
+    finished: bool,
+}
+
+impl FastStreamDriver {
+    #[inline]
+    fn record_ttft(&mut self) {
+        if self.ttft_ms.is_none() {
+            self.ttft_ms = Some(self.started.elapsed().as_millis() as u64);
+        }
+    }
+
+    fn process_chunk(&mut self, chunk: LanguageModelStreamChunk) {
+        match chunk {
+            LanguageModelStreamChunk::Delta(delta) => match delta {
+                LanguageModelStreamChunkType::TextStart => {
+                    self.record_ttft();
+                    self.ready.push_back(RoutedStreamEvent::TextStart);
+                }
+                LanguageModelStreamChunkType::TextDelta(t) => {
+                    self.record_ttft();
+                    self.acc_text.push_str(&t);
+                    self.ready.push_back(RoutedStreamEvent::TextDelta(t));
+                }
+                LanguageModelStreamChunkType::TextEnd => {
+                    self.ready.push_back(RoutedStreamEvent::TextEnd);
+                }
+                LanguageModelStreamChunkType::ReasoningStart => {
+                    self.record_ttft();
+                    self.ready.push_back(RoutedStreamEvent::ReasoningStart);
+                }
+                LanguageModelStreamChunkType::ReasoningDelta(r) => {
+                    self.record_ttft();
+                    self.acc_reasoning.push_str(&r);
+                    self.ready.push_back(RoutedStreamEvent::ReasoningDelta(r));
+                }
+                LanguageModelStreamChunkType::ReasoningEnd => {
+                    self.ready.push_back(RoutedStreamEvent::ReasoningEnd);
+                }
+                LanguageModelStreamChunkType::ToolCallStart(details) => {
+                    self.record_ttft();
+                    self.ready.push_back(RoutedStreamEvent::ToolCallStart {
+                        id: details.id,
+                        name: details.name,
+                    });
+                }
+                LanguageModelStreamChunkType::ToolCallDelta { id, delta } => {
+                    self.record_ttft();
+                    self.ready
+                        .push_back(RoutedStreamEvent::ToolCallDelta { id, delta });
+                }
+                LanguageModelStreamChunkType::Failed(why) => {
+                    self.ready.push_back(RoutedStreamEvent::Error(why));
+                }
+                LanguageModelStreamChunkType::Incomplete(why) => {
+                    self.ready
+                        .push_back(RoutedStreamEvent::Error(format!("incomplete: {why}")));
+                }
+                _ => {}
+            },
+            LanguageModelStreamChunk::Done(msg) => {
+                if let Some(u) = &msg.usage {
+                    add_usage(
+                        u,
+                        &mut self.input_tokens,
+                        &mut self.cached_input_tokens,
+                        &mut self.reasoning_tokens,
+                        &mut self.output_tokens,
+                    );
+                }
+                match msg.content {
+                    LanguageModelResponseContentType::Text(t) => {
+                        if self.acc_text.is_empty() && !t.is_empty() {
+                            self.record_ttft();
+                            self.acc_text = t.clone();
+                            self.ready.push_back(RoutedStreamEvent::TextStart);
+                            self.ready.push_back(RoutedStreamEvent::TextDelta(t));
+                            self.ready.push_back(RoutedStreamEvent::TextEnd);
+                        }
+                    }
+                    LanguageModelResponseContentType::Reasoning { content, .. } => {
+                        if self.acc_reasoning.is_empty() && !content.is_empty() {
+                            self.acc_reasoning = content;
+                        }
+                    }
+                    LanguageModelResponseContentType::ToolCall(tc) => {
+                        self.ready
+                            .push_back(RoutedStreamEvent::ToolCallReady(tc.clone()));
+                        self.client_tool_calls.push(tc);
+                    }
+                    LanguageModelResponseContentType::NotSupported(_) => {}
+                }
+            }
+        }
+    }
+
+    fn finish_sync(&mut self) {
+        self.finished = true;
+        let duration_ms = self.started.elapsed().as_millis() as u64;
+        if self.output_tokens == 0 && !self.acc_text.is_empty() {
+            self.output_tokens = (self.acc_text.len() as u64).div_ceil(4).max(1);
+        }
+        if self.auth_kind == AuthKind::LocalNoauth
+            || matches!(
+                self.provider_id.as_str(),
+                "ollama" | "lmstudio" | "llamacpp" | "vllm" | "mlx"
+            )
+        {
+            let tps = (duration_ms > 0)
+                .then(|| (self.output_tokens as f64) / (duration_ms as f64 / 1000.0));
+            self.router
+                .local_scanner
+                .record_performance(&self.provider_id, self.ttft_ms, tps);
+        }
+
+        let meta = self.model.upstream_meta();
+        if let Some(concrete) = meta.resolved_model.filter(|m| !m.trim().is_empty()) {
+            self.resolved_model = concrete;
+        }
+
+        let (computed_cost, computed_equiv) = self.router.catalog.compute_cost(
+            &self.provider_id,
+            self.auth_kind,
+            &self.resolved_model,
+            self.input_tokens,
+            self.cached_input_tokens,
+            self.output_tokens,
+            self.route.as_deref(),
+        );
+        let (cost_nanos, api_equiv_nanos) = match meta.exact_cost_nanos {
+            Some(exact) => (
+                exact,
+                if exact.is_zero() {
+                    computed_equiv
+                } else {
+                    exact
+                },
+            ),
+            None => (computed_cost, computed_equiv),
+        };
+
+        self.ready
+            .push_back(RoutedStreamEvent::Finish(StreamCompletionSummary {
+                requested_model: std::mem::take(&mut self.requested_model),
+                resolved_model: std::mem::take(&mut self.resolved_model),
+                provider_id: std::mem::take(&mut self.provider_id),
+                credential_id: self.credential_id.take(),
+                auth_kind: self.auth_kind,
+                text: std::mem::take(&mut self.acc_text),
+                reasoning: (!self.acc_reasoning.is_empty())
+                    .then(|| std::mem::take(&mut self.acc_reasoning)),
+                tool_calls: std::mem::take(&mut self.client_tool_calls),
+                finish_reason: meta.finish_reason,
+                input_tokens: self.input_tokens,
+                cached_input_tokens: self.cached_input_tokens,
+                reasoning_tokens: self.reasoning_tokens,
+                output_tokens: self.output_tokens,
+                cost_nanos,
+                api_equiv_nanos,
+                ttft_ms: self.ttft_ms,
+                duration_ms,
+                fallback_attempts: self.fallback_attempts,
+            }));
+    }
+}
+
+impl Stream for FastStreamDriver {
+    type Item = RoutedStreamEvent;
+
+    fn poll_next(
+        self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        loop {
+            if let Some(ev) = this.ready.pop_front() {
+                return std::task::Poll::Ready(Some(ev));
+            }
+            if this.finished {
+                return std::task::Poll::Ready(None);
+            }
+            let Some(stream) = this.stream.as_mut() else {
+                this.finish_sync();
+                continue;
+            };
+            match stream.as_mut().poll_next(cx) {
+                std::task::Poll::Ready(Some(Ok(chunks))) => {
+                    for chunk in chunks {
+                        this.process_chunk(chunk);
+                    }
+                }
+                std::task::Poll::Ready(Some(Err(err))) => {
+                    this.ready
+                        .push_back(RoutedStreamEvent::Error(err.to_string()));
+                    this.stream = None;
+                    this.finish_sync();
+                }
+                std::task::Poll::Ready(None) => {
+                    this.stream = None;
+                    this.finish_sync();
+                }
+                std::task::Poll::Pending => return std::task::Poll::Pending,
+            }
+        }
     }
 }
 

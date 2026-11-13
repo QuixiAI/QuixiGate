@@ -1,5 +1,8 @@
 //! `quixigate` — Pure-Rust AI Gateway CLI & Embedded Single-Binary Server.
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[cfg(feature = "demo")]
 mod demo_upstreams;
 
@@ -597,9 +600,13 @@ async fn cmd_serve(
         }
     }
 
-    let listener = TcpListener::bind((host, port))
-        .await
-        .with_context(|| format!("failed to bind {host}:{port}"))?;
+    let listener = match format!("{host}:{port}").parse::<SocketAddr>() {
+        Ok(sock_addr) => quixigate_proxy::bind_reuseport_or_standard_listener(sock_addr)
+            .with_context(|| format!("failed to bind {host}:{port}"))?,
+        Err(_) => TcpListener::bind((host, port))
+            .await
+            .with_context(|| format!("failed to bind {host}:{port}"))?,
+    };
     let local_addr: SocketAddr = listener.local_addr()?;
     let bound_loopback = local_addr.ip().is_loopback();
     let (master_key, master_key_generated) = resolve_master_key(master_key_arg);

@@ -423,7 +423,10 @@ impl CopilotStreamState {
             }
             match self.response.chunk().await {
                 Ok(Some(bytes)) => match self.decoder.push(&bytes) {
-                    Ok(events) => events.iter().for_each(|d| self.on_event(d)),
+                    Ok(events) => {
+                        events.iter().for_each(|d| self.on_event(d));
+                        self.coalesce_ready_ok();
+                    }
                     Err(sse::FrameTooLarge) => {
                         self.fail("Chat completions backend sent oversized SSE frame")
                     }
@@ -436,12 +439,33 @@ impl CopilotStreamState {
                         self.finish_stream();
                         self.ended = true;
                     }
+                    self.coalesce_ready_ok();
                 }
                 Err(err) => {
                     let (_, why) = crate::describe_reqwest_error(&err);
                     self.fail(&format!("Chat completions stream error: {why}"));
                 }
             }
+        }
+    }
+
+    #[inline]
+    fn coalesce_ready_ok(&mut self) {
+        if self.ready.len() <= 1 || self.ready.iter().any(std::result::Result::is_err) {
+            return;
+        }
+        let total_chunks: usize = self
+            .ready
+            .iter()
+            .filter_map(|r| r.as_ref().ok())
+            .map(Vec::len)
+            .sum();
+        let mut merged = Vec::with_capacity(total_chunks);
+        while let Some(Ok(mut v)) = self.ready.pop_front() {
+            merged.append(&mut v);
+        }
+        if !merged.is_empty() {
+            self.ready.push_back(Ok(merged));
         }
     }
 

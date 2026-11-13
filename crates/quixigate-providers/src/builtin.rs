@@ -465,6 +465,26 @@ pub fn instantiate_model(req: ModelBuildRequest) -> Result<AnyLanguageModel> {
         ) => Err(QuixigateError::Validation(
             "Consumer subscription OAuth seats are disabled in this build (compiled without `subscription-oauth` feature)".to_owned(),
         )),
+        #[cfg(feature = "subscription-oauth")]
+        ("anthropic", secret_opt) => {
+            let key = secret_opt.and_then(|s| match s {
+                CredentialSecret::ApiKey { key } => Some(key),
+                _ => None,
+            });
+            let mut m = AnthropicOAuthModel::api_key(&req.model_name, key)
+                .with_http(http)
+                .with_tools(req.tools);
+            if let Some(u) = base_override {
+                m = m.with_base_url(u);
+            }
+            if let Some(hdrs) = req.headers {
+                m = m.with_default_headers(hdrs);
+            }
+            if let Some(body) = req.body {
+                m = m.with_default_body(body);
+            }
+            Ok(AnyLanguageModel::new(m))
+        }
         ("openrouter", secret_opt)
         | (_, secret_opt @ Some(CredentialSecret::OpenRouterOidc { .. })) => {
             let url = base_override.unwrap_or("https://openrouter.ai/api/v1");

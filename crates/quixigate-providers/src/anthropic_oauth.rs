@@ -1,7 +1,8 @@
 //! Custom `aisdk::core::LanguageModel` for Anthropic Setup-Token OAuth
 //! (`sk-ant-oat01-...`) and full-fidelity Anthropic `/v1/messages` streaming.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::borrow::Cow;
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fmt;
 
 use aisdk::core::capabilities::{
@@ -29,8 +30,11 @@ const ANTHROPIC_OAUTH_BETA: &str = "oauth-2025-04-20";
 pub struct AnthropicOAuthModel {
     model: String,
     token: String,
+    use_x_api_key: bool,
     base_url: String,
     tools: Vec<Tool>,
+    default_headers: Option<HashMap<String, String>>,
+    default_body: Option<Value>,
     http: reqwest::Client,
 }
 
@@ -39,8 +43,25 @@ impl AnthropicOAuthModel {
         Self {
             model: model.into(),
             token: token.into(),
+            use_x_api_key: false,
             base_url: DEFAULT_ANTHROPIC_BASE_URL.to_owned(),
             tools: Vec::new(),
+            default_headers: None,
+            default_body: None,
+            http: crate::shared_inference_http_client(),
+        }
+    }
+
+    /// Constructs a warm-pooled Anthropic `/v1/messages` client authenticating via `x-api-key`.
+    pub fn api_key(model: impl Into<String>, api_key: Option<String>) -> Self {
+        Self {
+            model: model.into(),
+            token: api_key.unwrap_or_default(),
+            use_x_api_key: true,
+            base_url: DEFAULT_ANTHROPIC_BASE_URL.to_owned(),
+            tools: Vec::new(),
+            default_headers: None,
+            default_body: None,
             http: crate::shared_inference_http_client(),
         }
     }
@@ -63,9 +84,21 @@ impl AnthropicOAuthModel {
         self
     }
 
-    fn messages_url(&self) -> String {
-        let trimmed = self.base_url.trim_end_matches('/');
-        if trimmed.ends_with("/v1/messages") {
+    pub fn with_default_headers(mut self, headers: HashMap<String, String>) -> Self {
+        if !headers.is_empty() {
+            self.default_headers = Some(headers);
+        }
+        self
+    }
+
+    pub fn with_default_body(mut self, body: Value) -> Self {
+        self.default_body = Some(body);
+        self
+    }
+
+    pub fn resolve_messages_url(base_url: &str) -> String {
+        let trimmed = base_url.trim_end_matches('/');
+        if trimmed.ends_with("/v1/messages") || trimmed.ends_with("/messages") {
             trimmed.to_owned()
         } else if trimmed.ends_with("/v1") {
             format!("{trimmed}/messages")
@@ -74,22 +107,43 @@ impl AnthropicOAuthModel {
         }
     }
 
+    fn messages_url(&self) -> String {
+        Self::resolve_messages_url(&self.base_url)
+    }
+
     async fn send(
         &self,
         options: &LanguageModelOptions,
         stream: bool,
     ) -> Result<reqwest::Response> {
-        let body = build_anthropic_body(&self.model, options, &self.tools, stream);
+        let mut body = build_anthropic_body(&self.model, options, &self.tools, stream);
+        if let (Some(Value::Object(extra)), Some(obj)) = (&self.default_body, body.as_object_mut())
+        {
+            for (k, v) in extra {
+                obj.entry(k.clone()).or_insert_with(|| v.clone());
+            }
+        }
         let mut req = self
             .http
             .post(self.messages_url())
-            .bearer_auth(&self.token)
             .header("anthropic-version", ANTHROPIC_VERSION)
-            .header("anthropic-beta", ANTHROPIC_OAUTH_BETA)
             .header("Content-Type", "application/json");
+
+        if self.use_x_api_key {
+            if !self.token.trim().is_empty() {
+                req = req.header("x-api-key", &self.token);
+            }
+        } else {
+            req = req
+                .bearer_auth(&self.token)
+                .header("anthropic-beta", ANTHROPIC_OAUTH_BETA);
+        }
 
         if stream {
             req = req.header("Accept", "text/event-stream");
+        }
+        for (k, v) in self.default_headers.iter().flatten() {
+            req = req.header(k, v);
         }
         for (k, v) in options.headers.iter().flatten() {
             req = req.header(k, v);
@@ -247,6 +301,28 @@ enum AnthropicAccBlock {
     },
 }
 
+#[derive(serde::Deserialize)]
+struct FastAnthropicDeltaEvent<'a> {
+    #[serde(borrow, rename = "type", default)]
+    event_type: Option<Cow<'a, str>>,
+    #[serde(default)]
+    index: usize,
+    #[serde(borrow, default)]
+    delta: Option<FastAnthropicDelta<'a>>,
+}
+
+#[derive(serde::Deserialize)]
+struct FastAnthropicDelta<'a> {
+    #[serde(borrow, rename = "type", default)]
+    delta_type: Option<Cow<'a, str>>,
+    #[serde(borrow, default)]
+    text: Option<Cow<'a, str>>,
+    #[serde(borrow, default)]
+    thinking: Option<Cow<'a, str>>,
+    #[serde(borrow, default)]
+    partial_json: Option<Cow<'a, str>>,
+}
+
 struct AnthropicStreamState {
     response: reqwest::Response,
     decoder: SseDecoder,
@@ -270,7 +346,10 @@ impl AnthropicStreamState {
             }
             match self.response.chunk().await {
                 Ok(Some(bytes)) => match self.decoder.push_frames(&bytes) {
-                    Ok(frames) => frames.into_iter().for_each(|f| self.on_frame(f)),
+                    Ok(frames) => {
+                        frames.into_iter().for_each(|f| self.on_frame(f));
+                        self.coalesce_ready_ok();
+                    }
                     Err(sse::FrameTooLarge) => {
                         self.fail("Anthropic backend sent oversized SSE frame")
                     }
@@ -282,6 +361,7 @@ impl AnthropicStreamState {
                     if !self.finished && !self.blocks.is_empty() {
                         self.emit_done();
                     }
+                    self.coalesce_ready_ok();
                     self.ended = true;
                 }
                 Err(err) => {
@@ -292,10 +372,73 @@ impl AnthropicStreamState {
         }
     }
 
+    #[inline]
+    fn coalesce_ready_ok(&mut self) {
+        if self.ready.len() <= 1 || self.ready.iter().any(std::result::Result::is_err) {
+            return;
+        }
+        let total_chunks: usize = self
+            .ready
+            .iter()
+            .filter_map(|r| r.as_ref().ok())
+            .map(Vec::len)
+            .sum();
+        let mut merged = Vec::with_capacity(total_chunks);
+        while let Some(Ok(mut v)) = self.ready.pop_front() {
+            merged.append(&mut v);
+        }
+        if !merged.is_empty() {
+            self.ready.push_back(Ok(merged));
+        }
+    }
+
     fn on_frame(&mut self, frame: SseFrame) {
         if self.ended || frame.data == "[DONE]" {
             return;
         }
+        // Fast zero-DOM path for `content_block_delta` (99%+ of Anthropic SSE frames).
+        if (frame.event.as_deref() == Some("content_block_delta")
+            || memchr::memmem::find(frame.data.as_bytes(), b"\"content_block_delta\"").is_some())
+            && let Ok(fast) = serde_json::from_str::<FastAnthropicDeltaEvent<'_>>(&frame.data)
+            && fast.event_type.as_deref().or(frame.event.as_deref()) == Some("content_block_delta")
+            && let Some(delta) = fast.delta
+        {
+            let Some(block) = self.blocks.get_mut(&fast.index) else {
+                return;
+            };
+            match (block, delta.delta_type.as_deref().unwrap_or_default()) {
+                (AnthropicAccBlock::Text(buf), "text_delta") => {
+                    let d = delta.text.unwrap_or_default().into_owned();
+                    buf.push_str(&d);
+                    self.ready
+                        .push_back(Ok(vec![LanguageModelStreamChunk::Delta(
+                            LanguageModelStreamChunkType::TextDelta(d),
+                        )]));
+                }
+                (AnthropicAccBlock::Thinking(buf), "thinking_delta") => {
+                    let d = delta.thinking.unwrap_or_default().into_owned();
+                    buf.push_str(&d);
+                    self.ready
+                        .push_back(Ok(vec![LanguageModelStreamChunk::Delta(
+                            LanguageModelStreamChunkType::ReasoningDelta(d),
+                        )]));
+                }
+                (AnthropicAccBlock::ToolUse { id, json_buf, .. }, "input_json_delta") => {
+                    let d = delta.partial_json.unwrap_or_default().into_owned();
+                    json_buf.push_str(&d);
+                    self.ready
+                        .push_back(Ok(vec![LanguageModelStreamChunk::Delta(
+                            LanguageModelStreamChunkType::ToolCallDelta {
+                                id: id.clone(),
+                                delta: d,
+                            },
+                        )]));
+                }
+                _ => {}
+            }
+            return;
+        }
+
         let Ok(payload) = serde_json::from_str::<Value>(&frame.data) else {
             return;
         };

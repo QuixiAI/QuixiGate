@@ -209,6 +209,14 @@ impl LanguageModel for ChatGptCodexModel {
     }
 }
 
+#[derive(serde::Deserialize)]
+struct FastCodexDeltaEvent<'a> {
+    #[serde(borrow, rename = "type", default)]
+    event_type: Option<std::borrow::Cow<'a, str>>,
+    #[serde(borrow, default)]
+    delta: Option<std::borrow::Cow<'a, str>>,
+}
+
 struct CodexStreamState {
     response: reqwest::Response,
     decoder: SseDecoder,
@@ -228,7 +236,10 @@ impl CodexStreamState {
             }
             match self.response.chunk().await {
                 Ok(Some(bytes)) => match self.decoder.push(&bytes) {
-                    Ok(events) => events.iter().for_each(|data| self.on_event(data)),
+                    Ok(events) => {
+                        events.iter().for_each(|data| self.on_event(data));
+                        self.coalesce_ready_ok();
+                    }
                     Err(sse::FrameTooLarge) => {
                         self.fail("ChatGPT Codex backend sent an oversized SSE frame")
                     }
@@ -240,6 +251,7 @@ impl CodexStreamState {
                     if !self.mapper.finished {
                         self.fail("ChatGPT Codex stream closed before response.completed");
                     }
+                    self.coalesce_ready_ok();
                     self.ended = true;
                 }
                 Err(err) => {
@@ -250,9 +262,57 @@ impl CodexStreamState {
         }
     }
 
+    #[inline]
+    fn coalesce_ready_ok(&mut self) {
+        if self.ready.len() <= 1 || self.ready.iter().any(std::result::Result::is_err) {
+            return;
+        }
+        let total_chunks: usize = self
+            .ready
+            .iter()
+            .filter_map(|r| r.as_ref().ok())
+            .map(Vec::len)
+            .sum();
+        let mut merged = Vec::with_capacity(total_chunks);
+        while let Some(Ok(mut v)) = self.ready.pop_front() {
+            merged.append(&mut v);
+        }
+        if !merged.is_empty() {
+            self.ready.push_back(Ok(merged));
+        }
+    }
+
     fn on_event(&mut self, data: &str) {
         if self.ended || data == "[DONE]" {
             return;
+        }
+        // Fast zero-DOM path for text/reasoning deltas (99%+ of Codex `/responses` SSE events).
+        let bytes = data.as_bytes();
+        if (memchr::memmem::find(bytes, b"\"response.output_text.delta\"").is_some()
+            || memchr::memmem::find(bytes, b"\"response.reasoning_summary_text.delta\"").is_some())
+            && let Ok(fast) = serde_json::from_str::<FastCodexDeltaEvent<'_>>(data)
+        {
+            match fast.event_type.as_deref() {
+                Some("response.output_text.delta") => {
+                    let d = fast.delta.unwrap_or_default().into_owned();
+                    self.mapper.accumulated_text.push_str(&d);
+                    self.ready
+                        .push_back(Ok(vec![LanguageModelStreamChunk::Delta(
+                            LanguageModelStreamChunkType::TextDelta(d),
+                        )]));
+                    return;
+                }
+                Some("response.reasoning_summary_text.delta") => {
+                    let d = fast.delta.unwrap_or_default().into_owned();
+                    self.mapper.accumulated_reasoning.push_str(&d);
+                    self.ready
+                        .push_back(Ok(vec![LanguageModelStreamChunk::Delta(
+                            LanguageModelStreamChunkType::ReasoningDelta(d),
+                        )]));
+                    return;
+                }
+                _ => {}
+            }
         }
         if let Ok(event) = serde_json::from_str::<Value>(data) {
             let chunks = self.mapper.map(&event);
@@ -416,7 +476,7 @@ fn sanitize_format_name(title: &str) -> String {
     }
 }
 
-fn extract_residency(jwt: &str) -> Option<String> {
+pub fn extract_residency(jwt: &str) -> Option<String> {
     let payload_seg = jwt.split('.').nth(1)?;
     let bytes = URL_SAFE_NO_PAD.decode(payload_seg).ok()?;
     let val: Value = serde_json::from_slice(&bytes).ok()?;

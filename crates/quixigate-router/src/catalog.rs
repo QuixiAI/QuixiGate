@@ -1,9 +1,11 @@
 //! Offline-first + background-synced `models.dev` catalog, pricing calculator,
 //! and unified model discovery across cloud seats and local runtimes.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::io::Read;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use arc_swap::ArcSwap;
 use flate2::read::GzDecoder;
@@ -59,6 +61,7 @@ struct CatalogSnapshot {
 pub struct ModelCatalog {
     snapshot: Arc<ArcSwap<CatalogSnapshot>>,
     presets: Arc<ArcSwap<Vec<OpenRouterPreset>>>,
+    generation: Arc<AtomicU64>,
 }
 
 impl ModelCatalog {
@@ -77,7 +80,13 @@ impl ModelCatalog {
         Self {
             snapshot: Arc::new(ArcSwap::from_pointee(snap)),
             presets: Arc::new(ArcSwap::from_pointee(Vec::new())),
+            generation: Arc::new(AtomicU64::new(1)),
         }
+    }
+
+    #[inline]
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
     }
 
     /// Refreshes the catalog from `https://models.dev/api.json` (or custom URL) atomically.
@@ -94,6 +103,7 @@ impl ModelCatalog {
         let count = snap.by_canonical.len();
         if count > 0 {
             self.snapshot.store(Arc::new(snap));
+            self.generation.fetch_add(1, Ordering::AcqRel);
         }
         Ok(count)
     }
@@ -104,10 +114,12 @@ impl ModelCatalog {
 
     pub fn set_presets(&self, presets: Vec<OpenRouterPreset>) {
         self.presets.store(Arc::new(presets));
+        self.generation.fetch_add(1, Ordering::AcqRel);
     }
 
     pub fn clear_presets(&self) {
         self.presets.store(Arc::new(Vec::new()));
+        self.generation.fetch_add(1, Ordering::AcqRel);
     }
 
     /// Syncs live OpenRouter `/models/user` (falling back to `/models`) and `/presets` (`@preset/<slug>`)
@@ -331,6 +343,7 @@ impl ModelCatalog {
             self.presets.store(Arc::new(synced_presets.clone()));
         }
 
+        self.generation.fetch_add(1, Ordering::AcqRel);
         let preset_count = self.presets.load().len();
         Ok((synced_models, preset_count))
     }
@@ -345,6 +358,84 @@ impl ModelCatalog {
             .count()
     }
 
+    #[inline]
+    fn find_in_snapshot<'a>(snap: &'a CatalogSnapshot, trimmed: &str) -> Option<&'a CatalogModel> {
+        if let Some(m) = snap.by_canonical.get(trimmed) {
+            return Some(m);
+        }
+        let lower: Cow<'_, str> = if trimmed.bytes().any(|b| b.is_ascii_uppercase()) {
+            Cow::Owned(trimmed.to_ascii_lowercase())
+        } else {
+            Cow::Borrowed(trimmed)
+        };
+        let low = lower.as_ref();
+        if low != trimmed
+            && let Some(m) = snap.by_canonical.get(low)
+        {
+            return Some(m);
+        }
+        if let Some(canon) = snap.bare_to_canonical.get(low)
+            && let Some(m) = snap.by_canonical.get(canon)
+        {
+            return Some(m);
+        }
+        // Strip leading `~` and/or `-latest` suffix for dynamic OpenRouter aliases
+        let untilded = low.trim_start_matches('~');
+        if untilded != low
+            && let Some(m) = snap.by_canonical.get(untilded)
+        {
+            return Some(m);
+        }
+        if let Some(prefix) = untilded.strip_suffix("-latest")
+            && let Some(m) = snap
+                .by_canonical
+                .values()
+                .filter(|m| m.canonical_id.starts_with(prefix))
+                .max_by(|a, b| a.release_date.cmp(&b.release_date))
+        {
+            return Some(m);
+        }
+        // Strip date suffix fallback (e.g. claude-sonnet-4-5-20250929 -> claude-sonnet-4-5)
+        let bare = untilded.split('/').next_back().unwrap_or(untilded);
+        if bare != low
+            && let Some(canon) = snap.bare_to_canonical.get(bare)
+            && let Some(m) = snap.by_canonical.get(canon)
+        {
+            return Some(m);
+        }
+        None
+    }
+
+    /// Zero-allocation pricing lookup returning `(input_nanos_per_m, output_nanos_per_m, cache_read_nanos_per_m)`
+    /// directly from the lock-free `ArcSwap<CatalogSnapshot>` without cloning `CatalogModel` strings or maps.
+    #[inline]
+    pub fn lookup_pricing(&self, model: &str) -> Option<(NanoUsd, NanoUsd, NanoUsd)> {
+        let snap = self.snapshot.load();
+        let trimmed = model.trim();
+        if let Some(slug) = trimmed.strip_prefix("@preset/") {
+            let presets = self.presets.load();
+            if let Some(p) = presets.iter().find(|p| p.slug.eq_ignore_ascii_case(slug)) {
+                if let Some(um) = p.underlying_model.as_deref()
+                    && let Some(b) = Self::find_in_snapshot(&snap, um.trim())
+                {
+                    return Some((
+                        b.input_nanos_per_m,
+                        b.output_nanos_per_m,
+                        b.cache_read_nanos_per_m,
+                    ));
+                }
+                return Some((NanoUsd::ZERO, NanoUsd::ZERO, NanoUsd::ZERO));
+            }
+        }
+        Self::find_in_snapshot(&snap, trimmed).map(|m| {
+            (
+                m.input_nanos_per_m,
+                m.output_nanos_per_m,
+                m.cache_read_nanos_per_m,
+            )
+        })
+    }
+
     /// Looks up a catalog model by canonical `author/model`, `@preset/<slug>`, `~author/*-latest`,
     /// `provider/model`, or bare `model` name.
     pub fn lookup(&self, model: &str) -> Option<CatalogModel> {
@@ -356,40 +447,7 @@ impl ModelCatalog {
                 return Some(self.preset_to_catalog_model(p, &snap));
             }
         }
-        if let Some(m) = snap.by_canonical.get(trimmed) {
-            return Some(m.clone());
-        }
-        let lower = trimmed.to_ascii_lowercase();
-        if let Some(m) = snap.by_canonical.get(&lower) {
-            return Some(m.clone());
-        }
-        if let Some(canon) = snap.bare_to_canonical.get(&lower)
-            && let Some(m) = snap.by_canonical.get(canon)
-        {
-            return Some(m.clone());
-        }
-        // Strip leading `~` and/or `-latest` suffix for dynamic OpenRouter aliases
-        let untilded = lower.trim_start_matches('~');
-        if let Some(m) = snap.by_canonical.get(untilded) {
-            return Some(m.clone());
-        }
-        if let Some(prefix) = untilded.strip_suffix("-latest")
-            && let Some(m) = snap
-                .by_canonical
-                .values()
-                .filter(|m| m.canonical_id.starts_with(prefix))
-                .max_by(|a, b| a.release_date.cmp(&b.release_date))
-        {
-            return Some(m.clone());
-        }
-        // Strip date suffix fallback (e.g. claude-sonnet-4-5-20250929 -> claude-sonnet-4-5)
-        let bare = untilded.split('/').next_back().unwrap_or(untilded);
-        if let Some(canon) = snap.bare_to_canonical.get(bare)
-            && let Some(m) = snap.by_canonical.get(canon)
-        {
-            return Some(m.clone());
-        }
-        None
+        Self::find_in_snapshot(&snap, trimmed).cloned()
     }
 
     fn preset_to_catalog_model(
@@ -546,7 +604,7 @@ impl ModelCatalog {
         route_override: Option<&ModelRoute>,
     ) -> (NanoUsd, NanoUsd) {
         let stripped = model.strip_suffix(":free").unwrap_or(model);
-        let cat = self.lookup(stripped);
+        let pricing = self.lookup_pricing(stripped);
 
         let default_local_in = NanoUsd(500_000_000); // $0.50 / 1M reference for local savings
         let default_local_out = NanoUsd(1_500_000_000); // $1.50 / 1M reference for local savings
@@ -572,11 +630,7 @@ impl ModelCatalog {
 
         let in_rate = route_override
             .and_then(|r| r.input_nanos_per_m.map(NanoUsd))
-            .or_else(|| {
-                cat.as_ref()
-                    .map(|c| c.input_nanos_per_m)
-                    .filter(|n| !n.is_zero())
-            })
+            .or_else(|| pricing.map(|(inp, _, _)| inp).filter(|n| !n.is_zero()))
             .unwrap_or(if is_zero_marginal {
                 default_local_in
             } else {
@@ -585,11 +639,7 @@ impl ModelCatalog {
 
         let out_rate = route_override
             .and_then(|r| r.output_nanos_per_m.map(NanoUsd))
-            .or_else(|| {
-                cat.as_ref()
-                    .map(|c| c.output_nanos_per_m)
-                    .filter(|n| !n.is_zero())
-            })
+            .or_else(|| pricing.map(|(_, out, _)| out).filter(|n| !n.is_zero()))
             .unwrap_or(if is_zero_marginal {
                 default_local_out
             } else {
@@ -599,9 +649,9 @@ impl ModelCatalog {
         let cache_rate = route_override
             .and_then(|r| r.cache_read_nanos_per_m.map(NanoUsd))
             .or_else(|| {
-                cat.as_ref().map(|c| {
-                    if c.cache_read_nanos_per_m.nanos() > 0 {
-                        c.cache_read_nanos_per_m
+                pricing.map(|(_, _, cache)| {
+                    if cache.nanos() > 0 {
+                        cache
                     } else {
                         NanoUsd(in_rate.nanos() / 10)
                     }

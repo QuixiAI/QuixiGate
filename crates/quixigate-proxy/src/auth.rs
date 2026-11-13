@@ -3,12 +3,16 @@
 //! `HttpOnly` / bearer admin sessions (`qxs_...`), and per-connection TCP
 //! loopback trust (`127.0.0.1` / `::1`) with reverse-proxy, DNS-rebinding, and CSRF guards.
 
+use std::convert::Infallible;
+use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::pin::Pin;
+use std::task::{Context, Poll};
 
 use axum::Json;
 use axum::body::Body;
 use axum::extract::{ConnectInfo, Request, State};
-use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use base64::Engine;
@@ -19,24 +23,33 @@ use quixigate_db::AuthenticatedPrincipal;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
+use tower::{Layer, Service};
 
 use crate::state::AppState;
 
 pub const SESSION_COOKIE_NAME: &str = quixigate_core::brand::SESSION_COOKIE_NAME;
 
-/// Non-spoofable internal marker headers stripped and recomputed on every incoming request
-/// by [`peer_trust_middleware`] from the real TCP `ConnectInfo<SocketAddr>`.
-const INTERNAL_DIRECT_LOOPBACK_HEADER: &str = "x-quixigate-internal-direct-loopback";
-const INTERNAL_PEER_CHECKED_HEADER: &str = "x-quixigate-internal-peer-checked";
-const INTERNAL_PEER_IP_HEADER: &str = "x-quixigate-internal-peer-ip";
+/// Non-spoofable internal marker headers recomputed on every incoming request by
+/// [`PeerTrustService`] / [`peer_trust_middleware`] from the real TCP `ConnectInfo<SocketAddr>`.
+///
+/// Compact state encoding in `x-quixigate-internal-peer-checked` avoids 5 redundant `HeaderMap`
+/// mutations and `IpAddr::from_str` allocations on loopback traffic:
+/// - `"l4"` / `"l6"`: verified direct IPv4 (`127.0.0.1`) / IPv6 (`::1`) loopback
+/// - `"u4"` / `"u6"`: IPv4 / IPv6 loopback socket with untrusted proxy/Host/Origin headers
+/// - `"t"`: trusted container / CIDR peer (exact IP stored in `HDR_PEER_IP`)
+/// - `"r"`: remote / untrusted peer (exact IP stored in `HDR_PEER_IP` if present)
+const HDR_PEER_CHECKED: HeaderName = HeaderName::from_static("x-quixigate-internal-peer-checked");
+const HDR_PEER_IP: HeaderName = HeaderName::from_static("x-quixigate-internal-peer-ip");
+const HDR_LEGACY_DIRECT_LOOPBACK: HeaderName =
+    HeaderName::from_static("x-quixigate-internal-direct-loopback");
 
-const PROXY_FORWARDING_HEADERS: &[&str] = &[
-    "x-forwarded-for",
-    "forwarded",
-    "x-real-ip",
-    "cf-connecting-ip",
-    "true-client-ip",
-    "fly-client-ip",
+const PROXY_FORWARDING_HEADERS: [HeaderName; 6] = [
+    HeaderName::from_static("x-forwarded-for"),
+    HeaderName::from_static("forwarded"),
+    HeaderName::from_static("x-real-ip"),
+    HeaderName::from_static("cf-connecting-ip"),
+    HeaderName::from_static("true-client-ip"),
+    HeaderName::from_static("fly-client-ip"),
 ];
 
 /// Standard container-to-host DNS aliases used by Docker Desktop, Linux Docker (`host-gateway`),
@@ -140,14 +153,18 @@ fn is_trusted_hostname(host_raw: &str, trust_containers: bool, trusted_cidrs: &[
         return true;
     }
     let host_only = extract_host_only(trimmed);
-    let lower = host_only.to_ascii_lowercase();
-    if matches!(
-        lower.as_str(),
-        "localhost" | "127.0.0.1" | "::1" | "0.0.0.0"
-    ) {
+    if host_only == "127.0.0.1"
+        || host_only == "::1"
+        || host_only == "0.0.0.0"
+        || host_only.eq_ignore_ascii_case("localhost")
+    {
         return true;
     }
-    if trust_containers && CONTAINER_HOST_ALIASES.contains(&lower.as_str()) {
+    if trust_containers
+        && CONTAINER_HOST_ALIASES
+            .iter()
+            .any(|a| host_only.eq_ignore_ascii_case(a))
+    {
         return true;
     }
     // Literal IP addresses in `Host` (never domain names, preserving DNS-rebinding defense)
@@ -174,50 +191,187 @@ fn is_trusted_origin(origin_raw: &str, trust_containers: bool, trusted_cidrs: &[
     let Some((scheme, rest)) = trimmed.split_once("://") else {
         return false;
     };
-    if !matches!(scheme.to_ascii_lowercase().as_str(), "http" | "https") {
+    if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
         return false;
     }
     let authority = rest.split('/').next().unwrap_or(rest);
     is_trusted_hostname(authority, trust_containers, trusted_cidrs)
 }
 
-/// Outermost Axum middleware that strips any client-supplied internal headers, enforces
-/// gateway-wide `allowed_cidrs` and live `max_request_size_mb`, and marks whether the request
-/// arrived directly from a local loopback socket (`127.0.0.1` / `::1`) or an authorized local
-/// container runtime (`host.docker.internal` / local Docker bridge) without reverse-proxy
-/// forwarding headers, DNS rebinding, or cross-origin browser spoofing.
-pub async fn peer_trust_middleware(
-    State(state): State<AppState>,
+enum PeerPrecheckOutcome {
+    FastBounded { max_mb: usize },
+    Immediate(Response),
+    SlowAsync,
+}
+
+/// Zero-allocation synchronous fast-path peer check used by [`PeerTrustService`]:
+/// strips spoofed internal headers only if present, enforces `allowed_cidrs` and bounded
+/// `Content-Length <= max_request_size_mb`, and stamps `HDR_PEER_CHECKED` in 1 static insert.
+#[inline]
+fn precheck_peer_trust_sync(
+    state: &AppState,
+    known_peer_ip: Option<IpAddr>,
+    req: &mut Request,
+) -> PeerPrecheckOutcome {
+    if req.headers().contains_key(&HDR_LEGACY_DIRECT_LOOPBACK) {
+        req.headers_mut().remove(&HDR_LEGACY_DIRECT_LOOPBACK);
+    }
+    if req.headers().contains_key(&HDR_PEER_IP) {
+        req.headers_mut().remove(&HDR_PEER_IP);
+    }
+
+    let settings = state.db.settings_arc();
+    if crate::oidc::OidcVerifier::is_configured(&settings) {
+        return PeerPrecheckOutcome::SlowAsync;
+    }
+
+    let trust_containers = settings.trust_local_containers;
+    let trusted_cidrs = &settings.trusted_cidrs;
+
+    let peer_ip: Option<IpAddr> = match known_peer_ip {
+        Some(ip) => Some(ip),
+        None => match req.extensions().get::<ConnectInfo<SocketAddr>>() {
+            Some(ConnectInfo(addr)) => Some(addr.ip().to_canonical()),
+            None if state.bound_loopback => Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            None => None,
+        },
+    };
+
+    if !settings.allowed_cidrs.is_empty() {
+        let path = req.uri().path();
+        let is_liveness = matches!(path, "/health" | "/health/liveness");
+        if !is_liveness {
+            let allowed = peer_ip.is_some_and(|ip| {
+                settings
+                    .allowed_cidrs
+                    .iter()
+                    .any(|cidr| matches_cidr_str(ip, cidr))
+            });
+            if !allowed {
+                let ip_label = peer_ip
+                    .map(|ip| ip.to_string())
+                    .unwrap_or_else(|| "unknown".to_owned());
+                return PeerPrecheckOutcome::Immediate(
+                    (
+                        StatusCode::FORBIDDEN,
+                        Json(json!({
+                            "type": "error",
+                            "error": {
+                                "message": format!("client IP '{ip_label}' is not permitted by gateway allowed_cidrs policy"),
+                                "type": "permission_error",
+                                "code": "ip_not_allowed"
+                            }
+                        })),
+                    )
+                        .into_response(),
+                );
+            }
+        }
+    }
+
+    let max_mb = settings.max_request_size_mb.clamp(1, 512);
+    let max_bytes = max_mb.saturating_mul(1024 * 1024);
+    let mut known_bounded_content_length = matches!(
+        *req.method(),
+        axum::http::Method::GET
+            | axum::http::Method::HEAD
+            | axum::http::Method::OPTIONS
+            | axum::http::Method::DELETE
+    ) && !req.headers().contains_key(header::CONTENT_LENGTH)
+        && !req.headers().contains_key(header::TRANSFER_ENCODING);
+
+    if let Some(cl_raw) = req
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        && let Ok(cl) = cl_raw.trim().parse::<usize>()
+    {
+        if cl > max_bytes {
+            return PeerPrecheckOutcome::Immediate(payload_too_large_response(max_mb));
+        }
+        if !req.headers().contains_key(header::TRANSFER_ENCODING) {
+            known_bounded_content_length = true;
+        }
+    }
+
+    if !known_bounded_content_length {
+        return PeerPrecheckOutcome::SlowAsync;
+    }
+
+    let tcp_peer_trusted = match peer_ip {
+        Some(ip) => {
+            ip.is_loopback()
+                || (trust_containers && is_local_container_ip(ip))
+                || trusted_cidrs.iter().any(|c| matches_cidr_str(ip, c))
+        }
+        None => false,
+    };
+
+    let hdrs = req.headers();
+    let has_proxy_header = PROXY_FORWARDING_HEADERS
+        .iter()
+        .any(|h| hdrs.contains_key(h));
+    let host_ok = hdrs
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .is_none_or(|h| is_trusted_hostname(h, trust_containers, trusted_cidrs));
+    let origin_ok = hdrs
+        .get(header::ORIGIN)
+        .and_then(|v| v.to_str().ok())
+        .is_none_or(|o| is_trusted_origin(o, trust_containers, trusted_cidrs));
+
+    let direct_trusted = tcp_peer_trusted && !has_proxy_header && host_ok && origin_ok;
+
+    let checked_marker = match (peer_ip, direct_trusted) {
+        (Some(IpAddr::V4(Ipv4Addr::LOCALHOST)), true) => HeaderValue::from_static("l4"),
+        (Some(IpAddr::V6(Ipv6Addr::LOCALHOST)), true) => HeaderValue::from_static("l6"),
+        (Some(IpAddr::V4(Ipv4Addr::LOCALHOST)), false) => HeaderValue::from_static("u4"),
+        (Some(IpAddr::V6(Ipv6Addr::LOCALHOST)), false) => HeaderValue::from_static("u6"),
+        (Some(other), true) => {
+            if let Ok(hv) = HeaderValue::from_str(&other.to_string()) {
+                req.headers_mut().insert(HDR_PEER_IP, hv);
+            }
+            HeaderValue::from_static("t")
+        }
+        (Some(other), false) => {
+            if let Ok(hv) = HeaderValue::from_str(&other.to_string()) {
+                req.headers_mut().insert(HDR_PEER_IP, hv);
+            }
+            HeaderValue::from_static("r")
+        }
+        (None, _) => HeaderValue::from_static("r"),
+    };
+    req.headers_mut().insert(HDR_PEER_CHECKED, checked_marker);
+
+    PeerPrecheckOutcome::FastBounded { max_mb }
+}
+
+async fn run_peer_trust_slow_path<S>(
+    state: AppState,
+    known_peer_ip: Option<IpAddr>,
+    mut inner: S,
     mut req: Request,
-    next: Next,
-) -> Response {
-    req.headers_mut().remove(INTERNAL_DIRECT_LOOPBACK_HEADER);
-    req.headers_mut().remove(INTERNAL_PEER_CHECKED_HEADER);
-    req.headers_mut().remove(INTERNAL_PEER_IP_HEADER);
+) -> Response
+where
+    S: Service<Request, Response = Response, Error = Infallible>,
+{
+    req.headers_mut().remove(&HDR_LEGACY_DIRECT_LOOPBACK);
+    req.headers_mut().remove(&HDR_PEER_CHECKED);
+    req.headers_mut().remove(&HDR_PEER_IP);
 
     let settings = state.db.settings_arc();
     let trust_containers = settings.trust_local_containers;
     let trusted_cidrs = &settings.trusted_cidrs;
 
-    let peer_ip: Option<IpAddr> = match req.extensions().get::<ConnectInfo<SocketAddr>>() {
-        Some(ConnectInfo(addr)) => Some(addr.ip().to_canonical()),
-        None if state.bound_loopback => Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
-        None => None,
+    let peer_ip: Option<IpAddr> = match known_peer_ip {
+        Some(ip) => Some(ip),
+        None => match req.extensions().get::<ConnectInfo<SocketAddr>>() {
+            Some(ConnectInfo(addr)) => Some(addr.ip().to_canonical()),
+            None if state.bound_loopback => Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            None => None,
+        },
     };
 
-    if let Some(ip) = peer_ip {
-        let hv_opt = match ip {
-            IpAddr::V4(Ipv4Addr::LOCALHOST) => Some(HeaderValue::from_static("127.0.0.1")),
-            IpAddr::V6(Ipv6Addr::LOCALHOST) => Some(HeaderValue::from_static("::1")),
-            other => HeaderValue::from_str(&other.to_string()).ok(),
-        };
-        if let Some(hv) = hv_opt {
-            req.headers_mut().insert(INTERNAL_PEER_IP_HEADER, hv);
-        }
-    }
-
-    // Gateway-wide IP/CIDR allowlist (`settings.allowed_cidrs` / `QUIXIGATE_ALLOWED_IPS`).
-    // Liveness probes remain reachable so container orchestrators don't restart pods.
     let path = req.uri().path();
     let is_liveness = matches!(path, "/health" | "/health/liveness");
     if !is_liveness && !settings.allowed_cidrs.is_empty() {
@@ -246,7 +400,6 @@ pub async fn peer_trust_middleware(
         }
     }
 
-    // Live-configurable request body limit (`settings.max_request_size_mb` / `MAX_REQUEST_SIZE_MB`).
     let max_mb = settings.max_request_size_mb.clamp(1, 512);
     let max_bytes = max_mb.saturating_mul(1024 * 1024);
     let mut known_bounded_content_length = false;
@@ -264,43 +417,51 @@ pub async fn peer_trust_middleware(
         }
     }
 
-    let tcp_peer_trusted = match req.extensions().get::<ConnectInfo<SocketAddr>>() {
-        Some(ConnectInfo(addr)) => {
-            let ip = addr.ip().to_canonical();
+    let tcp_peer_trusted = match peer_ip {
+        Some(ip) => {
             ip.is_loopback()
                 || (trust_containers && is_local_container_ip(ip))
                 || trusted_cidrs.iter().any(|c| matches_cidr_str(ip, c))
         }
-        None => state.bound_loopback,
+        None => false,
     };
 
     let has_proxy_header = PROXY_FORWARDING_HEADERS
         .iter()
-        .any(|h| req.headers().contains_key(*h));
-
+        .any(|h| req.headers().contains_key(h));
     let host_ok = req
         .headers()
         .get(header::HOST)
         .and_then(|v| v.to_str().ok())
         .is_none_or(|h| is_trusted_hostname(h, trust_containers, trusted_cidrs));
-
     let origin_ok = req
         .headers()
         .get(header::ORIGIN)
         .and_then(|v| v.to_str().ok())
         .is_none_or(|o| is_trusted_origin(o, trust_containers, trusted_cidrs));
 
-    req.headers_mut()
-        .insert(INTERNAL_PEER_CHECKED_HEADER, HeaderValue::from_static("1"));
+    let direct_trusted = tcp_peer_trusted && !has_proxy_header && host_ok && origin_ok;
+    let checked_marker = match (peer_ip, direct_trusted) {
+        (Some(IpAddr::V4(Ipv4Addr::LOCALHOST)), true) => HeaderValue::from_static("l4"),
+        (Some(IpAddr::V6(Ipv6Addr::LOCALHOST)), true) => HeaderValue::from_static("l6"),
+        (Some(IpAddr::V4(Ipv4Addr::LOCALHOST)), false) => HeaderValue::from_static("u4"),
+        (Some(IpAddr::V6(Ipv6Addr::LOCALHOST)), false) => HeaderValue::from_static("u6"),
+        (Some(other), true) => {
+            if let Ok(hv) = HeaderValue::from_str(&other.to_string()) {
+                req.headers_mut().insert(HDR_PEER_IP, hv);
+            }
+            HeaderValue::from_static("t")
+        }
+        (Some(other), false) => {
+            if let Ok(hv) = HeaderValue::from_str(&other.to_string()) {
+                req.headers_mut().insert(HDR_PEER_IP, hv);
+            }
+            HeaderValue::from_static("r")
+        }
+        (None, _) => HeaderValue::from_static("r"),
+    };
+    req.headers_mut().insert(HDR_PEER_CHECKED, checked_marker);
 
-    if tcp_peer_trusted && !has_proxy_header && host_ok && origin_ok {
-        req.headers_mut().insert(
-            INTERNAL_DIRECT_LOOPBACK_HEADER,
-            HeaderValue::from_static("1"),
-        );
-    }
-
-    // Warm OIDC Discovery / JWKS cache asynchronously only when OIDC is configured.
     if crate::oidc::OidcVerifier::is_configured(&settings) {
         let query_key_opt = req.uri().query().and_then(|q| {
             q.split('&').find_map(|kv| {
@@ -313,17 +474,14 @@ pub async fn peer_trust_middleware(
         }
     }
 
-    // Fast path: when `Content-Length <= max_bytes` is already verified (99.9% of HTTP/1.1 & HTTP/2 JSON POSTs),
-    // Hyper natively enforces the exact byte count without wrapping `Body` or allocating `Arc<AtomicBool>`.
     if known_bounded_content_length {
-        let resp = next.run(req).await;
+        let Ok(resp) = inner.call(req).await;
         if resp.status() == StatusCode::PAYLOAD_TOO_LARGE {
             return payload_too_large_response(max_mb);
         }
         return resp;
     }
 
-    // Enforce byte cap even on chunked transfer-encoded streams without `Content-Length`.
     let (parts, body) = req.into_parts();
     let exceeded_cap = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let exceeded_flag = exceeded_cap.clone();
@@ -341,13 +499,145 @@ pub async fn peer_trust_middleware(
     });
     let req = Request::from_parts(parts, Body::from_stream(limited_stream));
 
-    let resp = next.run(req).await;
+    let Ok(resp) = inner.call(req).await;
     if exceeded_cap.load(std::sync::atomic::Ordering::Relaxed)
         || resp.status() == StatusCode::PAYLOAD_TOO_LARGE
     {
         return payload_too_large_response(max_mb);
     }
     resp
+}
+
+/// Concrete zero-box Tower `Layer` replacing `from_fn_with_state(..., peer_trust_middleware)`.
+#[derive(Clone)]
+pub struct PeerTrustLayer {
+    state: AppState,
+}
+
+impl PeerTrustLayer {
+    pub fn new(state: AppState) -> Self {
+        Self { state }
+    }
+}
+
+impl<S> Layer<S> for PeerTrustLayer {
+    type Service = PeerTrustService<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        PeerTrustService {
+            inner,
+            state: self.state.clone(),
+            known_peer_ip: None,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct PeerTrustService<S> {
+    inner: S,
+    state: AppState,
+    known_peer_ip: Option<IpAddr>,
+}
+
+impl<S> PeerTrustService<S> {
+    pub fn new(inner: S, state: AppState) -> Self {
+        Self {
+            inner,
+            state,
+            known_peer_ip: None,
+        }
+    }
+
+    #[inline]
+    pub fn with_peer_ip(mut self, peer_ip: IpAddr) -> Self {
+        self.known_peer_ip = Some(peer_ip);
+        self
+    }
+}
+
+pub enum PeerTrustFuture<F> {
+    Fast { fut: F, max_mb: usize },
+    Immediate(Option<Response>),
+    Slow(Pin<Box<dyn Future<Output = Response> + Send>>),
+}
+
+impl<F> Future for PeerTrustFuture<F>
+where
+    F: Future<Output = std::result::Result<Response, Infallible>> + Unpin,
+{
+    type Output = std::result::Result<Response, Infallible>;
+
+    #[inline]
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        match self.get_mut() {
+            Self::Fast { fut, max_mb } => match Pin::new(fut).poll(cx) {
+                Poll::Ready(Ok(resp)) => {
+                    if resp.status() == StatusCode::PAYLOAD_TOO_LARGE {
+                        Poll::Ready(Ok(payload_too_large_response(*max_mb)))
+                    } else {
+                        Poll::Ready(Ok(resp))
+                    }
+                }
+                Poll::Ready(Err(inf)) => match inf {},
+                Poll::Pending => Poll::Pending,
+            },
+            Self::Immediate(slot) => {
+                Poll::Ready(Ok(slot.take().expect("PeerTrustFuture polled after ready")))
+            }
+            Self::Slow(boxed) => boxed.as_mut().poll(cx).map(Ok),
+        }
+    }
+}
+
+impl<S> Service<Request> for PeerTrustService<S>
+where
+    S: Service<Request, Response = Response, Error = Infallible> + Clone + Send + 'static,
+    S::Future: Send + Unpin + 'static,
+{
+    type Response = Response;
+    type Error = Infallible;
+    type Future = PeerTrustFuture<S::Future>;
+
+    #[inline]
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<std::result::Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    #[inline]
+    fn call(&mut self, mut req: Request) -> Self::Future {
+        match precheck_peer_trust_sync(&self.state, self.known_peer_ip, &mut req) {
+            PeerPrecheckOutcome::FastBounded { max_mb } => PeerTrustFuture::Fast {
+                fut: self.inner.call(req),
+                max_mb,
+            },
+            PeerPrecheckOutcome::Immediate(resp) => PeerTrustFuture::Immediate(Some(resp)),
+            PeerPrecheckOutcome::SlowAsync => {
+                let state = self.state.clone();
+                let inner = self.inner.clone();
+                let known_peer_ip = self.known_peer_ip;
+                PeerTrustFuture::Slow(Box::pin(run_peer_trust_slow_path(
+                    state,
+                    known_peer_ip,
+                    inner,
+                    req,
+                )))
+            }
+        }
+    }
+}
+
+/// Legacy `from_fn_with_state` entrypoint preserved for callers referencing it directly.
+pub async fn peer_trust_middleware(
+    State(state): State<AppState>,
+    req: Request,
+    next: Next,
+) -> Response {
+    let mut next_opt = Some(next);
+    let svc = tower::service_fn(move |r: Request| {
+        let n = next_opt.take().expect("peer_trust_middleware called once");
+        async move { Ok::<_, Infallible>(n.run(r).await) }
+    });
+    run_peer_trust_slow_path(state, None, svc, req).await
 }
 
 fn payload_too_large_response(max_mb: usize) -> Response {
@@ -363,6 +653,136 @@ fn payload_too_large_response(max_mb: usize) -> Response {
         })),
     )
         .into_response()
+}
+
+/// Concrete zero-box Tower `Layer` replacing `from_fn_with_state(..., enforce_inference_plane_enabled)`.
+#[derive(Clone)]
+pub struct InferenceGateLayer {
+    state: AppState,
+}
+
+impl InferenceGateLayer {
+    pub fn new(state: AppState) -> Self {
+        Self { state }
+    }
+}
+
+impl<S> Layer<S> for InferenceGateLayer {
+    type Service = PlaneGateService<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        PlaneGateService {
+            inner,
+            state: self.state.clone(),
+            admin_plane: false,
+        }
+    }
+}
+
+/// Concrete zero-box Tower `Layer` replacing `from_fn_with_state(..., enforce_admin_plane_enabled)`.
+#[derive(Clone)]
+pub struct AdminGateLayer {
+    state: AppState,
+}
+
+impl AdminGateLayer {
+    pub fn new(state: AppState) -> Self {
+        Self { state }
+    }
+}
+
+impl<S> Layer<S> for AdminGateLayer {
+    type Service = PlaneGateService<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        PlaneGateService {
+            inner,
+            state: self.state.clone(),
+            admin_plane: true,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct PlaneGateService<S> {
+    inner: S,
+    state: AppState,
+    admin_plane: bool,
+}
+
+pub enum PlaneGateFuture<F> {
+    Inner(F),
+    Blocked(Option<Response>),
+}
+
+impl<F> Future for PlaneGateFuture<F>
+where
+    F: Future<Output = std::result::Result<Response, Infallible>> + Unpin,
+{
+    type Output = std::result::Result<Response, Infallible>;
+
+    #[inline]
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        match self.get_mut() {
+            Self::Inner(f) => Pin::new(f).poll(cx),
+            Self::Blocked(slot) => {
+                Poll::Ready(Ok(slot.take().expect("PlaneGateFuture polled after ready")))
+            }
+        }
+    }
+}
+
+impl<S> Service<Request> for PlaneGateService<S>
+where
+    S: Service<Request, Response = Response, Error = Infallible>,
+    S::Future: Unpin,
+{
+    type Response = Response;
+    type Error = Infallible;
+    type Future = PlaneGateFuture<S::Future>;
+
+    #[inline]
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<std::result::Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    #[inline]
+    fn call(&mut self, req: Request) -> Self::Future {
+        let settings = self.state.db.settings_arc();
+        if !self.admin_plane && settings.disable_inference_endpoints {
+            return PlaneGateFuture::Blocked(Some(
+                (
+                    StatusCode::FORBIDDEN,
+                    Json(json!({
+                        "type": "error",
+                        "error": {
+                            "message": "inference data-plane endpoints are disabled on this gateway instance (disable_inference_endpoints=true)",
+                            "type": "permission_error",
+                            "code": "inference_endpoints_disabled"
+                        }
+                    })),
+                )
+                    .into_response(),
+            ));
+        }
+        if self.admin_plane && settings.disable_admin_endpoints {
+            return PlaneGateFuture::Blocked(Some(
+                (
+                    StatusCode::FORBIDDEN,
+                    Json(json!({
+                        "type": "error",
+                        "error": {
+                            "message": "admin and management control-plane endpoints are disabled on this gateway instance (disable_admin_endpoints=true)",
+                            "type": "permission_error",
+                            "code": "admin_endpoints_disabled"
+                        }
+                    })),
+                )
+                    .into_response(),
+            ));
+        }
+        PlaneGateFuture::Inner(self.inner.call(req))
+    }
 }
 
 /// Split-plane middleware blocking data-plane LLM endpoints when `settings.disable_inference_endpoints` is true.
@@ -411,36 +831,45 @@ pub async fn enforce_admin_plane_enabled(
     next.run(req).await
 }
 
-/// Extracts the verified peer IP recorded by [`peer_trust_middleware`].
+/// Extracts the verified peer IP recorded by [`PeerTrustService`] / [`peer_trust_middleware`].
+#[inline]
 pub fn verified_peer_ip(state: &AppState, headers: &HeaderMap) -> Option<IpAddr> {
-    if let Some(ip_str) = headers
-        .get(INTERNAL_PEER_IP_HEADER)
-        .and_then(|v| v.to_str().ok())
-        && let Ok(ip) = ip_str.parse::<IpAddr>()
-    {
-        return Some(ip.to_canonical());
+    if let Some(checked) = headers.get(&HDR_PEER_CHECKED) {
+        return match checked.as_bytes() {
+            b"l4" | b"u4" => Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            b"l6" | b"u6" => Some(IpAddr::V6(Ipv6Addr::LOCALHOST)),
+            _ => headers
+                .get(&HDR_PEER_IP)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse::<IpAddr>().ok())
+                .map(|ip| ip.to_canonical()),
+        };
     }
-    if !headers.contains_key(INTERNAL_PEER_CHECKED_HEADER) && state.bound_loopback {
+    if state.bound_loopback {
         return Some(IpAddr::V4(Ipv4Addr::LOCALHOST));
     }
     None
 }
 
 /// Returns true iff this request came from a verified direct local loopback connection.
+#[inline]
 pub fn is_direct_loopback(state: &AppState, headers: &HeaderMap) -> bool {
-    if headers.contains_key(INTERNAL_PEER_CHECKED_HEADER) {
-        headers
-            .get(INTERNAL_DIRECT_LOOPBACK_HEADER)
-            .and_then(|v| v.to_str().ok())
-            == Some("1")
+    if let Some(checked) = headers.get(&HDR_PEER_CHECKED) {
+        matches!(checked.as_bytes(), b"l4" | b"l6" | b"t")
     } else {
         // Direct unit-test helper calls that did not pass through the router layer.
         state.bound_loopback
             && !PROXY_FORWARDING_HEADERS
                 .iter()
-                .any(|h| headers.contains_key(*h))
+                .any(|h| headers.contains_key(h))
     }
 }
+
+const HDR_ADMIN_KEY: HeaderName = HeaderName::from_static("x-quixigate-admin-key");
+const HDR_LITELLM_API_KEY: HeaderName = HeaderName::from_static("x-litellm-api-key");
+const HDR_X_API_KEY: HeaderName = HeaderName::from_static("x-api-key");
+const HDR_X_GOOG_API_KEY: HeaderName = HeaderName::from_static("x-goog-api-key");
+const HDR_API_KEY: HeaderName = HeaderName::from_static("api-key");
 
 /// Zero-allocation borrowed token extractor across `Authorization: Bearer ...`,
 /// `x-quixigate-admin-key`, `x-litellm-api-key`, `x-api-key`, `x-goog-api-key`, `api-key`, and `?key=`.
@@ -449,8 +878,7 @@ pub fn extract_api_token_str<'a>(
     headers: &'a HeaderMap,
     query_key: Option<&'a str>,
 ) -> Option<&'a str> {
-    // Check `Authorization: Bearer ...` first when neither admin header is present (the 99.9% SDK path).
-    for hdr_name in ["x-quixigate-admin-key", "x-litellm-api-key"] {
+    for hdr_name in [&HDR_ADMIN_KEY, &HDR_LITELLM_API_KEY] {
         if let Some(val) = headers.get(hdr_name).and_then(|v| v.to_str().ok()) {
             let trimmed = val.trim();
             let tok = trimmed
@@ -478,12 +906,7 @@ pub fn extract_api_token_str<'a>(
             }
         }
     }
-    for hdr_name in [
-        "x-api-key",
-        "x-goog-api-key",
-        "api-key",
-        "x-litellm-api-key",
-    ] {
+    for hdr_name in [&HDR_X_API_KEY, &HDR_X_GOOG_API_KEY, &HDR_API_KEY] {
         if let Some(val) = headers.get(hdr_name).and_then(|v| v.to_str().ok()) {
             let tok = val.trim();
             if !tok.is_empty() {
@@ -714,7 +1137,7 @@ pub fn authenticate_inference(
     let settings = state.db.settings_arc();
     let direct_loopback = is_direct_loopback(state, headers);
     let explicit_admin_hdr =
-        headers.contains_key("x-quixigate-admin-key") || headers.contains_key("x-litellm-api-key");
+        headers.contains_key(&HDR_ADMIN_KEY) || headers.contains_key(&HDR_LITELLM_API_KEY);
 
     if let Some(raw_token) = extract_api_token_str(headers, query_key) {
         if state.verify_master_key(raw_token) {

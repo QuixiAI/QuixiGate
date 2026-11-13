@@ -125,6 +125,7 @@ pub struct LocalRuntimeScanner {
     api_keys: Arc<DashMap<String, String>>,
     statuses: Arc<DashMap<String, LocalRuntimeStatus>>,
     perf: Arc<DashMap<String, RollingPerf>>,
+    generation: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl LocalRuntimeScanner {
@@ -160,7 +161,19 @@ impl LocalRuntimeScanner {
             api_keys: Arc::new(api_keys),
             statuses: Arc::new(statuses),
             perf: Arc::new(DashMap::new()),
+            generation: Arc::new(std::sync::atomic::AtomicU64::new(1)),
         }
+    }
+
+    #[inline]
+    pub fn generation(&self) -> u64 {
+        self.generation.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    #[inline]
+    fn bump_generation(&self) {
+        self.generation
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
     }
 
     pub fn add_or_update_endpoint(&self, mut spec: LocalEndpointSpec) {
@@ -177,6 +190,7 @@ impl LocalRuntimeScanner {
         self.statuses
             .entry(spec.runtime_id.clone())
             .or_insert_with(|| empty_status(&spec, false, None, None, now_ms));
+        self.bump_generation();
     }
 
     pub fn remove_endpoint(&self, runtime_id: &str) -> bool {
@@ -192,6 +206,7 @@ impl LocalRuntimeScanner {
         drop(eps);
         self.statuses.remove(&norm);
         self.api_keys.remove(&norm);
+        self.bump_generation();
         before != self.endpoints.read().len()
     }
 
@@ -298,6 +313,7 @@ impl LocalRuntimeScanner {
                 results.push(st);
             }
         }
+        self.bump_generation();
         results
     }
 
@@ -366,6 +382,7 @@ impl LocalRuntimeScanner {
         let updated = self.probe_one(&ep).await;
         self.statuses
             .insert(updated.runtime_id.clone(), updated.clone());
+        self.bump_generation();
         Ok(updated)
     }
 

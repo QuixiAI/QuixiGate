@@ -1,28 +1,63 @@
 //! `POST /v1/messages` & `POST /v1/messages/count_tokens` —
-//! Anthropic Messages JSON & SSE codec (native Claude Code compatibility).
+//! Two-Lane Anthropic Messages JSON & SSE Codec (native Claude Code compatibility):
+//! 1. **Zero-DOM Cut-Through Lane**: Borrowed `AnthropicEnvelopePeek` + raw-`Bytes` Anthropic splicer
+//!    and `CutThroughSseStream` (`0` `tokio::spawn`, `0` `mpsc`, `0` per-token JSON DOM) when routing
+//!    `/v1/messages` directly to Anthropic (`anthropic` / `anthropic-token`) or MiniMax (`minimax-portal`).
+//! 2. **Zero-Spawn Polyglot Transcoding Lane**: Full `CanonicalRequest` normalization and direct
+//!    `BytesMut` `AnthropicTranscodeSseStream` state machine (`0` `tokio::spawn`, `0` `mpsc`, `0` `json!`)
+//!    for OpenRouter, OpenAI, Codex, Gemini, and local runtimes.
 
+#[cfg(feature = "subscription-oauth")]
+use std::borrow::Cow;
 use std::collections::HashMap;
-use std::convert::Infallible;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use std::time::Instant;
 
 use aisdk::core::language_model::{LanguageModelResponseContentType, ReasoningEffort};
 use aisdk::core::tools::ToolDetails;
 use aisdk::core::{AssistantMessage, Message, ToolCallInfo, ToolResultInfo, UserMessage};
 use axum::Json;
+use axum::body::{Body, Bytes};
 use axum::extract::State;
-use axum::http::HeaderMap;
-use axum::response::sse::{Event, KeepAlive, Sse};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use futures::StreamExt;
-use quixigate_core::{IngressProtocol, QuixigateError};
-use quixigate_router::{CanonicalRequest, ClientToolSpec, RoutedStreamEvent};
+use bytes::BytesMut;
+use futures::Stream;
+#[cfg(feature = "subscription-oauth")]
+use quixigate_core::SecretScannerMode;
+use quixigate_core::{IngressProtocol, NanoUsd, QuixigateError};
+use quixigate_db::{AuthenticatedPrincipal, BudgetGuard, ConcurrencyGuard};
+use quixigate_router::{
+    CanonicalRequest, ClientToolSpec, RoutedStream, RoutedStreamEvent, StreamCompletionSummary,
+};
+#[cfg(feature = "subscription-oauth")]
+use quixigate_router::{CutThroughJsonOutcome, CutThroughStreamOutcome, CutThroughWireFormat};
+use quixigate_telemetry::{OpenInferencePayload, TelemetryHub};
+#[cfg(feature = "subscription-oauth")]
+use serde::Deserialize;
 use serde_json::{Map, Value, json};
-use tokio_stream::wrappers::ReceiverStream;
-use uuid::Uuid;
 
 use crate::auth::authenticate_inference;
 use crate::codecs::common::*;
 use crate::state::{ApiError, ApiResult, AppState};
+
+#[cfg(feature = "subscription-oauth")]
+#[derive(Deserialize)]
+struct AnthropicEnvelopePeek<'a> {
+    #[serde(borrow, default)]
+    model: Option<Cow<'a, str>>,
+    #[serde(default)]
+    messages: Option<MessagesArrayMarker>,
+    #[serde(default)]
+    stream: Option<bool>,
+    #[serde(default)]
+    max_tokens: Option<u64>,
+    #[serde(borrow, default)]
+    tags: Option<TagsPeek<'a>>,
+    #[serde(borrow, default)]
+    metadata: Option<MetadataPeek<'a>>,
+}
 
 fn parse_anthropic_canonical(
     body: &Value,
@@ -219,29 +254,294 @@ pub async fn handle_count_tokens(
 pub async fn handle_messages(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(body): Json<Value>,
+    raw_body: Bytes,
 ) -> ApiResult<Response> {
     let principal = authenticate_inference(&state, &headers, None)?;
+    let settings = state.db.settings_arc();
+    let capture_payloads = principal
+        .virtual_key
+        .as_ref()
+        .and_then(|k| k.log_payloads)
+        .unwrap_or(settings.capture_payloads_default);
+    let need_deep_telemetry = capture_payloads || settings.otlp_enabled;
+
+    let mut pre_reserved: Option<(ConcurrencyGuard, BudgetGuard)> = None;
+
+    // ── Fast Lane Gate: Zero-DOM `/v1/messages` -> Anthropic Cut-Through ─────
+    #[cfg(feature = "subscription-oauth")]
+    {
+        let cache_pref = parse_cache_preference(&headers);
+        let can_attempt_peek = settings.enforced_params.is_empty()
+            && settings.secret_scanner_mode == SecretScannerMode::Off
+            && settings.banned_keywords.is_empty()
+            && !capture_payloads
+            && !settings.otlp_enabled
+            && settings.mcp_server_urls.is_empty()
+            && !state.router.has_mcp_urls();
+
+        if can_attempt_peek
+            && let Ok(peek) = serde_json::from_slice::<AnthropicEnvelopePeek<'_>>(&raw_body)
+        {
+            let requested_model_str = peek
+                .model
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| {
+                    QuixigateError::Validation("missing 'model' in Anthropic request".to_owned())
+                })?;
+            if peek.messages.is_none() {
+                return Err(ApiError(QuixigateError::Validation(
+                    "'messages' must be an array".to_owned(),
+                )));
+            }
+
+            let cache_wanted = cache_pref.unwrap_or(settings.cache_enabled_default);
+            if !cache_wanted {
+                let est_in = ((raw_body.len() / 4) as u64).max(1) + 8;
+                let max_out = peek.max_tokens.unwrap_or(4096);
+                let plan =
+                    state
+                        .router
+                        .prepare_cut_through_plan(requested_model_str, est_in, max_out)?;
+
+                if !plan.spec().online
+                    && plan.candidates.first().is_some_and(|c| {
+                        matches!(
+                            c.provider_id.as_str(),
+                            "anthropic" | "anthropic-token" | "minimax-portal"
+                        )
+                    })
+                {
+                    let req_tags =
+                        collect_peek_tags(&headers, peek.metadata.as_ref(), peek.tags.as_ref());
+                    let end_user_id = peek_end_user(
+                        &headers,
+                        peek.metadata.as_ref().and_then(|m| m.user_id.as_deref()),
+                        None,
+                    );
+                    let (conc_guard, mut budget_guard) = state.db.authorize_and_reserve_full(
+                        &principal,
+                        requested_model_str,
+                        plan.est_total_tokens,
+                        plan.est_cost,
+                        &req_tags,
+                        end_user_id,
+                    )?;
+                    if should_suppress_request_log(&headers, &settings) {
+                        budget_guard.set_suppress_log(true);
+                    }
+
+                    let stream_requested = peek.stream.unwrap_or(false);
+                    let passthrough_headers = extract_passthrough_headers_vec(&headers);
+                    let msg_id = TelemetryHub::fast_prefixed_id("msg_");
+
+                    if stream_requested {
+                        state.telemetry.inc_active();
+                        let started = Instant::now();
+                        match state
+                            .router
+                            .execute_anthropic_cut_through_stream(
+                                plan,
+                                &raw_body,
+                                &passthrough_headers,
+                            )
+                            .await
+                        {
+                            Ok(CutThroughStreamOutcome::Stream(active)) => {
+                                let provider_hdr = active.provider_id.clone();
+                                let model_hdr = active.resolved_model.clone();
+                                let msg_id_hdr = msg_id.clone();
+                                let sse_stream = CutThroughSseStream::new(
+                                    active,
+                                    state,
+                                    principal,
+                                    conc_guard,
+                                    budget_guard,
+                                    CutThroughWireFormat::AnthropicMessages,
+                                    IngressProtocol::AnthropicMessages,
+                                    msg_id,
+                                    est_in,
+                                );
+                                let mut resp = Response::new(Body::from_stream(sse_stream));
+                                *resp.status_mut() = StatusCode::OK;
+                                let hdrs = resp.headers_mut();
+                                hdrs.insert(
+                                    header::CONTENT_TYPE,
+                                    HeaderValue::from_static("text/event-stream"),
+                                );
+                                hdrs.insert(
+                                    header::CACHE_CONTROL,
+                                    HeaderValue::from_static("no-cache"),
+                                );
+                                attach_gateway_headers(
+                                    hdrs,
+                                    &msg_id_hdr,
+                                    &provider_hdr,
+                                    &model_hdr,
+                                    false,
+                                    NanoUsd::ZERO,
+                                    NanoUsd::ZERO,
+                                );
+                                return Ok(resp);
+                            }
+                            Ok(CutThroughStreamOutcome::FallbackTranscode) => {
+                                state.telemetry.dec_active();
+                                pre_reserved = Some((conc_guard, budget_guard));
+                            }
+                            Err(err) => {
+                                state.telemetry.dec_active();
+                                drop(conc_guard);
+                                finalize_cut_through_accounting(
+                                    &state,
+                                    &principal,
+                                    budget_guard,
+                                    IngressProtocol::AnthropicMessages,
+                                    msg_id,
+                                    requested_model_str.to_owned(),
+                                    requested_model_str.to_owned(),
+                                    error_provider_id(&err),
+                                    None,
+                                    err.http_status(),
+                                    true,
+                                    0,
+                                    None,
+                                    started.elapsed().as_millis() as u64,
+                                    0,
+                                    0,
+                                    0,
+                                    0,
+                                    NanoUsd::ZERO,
+                                    NanoUsd::ZERO,
+                                    Some(err.to_string()),
+                                );
+                                return Err(ApiError(err));
+                            }
+                        }
+                    } else {
+                        state.telemetry.inc_active();
+                        let started = Instant::now();
+                        match state
+                            .router
+                            .execute_anthropic_cut_through_json(
+                                plan,
+                                &raw_body,
+                                est_in,
+                                &passthrough_headers,
+                            )
+                            .await
+                        {
+                            Ok(CutThroughJsonOutcome::Ready(res)) => {
+                                state.telemetry.dec_active();
+                                drop(conc_guard);
+                                let mut resp = Response::new(Body::from(res.body));
+                                *resp.status_mut() = StatusCode::OK;
+                                resp.headers_mut().insert(
+                                    header::CONTENT_TYPE,
+                                    HeaderValue::from_static("application/json"),
+                                );
+                                attach_gateway_headers(
+                                    resp.headers_mut(),
+                                    &msg_id,
+                                    &res.provider_id,
+                                    &res.resolved_model,
+                                    false,
+                                    res.cost_nanos,
+                                    res.api_equiv_nanos,
+                                );
+                                finalize_cut_through_accounting(
+                                    &state,
+                                    &principal,
+                                    budget_guard,
+                                    IngressProtocol::AnthropicMessages,
+                                    msg_id,
+                                    requested_model_str.to_owned(),
+                                    res.resolved_model,
+                                    res.provider_id,
+                                    res.credential_id,
+                                    200,
+                                    false,
+                                    res.fallback_attempts,
+                                    None,
+                                    res.duration_ms,
+                                    res.input_tokens,
+                                    res.cached_input_tokens,
+                                    res.reasoning_tokens,
+                                    res.output_tokens,
+                                    res.cost_nanos,
+                                    res.api_equiv_nanos,
+                                    None,
+                                );
+                                return Ok(resp);
+                            }
+                            Ok(CutThroughJsonOutcome::FallbackTranscode) => {
+                                state.telemetry.dec_active();
+                                pre_reserved = Some((conc_guard, budget_guard));
+                            }
+                            Err(err) => {
+                                state.telemetry.dec_active();
+                                drop(conc_guard);
+                                finalize_cut_through_accounting(
+                                    &state,
+                                    &principal,
+                                    budget_guard,
+                                    IngressProtocol::AnthropicMessages,
+                                    msg_id,
+                                    requested_model_str.to_owned(),
+                                    requested_model_str.to_owned(),
+                                    error_provider_id(&err),
+                                    None,
+                                    err.http_status(),
+                                    false,
+                                    0,
+                                    None,
+                                    started.elapsed().as_millis() as u64,
+                                    0,
+                                    0,
+                                    0,
+                                    0,
+                                    NanoUsd::ZERO,
+                                    NanoUsd::ZERO,
+                                    Some(err.to_string()),
+                                );
+                                return Err(ApiError(err));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ── Transcoding / Feature-Rich Lane ──────────────────────────────────────
+    let body: Value = serde_json::from_slice(&raw_body)
+        .map_err(|e| QuixigateError::Validation(format!("invalid JSON body: {e}")))?;
     let req = parse_anthropic_canonical(&body, &headers)?;
     let requested_model = req.requested_model.clone();
-    let max_out = u64::from(req.max_output_tokens.unwrap_or(4096));
     let est_in = estimate_request_tokens(&req);
-    let (est_total, est_cost) =
-        state
-            .router
-            .estimate_preflight_budget(&requested_model, est_in, max_out)?;
-    let (conc_guard, budget_guard) = authorize_inference_request(
-        &state,
-        &principal,
-        &headers,
-        Some(&body),
-        &requested_model,
-        est_total,
-        est_cost,
-    )?;
+
+    let (conc_guard, budget_guard) = match pre_reserved {
+        Some(guards) => guards,
+        None => {
+            let max_out = u64::from(req.max_output_tokens.unwrap_or(4096));
+            let (est_total, est_cost) =
+                state
+                    .router
+                    .estimate_preflight_budget(&requested_model, est_in, max_out)?;
+            authorize_inference_request(
+                &state,
+                &principal,
+                &headers,
+                Some(&body),
+                &requested_model,
+                est_total,
+                est_cost,
+            )?
+        }
+    };
 
     let stream_requested = body["stream"].as_bool().unwrap_or(false);
-    let msg_id = format!("msg_{}", Uuid::new_v4().simple());
+    let msg_id = TelemetryHub::fast_prefixed_id("msg_");
     let (oi, raw_req) = prepare_telemetry_capture(&state, &principal, &req, &body, None);
     let started = Instant::now();
 
@@ -303,17 +603,22 @@ pub async fn handle_messages(
                     }
                 });
 
-                let oi_tools = gen_out
-                    .tool_calls
-                    .iter()
-                    .map(|tc| {
-                        (
-                            tc.tool.id.clone(),
-                            tc.tool.name.clone(),
-                            tc.input.to_string(),
-                        )
-                    })
-                    .collect();
+                let raw_resp_str = capture_payloads.then(|| resp_json.to_string());
+                let oi_tools = if need_deep_telemetry {
+                    gen_out
+                        .tool_calls
+                        .iter()
+                        .map(|tc| {
+                            (
+                                tc.tool.id.clone(),
+                                tc.tool.name.clone(),
+                                tc.input.to_string(),
+                            )
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
 
                 finalize_request_accounting(
                     &state,
@@ -339,9 +644,9 @@ pub async fn handle_messages(
                     gen_out.api_equiv_nanos,
                     None,
                     raw_req,
-                    Some(resp_json.to_string()),
+                    raw_resp_str,
                     oi,
-                    Some(gen_out.text),
+                    need_deep_telemetry.then_some(gen_out.text),
                     oi_tools,
                 );
 
@@ -378,8 +683,8 @@ pub async fn handle_messages(
                     0,
                     0,
                     0,
-                    quixigate_core::NanoUsd::ZERO,
-                    quixigate_core::NanoUsd::ZERO,
+                    NanoUsd::ZERO,
+                    NanoUsd::ZERO,
                     Some(err.to_string()),
                     raw_req,
                     None,
@@ -416,8 +721,8 @@ pub async fn handle_messages(
                     0,
                     0,
                     0,
-                    quixigate_core::NanoUsd::ZERO,
-                    quixigate_core::NanoUsd::ZERO,
+                    NanoUsd::ZERO,
+                    NanoUsd::ZERO,
                     Some(err.to_string()),
                     raw_req,
                     None,
@@ -429,256 +734,364 @@ pub async fn handle_messages(
             }
         };
 
-        let resolved_model = routed.resolved_model.clone();
-        let provider_id = routed.provider_id.clone();
+        let resolved_hdr = routed.resolved_model.clone();
+        let provider_hdr = routed.provider_id.clone();
         let cache_hit = routed.cache_hit;
         let hdr_msg_id = msg_id.clone();
 
-        let (tx, rx) = tokio::sync::mpsc::channel::<std::result::Result<Event, Infallible>>(64);
-        let state_bg = state.clone();
+        let sse_stream = AnthropicTranscodeSseStream::new(
+            routed,
+            state,
+            principal,
+            conc_guard,
+            budget_guard,
+            msg_id,
+            requested_model,
+            est_in,
+            started,
+            need_deep_telemetry,
+            raw_req,
+            oi,
+        );
 
-        tokio::spawn(async move {
-            let _conc = conc_guard;
-            let mut events = routed.events;
+        let mut resp = Response::new(Body::from_stream(sse_stream));
+        *resp.status_mut() = StatusCode::OK;
+        let hdrs = resp.headers_mut();
+        hdrs.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/event-stream"),
+        );
+        hdrs.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+        attach_gateway_headers(
+            hdrs,
+            &hdr_msg_id,
+            &provider_hdr,
+            &resolved_hdr,
+            cache_hit,
+            NanoUsd::ZERO,
+            NanoUsd::ZERO,
+        );
+        Ok(resp)
+    }
+}
 
-            let start_ev = json!({
-                "type": "message_start",
-                "message": {
-                    "id": msg_id,
-                    "type": "message",
-                    "role": "assistant",
-                    "model": resolved_model,
-                    "content": [],
-                    "stop_reason": Value::Null,
-                    "stop_sequence": Value::Null,
-                    "usage": {
-                        "input_tokens": est_in,
-                        "cache_creation_input_tokens": 0,
-                        "cache_read_input_tokens": 0,
-                        "output_tokens": 1
-                    }
+// ── Zero-Spawn `AnthropicTranscodeSseStream` ─────────────────────────────────
+
+const TRANSCODE_BATCH_CAP: usize = 32 * 1024;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AnthropicOpenBlock {
+    Thinking,
+    Text,
+    ToolUse,
+}
+
+struct AnthropicTranscodeSseStream {
+    events: Pin<Box<dyn Stream<Item = RoutedStreamEvent> + Send>>,
+    state: AppState,
+    principal: AuthenticatedPrincipal,
+    conc_guard: Option<ConcurrencyGuard>,
+    budget_guard: Option<BudgetGuard>,
+    msg_id: String,
+    requested_model: String,
+    resolved_model: String,
+    provider_id: String,
+    credential_id: Option<String>,
+    fallback_attempts: u32,
+    cache_hit: bool,
+    started: Instant,
+    need_deep_telemetry: bool,
+    raw_req: Option<String>,
+    oi: Option<OpenInferencePayload>,
+    block_idx: usize,
+    open_block: Option<AnthropicOpenBlock>,
+    tool_idx_by_id: HashMap<String, usize>,
+    buf: BytesMut,
+    completed_summary: Option<StreamCompletionSummary>,
+    stream_err: Option<String>,
+    eof: bool,
+}
+
+impl AnthropicTranscodeSseStream {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        routed: RoutedStream,
+        state: AppState,
+        principal: AuthenticatedPrincipal,
+        conc_guard: ConcurrencyGuard,
+        budget_guard: BudgetGuard,
+        msg_id: String,
+        requested_model: String,
+        est_in: u64,
+        started: Instant,
+        need_deep_telemetry: bool,
+        raw_req: Option<String>,
+        oi: OpenInferencePayload,
+    ) -> Self {
+        let mut buf = BytesMut::with_capacity(1024);
+        buf.extend_from_slice(
+            b"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":",
+        );
+        put_json_escaped_str(&mut buf, &msg_id);
+        buf.extend_from_slice(b",\"type\":\"message\",\"role\":\"assistant\",\"model\":");
+        put_json_escaped_str(&mut buf, &routed.resolved_model);
+        buf.extend_from_slice(
+            b",\"content\":[],\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":",
+        );
+        put_u64_dec(&mut buf, est_in);
+        buf.extend_from_slice(
+            b",\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":0,\"output_tokens\":1}}}\n\n",
+        );
+
+        Self {
+            events: routed.events,
+            state,
+            principal,
+            conc_guard: Some(conc_guard),
+            budget_guard: Some(budget_guard),
+            msg_id,
+            requested_model,
+            resolved_model: routed.resolved_model,
+            provider_id: routed.provider_id,
+            credential_id: routed.credential_id,
+            fallback_attempts: routed.fallback_attempts,
+            cache_hit: routed.cache_hit,
+            started,
+            need_deep_telemetry,
+            raw_req,
+            oi: Some(oi),
+            block_idx: 0,
+            open_block: None,
+            tool_idx_by_id: HashMap::new(),
+            buf,
+            completed_summary: None,
+            stream_err: None,
+            eof: false,
+        }
+    }
+
+    #[inline]
+    fn write_close_open(&mut self) {
+        self.buf.extend_from_slice(
+            b"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":",
+        );
+        put_usize_dec(&mut self.buf, self.block_idx);
+        self.buf.extend_from_slice(b"}\n\n");
+    }
+
+    fn encode_event(&mut self, ev: RoutedStreamEvent) {
+        match ev {
+            RoutedStreamEvent::ReasoningDelta(delta) => {
+                if delta.is_empty() {
+                    return;
                 }
-            });
-            let _ = tx
-                .send(Ok(Event::default()
-                    .event("message_start")
-                    .data(start_ev.to_string())))
-                .await;
+                if self.open_block != Some(AnthropicOpenBlock::Thinking) {
+                    if self.open_block.is_some() {
+                        self.write_close_open();
+                        self.block_idx += 1;
+                    }
+                    self.buf.extend_from_slice(
+                        b"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":",
+                    );
+                    put_usize_dec(&mut self.buf, self.block_idx);
+                    self.buf.extend_from_slice(
+                        b",\"content_block\":{\"type\":\"thinking\",\"thinking\":\"\"}}\n\n",
+                    );
+                    self.open_block = Some(AnthropicOpenBlock::Thinking);
+                }
+                self.buf.extend_from_slice(
+                    b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":",
+                );
+                put_usize_dec(&mut self.buf, self.block_idx);
+                self.buf
+                    .extend_from_slice(b",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":");
+                put_json_escaped_str(&mut self.buf, &delta);
+                self.buf.extend_from_slice(b"}}\n\n");
+            }
+            RoutedStreamEvent::TextDelta(delta) => {
+                if delta.is_empty() {
+                    return;
+                }
+                if self.open_block != Some(AnthropicOpenBlock::Text) {
+                    if self.open_block.is_some() {
+                        self.write_close_open();
+                        self.block_idx += 1;
+                    }
+                    self.buf.extend_from_slice(
+                        b"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":",
+                    );
+                    put_usize_dec(&mut self.buf, self.block_idx);
+                    self.buf.extend_from_slice(
+                        b",\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+                    );
+                    self.open_block = Some(AnthropicOpenBlock::Text);
+                }
+                self.buf.extend_from_slice(
+                    b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":",
+                );
+                put_usize_dec(&mut self.buf, self.block_idx);
+                self.buf
+                    .extend_from_slice(b",\"delta\":{\"type\":\"text_delta\",\"text\":");
+                put_json_escaped_str(&mut self.buf, &delta);
+                self.buf.extend_from_slice(b"}}\n\n");
+            }
+            RoutedStreamEvent::ToolCallStart { id, name } => {
+                if self.open_block.is_some() {
+                    self.write_close_open();
+                    self.block_idx += 1;
+                }
+                self.tool_idx_by_id.insert(id.clone(), self.block_idx);
+                self.open_block = Some(AnthropicOpenBlock::ToolUse);
+                self.buf.extend_from_slice(
+                    b"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":",
+                );
+                put_usize_dec(&mut self.buf, self.block_idx);
+                self.buf
+                    .extend_from_slice(b",\"content_block\":{\"type\":\"tool_use\",\"id\":");
+                put_json_escaped_str(&mut self.buf, &id);
+                self.buf.extend_from_slice(b",\"name\":");
+                put_json_escaped_str(&mut self.buf, &name);
+                self.buf.extend_from_slice(b",\"input\":{}}}\n\n");
+            }
+            RoutedStreamEvent::ToolCallDelta { id, delta } => {
+                let idx = self
+                    .tool_idx_by_id
+                    .get(&id)
+                    .copied()
+                    .unwrap_or(self.block_idx);
+                self.buf.extend_from_slice(
+                    b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":",
+                );
+                put_usize_dec(&mut self.buf, idx);
+                self.buf.extend_from_slice(
+                    b",\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":",
+                );
+                put_json_escaped_str(&mut self.buf, &delta);
+                self.buf.extend_from_slice(b"}}\n\n");
+            }
+            RoutedStreamEvent::ToolCallReady(tc) => {
+                if !self.tool_idx_by_id.contains_key(&tc.tool.id) {
+                    if self.open_block.is_some() {
+                        self.write_close_open();
+                        self.block_idx += 1;
+                    }
+                    self.tool_idx_by_id
+                        .insert(tc.tool.id.clone(), self.block_idx);
+                    self.open_block = Some(AnthropicOpenBlock::ToolUse);
+                    self.buf.extend_from_slice(
+                        b"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":",
+                    );
+                    put_usize_dec(&mut self.buf, self.block_idx);
+                    self.buf
+                        .extend_from_slice(b",\"content_block\":{\"type\":\"tool_use\",\"id\":");
+                    put_json_escaped_str(&mut self.buf, &tc.tool.id);
+                    self.buf.extend_from_slice(b",\"name\":");
+                    put_json_escaped_str(&mut self.buf, &tc.tool.name);
+                    self.buf.extend_from_slice(b",\"input\":{}}}\n\n");
 
-            let mut block_idx: usize = 0;
-            let mut open_block: Option<&'static str> = None;
-            let mut tool_idx_by_id: HashMap<String, usize> = HashMap::new();
-            let mut completed_summary = None;
-            let mut stream_err = None;
-
-            let close_open =
-                |tx: &tokio::sync::mpsc::Sender<std::result::Result<Event, Infallible>>,
-                 idx: usize| {
-                    let stop = json!({ "type": "content_block_stop", "index": idx });
-                    let tx = tx.clone();
-                    async move {
-                        let _ = tx
-                            .send(Ok(Event::default()
-                                .event("content_block_stop")
-                                .data(stop.to_string())))
-                            .await;
-                    }
-                };
-
-            while let Some(ev) = events.next().await {
-                match ev {
-                    RoutedStreamEvent::ReasoningDelta(delta) => {
-                        if delta.is_empty() {
-                            continue;
-                        }
-                        if open_block != Some("thinking") {
-                            if open_block.is_some() {
-                                close_open(&tx, block_idx).await;
-                                block_idx += 1;
-                            }
-                            let blk = json!({
-                                "type": "content_block_start",
-                                "index": block_idx,
-                                "content_block": { "type": "thinking", "thinking": "" }
-                            });
-                            let _ = tx
-                                .send(Ok(Event::default()
-                                    .event("content_block_start")
-                                    .data(blk.to_string())))
-                                .await;
-                            open_block = Some("thinking");
-                        }
-                        let d = json!({
-                            "type": "content_block_delta",
-                            "index": block_idx,
-                            "delta": { "type": "thinking_delta", "thinking": delta }
-                        });
-                        let _ = tx
-                            .send(Ok(Event::default()
-                                .event("content_block_delta")
-                                .data(d.to_string())))
-                            .await;
-                    }
-                    RoutedStreamEvent::TextDelta(delta) => {
-                        if delta.is_empty() {
-                            continue;
-                        }
-                        if open_block != Some("text") {
-                            if open_block.is_some() {
-                                close_open(&tx, block_idx).await;
-                                block_idx += 1;
-                            }
-                            let blk = json!({
-                                "type": "content_block_start",
-                                "index": block_idx,
-                                "content_block": { "type": "text", "text": "" }
-                            });
-                            let _ = tx
-                                .send(Ok(Event::default()
-                                    .event("content_block_start")
-                                    .data(blk.to_string())))
-                                .await;
-                            open_block = Some("text");
-                        }
-                        let d = json!({
-                            "type": "content_block_delta",
-                            "index": block_idx,
-                            "delta": { "type": "text_delta", "text": delta }
-                        });
-                        if tx
-                            .send(Ok(Event::default()
-                                .event("content_block_delta")
-                                .data(d.to_string())))
-                            .await
-                            .is_err()
-                        {
-                            break;
-                        }
-                    }
-                    RoutedStreamEvent::ToolCallStart { id, name } => {
-                        if open_block.is_some() {
-                            close_open(&tx, block_idx).await;
-                            block_idx += 1;
-                        }
-                        tool_idx_by_id.insert(id.clone(), block_idx);
-                        open_block = Some("tool_use");
-                        let blk = json!({
-                            "type": "content_block_start",
-                            "index": block_idx,
-                            "content_block": {
-                                "type": "tool_use",
-                                "id": id,
-                                "name": name,
-                                "input": {}
-                            }
-                        });
-                        let _ = tx
-                            .send(Ok(Event::default()
-                                .event("content_block_start")
-                                .data(blk.to_string())))
-                            .await;
-                    }
-                    RoutedStreamEvent::ToolCallDelta { id, delta } => {
-                        let idx = tool_idx_by_id.get(&id).copied().unwrap_or(block_idx);
-                        let d = json!({
-                            "type": "content_block_delta",
-                            "index": idx,
-                            "delta": { "type": "input_json_delta", "partial_json": delta }
-                        });
-                        let _ = tx
-                            .send(Ok(Event::default()
-                                .event("content_block_delta")
-                                .data(d.to_string())))
-                            .await;
-                    }
-                    RoutedStreamEvent::ToolCallReady(tc) => {
-                        if !tool_idx_by_id.contains_key(&tc.tool.id) {
-                            if open_block.is_some() {
-                                close_open(&tx, block_idx).await;
-                                block_idx += 1;
-                            }
-                            tool_idx_by_id.insert(tc.tool.id.clone(), block_idx);
-                            open_block = Some("tool_use");
-                            let blk = json!({
-                                "type": "content_block_start",
-                                "index": block_idx,
-                                "content_block": {
-                                    "type": "tool_use",
-                                    "id": tc.tool.id,
-                                    "name": tc.tool.name,
-                                    "input": {}
-                                }
-                            });
-                            let _ = tx
-                                .send(Ok(Event::default()
-                                    .event("content_block_start")
-                                    .data(blk.to_string())))
-                                .await;
-                            let d = json!({
-                                "type": "content_block_delta",
-                                "index": block_idx,
-                                "delta": {
-                                    "type": "input_json_delta",
-                                    "partial_json": tc.input.to_string()
-                                }
-                            });
-                            let _ = tx
-                                .send(Ok(Event::default()
-                                    .event("content_block_delta")
-                                    .data(d.to_string())))
-                                .await;
-                        }
-                    }
-                    RoutedStreamEvent::Finish(sum) => {
-                        if open_block.is_some() {
-                            close_open(&tx, block_idx).await;
-                            open_block = None;
-                        }
-                        let stop_reason = if !sum.tool_calls.is_empty() {
-                            "tool_use"
-                        } else {
-                            "end_turn"
-                        };
-                        let m_delta = json!({
-                            "type": "message_delta",
-                            "delta": { "stop_reason": stop_reason, "stop_sequence": Value::Null },
-                            "usage": {
-                                "input_tokens": sum.input_tokens,
-                                "cache_read_input_tokens": sum.cached_input_tokens,
-                                "output_tokens": sum.output_tokens
-                            }
-                        });
-                        let _ = tx
-                            .send(Ok(Event::default()
-                                .event("message_delta")
-                                .data(m_delta.to_string())))
-                            .await;
-                        let _ = tx
-                            .send(Ok(Event::default()
-                                .event("message_stop")
-                                .data(json!({ "type": "message_stop" }).to_string())))
-                            .await;
-                        completed_summary = Some(sum);
-                    }
-                    RoutedStreamEvent::Error(err_msg) => {
-                        stream_err = Some(err_msg.clone());
-                        let err_ev = json!({
-                            "type": "error",
-                            "error": { "type": "api_error", "message": err_msg }
-                        });
-                        let _ = tx
-                            .send(Ok(Event::default().event("error").data(err_ev.to_string())))
-                            .await;
-                        break;
-                    }
-                    _ => {}
+                    let partial = tc.input.to_string();
+                    self.buf.extend_from_slice(
+                        b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":",
+                    );
+                    put_usize_dec(&mut self.buf, self.block_idx);
+                    self.buf.extend_from_slice(
+                        b",\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":",
+                    );
+                    put_json_escaped_str(&mut self.buf, &partial);
+                    self.buf.extend_from_slice(b"}}\n\n");
                 }
             }
+            RoutedStreamEvent::Finish(sum) => {
+                if self.open_block.is_some() {
+                    self.write_close_open();
+                    self.open_block = None;
+                }
+                let stop_reason = if !sum.tool_calls.is_empty() {
+                    b"\"tool_use\"".as_slice()
+                } else {
+                    b"\"end_turn\"".as_slice()
+                };
+                self.buf.extend_from_slice(
+                    b"event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":",
+                );
+                self.buf.extend_from_slice(stop_reason);
+                self.buf
+                    .extend_from_slice(b",\"stop_sequence\":null},\"usage\":{\"input_tokens\":");
+                put_u64_dec(&mut self.buf, sum.input_tokens);
+                self.buf.extend_from_slice(b",\"cache_read_input_tokens\":");
+                put_u64_dec(&mut self.buf, sum.cached_input_tokens);
+                self.buf.extend_from_slice(b",\"output_tokens\":");
+                put_u64_dec(&mut self.buf, sum.output_tokens);
+                self.buf.extend_from_slice(
+                    b"}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+                );
+                self.completed_summary = Some(sum);
+                self.eof = true;
+            }
+            RoutedStreamEvent::Error(err_msg) => {
+                self.buf.extend_from_slice(
+                    b"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":",
+                );
+                put_json_escaped_str(&mut self.buf, &err_msg);
+                self.buf.extend_from_slice(b"}}\n\n");
+                self.stream_err = Some(err_msg);
+                self.eof = true;
+            }
+            _ => {}
+        }
+    }
+}
 
-            state_bg.telemetry.dec_active();
-            if let Some(sum) = completed_summary {
-                let oi_tools = sum
-                    .tool_calls
+impl Stream for AnthropicTranscodeSseStream {
+    type Item = std::result::Result<Bytes, std::io::Error>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        loop {
+            if this.eof {
+                if !this.buf.is_empty() {
+                    return Poll::Ready(Some(Ok(this.buf.split().freeze())));
+                }
+                return Poll::Ready(None);
+            }
+            match this.events.as_mut().poll_next(cx) {
+                Poll::Ready(Some(ev)) => {
+                    this.encode_event(ev);
+                    if this.buf.len() >= TRANSCODE_BATCH_CAP {
+                        return Poll::Ready(Some(Ok(this.buf.split().freeze())));
+                    }
+                }
+                Poll::Ready(None) => {
+                    this.eof = true;
+                    if !this.buf.is_empty() {
+                        return Poll::Ready(Some(Ok(this.buf.split().freeze())));
+                    }
+                    return Poll::Ready(None);
+                }
+                Poll::Pending => {
+                    if !this.buf.is_empty() {
+                        return Poll::Ready(Some(Ok(this.buf.split().freeze())));
+                    }
+                    return Poll::Pending;
+                }
+            }
+        }
+    }
+}
+
+impl Drop for AnthropicTranscodeSseStream {
+    fn drop(&mut self) {
+        self.state.telemetry.dec_active();
+        drop(self.conc_guard.take());
+        let Some(budget_guard) = self.budget_guard.take() else {
+            return;
+        };
+        let oi = self.oi.take().unwrap_or_default();
+        let raw_req = self.raw_req.take();
+
+        if let Some(sum) = self.completed_summary.take() {
+            let oi_tools = if self.need_deep_telemetry {
+                sum.tool_calls
                     .iter()
                     .map(|tc| {
                         (
@@ -687,81 +1100,69 @@ pub async fn handle_messages(
                             tc.input.to_string(),
                         )
                     })
-                    .collect();
-                finalize_request_accounting(
-                    &state_bg,
-                    &principal,
-                    budget_guard,
-                    msg_id,
-                    IngressProtocol::AnthropicMessages,
-                    requested_model,
-                    sum.resolved_model,
-                    sum.provider_id,
-                    sum.credential_id,
-                    200,
-                    true,
-                    sum.fallback_attempts,
-                    cache_hit,
-                    sum.ttft_ms,
-                    sum.duration_ms,
-                    sum.input_tokens,
-                    sum.cached_input_tokens,
-                    sum.reasoning_tokens,
-                    sum.output_tokens,
-                    sum.cost_nanos,
-                    sum.api_equiv_nanos,
-                    None,
-                    raw_req,
-                    None,
-                    oi,
-                    Some(sum.text),
-                    oi_tools,
-                );
+                    .collect()
             } else {
-                finalize_request_accounting(
-                    &state_bg,
-                    &principal,
-                    budget_guard,
-                    msg_id,
-                    IngressProtocol::AnthropicMessages,
-                    requested_model,
-                    resolved_model,
-                    provider_id,
-                    routed.credential_id,
-                    if stream_err.is_some() { 502 } else { 200 },
-                    true,
-                    routed.fallback_attempts,
-                    cache_hit,
-                    None,
-                    started.elapsed().as_millis() as u64,
-                    0,
-                    0,
-                    0,
-                    0,
-                    quixigate_core::NanoUsd::ZERO,
-                    quixigate_core::NanoUsd::ZERO,
-                    stream_err,
-                    raw_req,
-                    None,
-                    oi,
-                    None,
-                    Vec::new(),
-                );
-            }
-        });
-
-        let mut resp = Sse::new(ReceiverStream::new(rx))
-            .keep_alive(KeepAlive::default())
-            .into_response();
-        attach_gateway_headers(
-            resp.headers_mut(),
-            &hdr_msg_id,
-            &routed.provider_id,
-            &routed.resolved_model,
-            cache_hit,
-            quixigate_core::NanoUsd::ZERO,
-            quixigate_core::NanoUsd::ZERO,
-        );
-        Ok(resp)
+                Vec::new()
+            };
+            finalize_request_accounting(
+                &self.state,
+                &self.principal,
+                budget_guard,
+                std::mem::take(&mut self.msg_id),
+                IngressProtocol::AnthropicMessages,
+                std::mem::take(&mut self.requested_model),
+                sum.resolved_model,
+                sum.provider_id,
+                sum.credential_id,
+                200,
+                true,
+                sum.fallback_attempts,
+                self.cache_hit,
+                sum.ttft_ms,
+                sum.duration_ms,
+                sum.input_tokens,
+                sum.cached_input_tokens,
+                sum.reasoning_tokens,
+                sum.output_tokens,
+                sum.cost_nanos,
+                sum.api_equiv_nanos,
+                None,
+                raw_req,
+                None,
+                oi,
+                self.need_deep_telemetry.then_some(sum.text),
+                oi_tools,
+            );
+        } else {
+            finalize_request_accounting(
+                &self.state,
+                &self.principal,
+                budget_guard,
+                std::mem::take(&mut self.msg_id),
+                IngressProtocol::AnthropicMessages,
+                std::mem::take(&mut self.requested_model),
+                std::mem::take(&mut self.resolved_model),
+                std::mem::take(&mut self.provider_id),
+                self.credential_id.take(),
+                if self.stream_err.is_some() { 502 } else { 200 },
+                true,
+                self.fallback_attempts,
+                self.cache_hit,
+                None,
+                self.started.elapsed().as_millis() as u64,
+                0,
+                0,
+                0,
+                0,
+                NanoUsd::ZERO,
+                NanoUsd::ZERO,
+                self.stream_err.take(),
+                raw_req,
+                None,
+                oi,
+                None,
+                Vec::new(),
+            );
+        }
     }
 }

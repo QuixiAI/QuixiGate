@@ -34,7 +34,12 @@ bytes.workspace = true
 chrono.workspace = true
 dashmap.workspace = true
 futures.workspace = true
+fastrand.workspace = true
 http.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+itoa.workspace = true
 memchr.workspace = true
 mime_guess = { workspace = true, optional = true }
 parking_lot.workspace = true
@@ -46,6 +51,7 @@ serde.workspace = true
 serde_json.workspace = true
 serde_yaml_ng.workspace = true
 sha2.workspace = true
+socket2.workspace = true
 subtle.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true
@@ -55,6 +61,7 @@ tracing.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+mimalloc.workspace = true
 opentelemetry-proto.workspace = true
 prost.workspace = true
 tempfile.workspace = true
