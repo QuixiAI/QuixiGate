@@ -11,11 +11,11 @@ Serve OpenAI, Anthropic, Gemini, OpenRouter, Vercel AI SDK, and MCP clients thro
 
 **Why people switch:**
 
-1. **Less overhead** — small compiled Rust binary instead of a Python service stack.
-2. **Fewer services to run** — embedded SQLite (WAL) + AES-256-GCM vault and budgets; no external Postgres or Redis required.
+1. **Less overhead** — **`20.1 MB`** (`19.2 MiB`) single Rust binary with **`8.4 ms`** cold start and **`23.7 MiB`** idle RSS (`14 MB` physical footprint) instead of a `499 MB` Python + Prisma stack.
+2. **Fewer services to run** — embedded SQLite (WAL) + AES-256-GCM vault and lock-free `AtomicI64` budgets; no external Postgres or Redis required.
 3. **Governance without a paid tier** — virtual keys, OIDC/JWKS, audit logs, team controls, model restrictions, and hosted `/mcp` all under MIT.
 4. **One local → subscription → cloud path** — auto-discover local runtimes, pool OAuth seats with sticky routing, and optionally burst to OpenRouter on 429/saturation.
-5. **Clean, auditable code** — `~44K` Rust SLOC across 9 focused crates vs. LiteLLM's `~1.2M` LOC (~27× smaller), with zero vendor SDK bloat or in-process SaaS anti-patterns.
+5. **Clean, auditable code** — **`~50K`** production Rust SLOC across 9 focused crates vs. LiteLLM's `~1.2M` LOC (`~24×` smaller), with zero vendor SDK bloat or in-process SaaS anti-patterns.
 
 **macOS & Linux:**
 
@@ -47,21 +47,49 @@ quixigate run claude
 
 ## QuixiGate vs. LiteLLM Proxy
 
-| Dimension | **QuixiGate** | **LiteLLM Proxy** |
+| Dimension | **QuixiGate (`v0.2.1`)** | **LiteLLM Proxy (`v1.109.1`)** |
 | :--- | :--- | :--- |
-| **Runtime / Cold Start** | Compiled Rust (`tokio` + `axum`); **`<10 ms`** cold start | Python-based; **`15–45 s`** typical startup depending on environment |
-| **Memory & Distribution** | **`~18 MB`** single binary (`macOS arm64` release) · **`<20 MB`** idle RSS | Python + Node/Prisma stack; memory varies with enabled services and load (often 800 MB–1.5 GB+) |
-| **Infrastructure for Keys & Budgets** | Embedded **SQLite (WAL)** + AES-256-GCM vault; zero external database or cache | PostgreSQL-backed key/spend management; Redis commonly used for coordination and caching |
+| **Runtime / Cold Start** | Compiled Rust (`tokio` + `hyper` + `axum`, per-core workers); **`8.4 ms`** cold start (`14.5 ms` fresh DB init) | Python (`uvloop` / Granian) + Prisma sidecars; **`4.2–8.0 s`** stateless, **`11.3–16.8 s`** with DB |
+| **Memory & Distribution** | **`20.1 MB`** (`19.2 MiB`) single binary (`macOS arm64`) · **`23.7 MiB`** idle RSS (`14 MB` physical footprint) · **`157 MiB`** peak @ `1,000` live streams | `499 MB` (`120` Python pkgs) · **`941 MiB`** idle (1 worker) to **`5.3–11.9 GiB`** idle (8–18 workers) · **`6.9–15.7 GiB`** @ `1,000` streams |
+| **Infrastructure for Keys & Budgets** | Embedded **SQLite (WAL)** + AES-256-GCM vault; zero external database or cache | PostgreSQL-backed key/spend management; Redis used for multi-worker coordination and caching |
 | **Licensing** | MIT; no paid tier for OIDC/JWKS, audit logs, virtual keys, team budgets, tags, or `/mcp` | Open-source core plus separately licensed enterprise features (gates vary by release) |
-| **Budget Accounting** | Exact **`NanoUsd`** (`i64`, `10⁻⁹` USD) integer ledger with race-free SQLite reservations | Floating-point spend calculations in relevant paths |
+| **Budget Accounting** | Exact **`NanoUsd`** (`i64`, `10⁻⁹` USD) ledger with lock-free **`AtomicI64`** reservations + batched SQLite WAL write-behind | Floating-point spend calculations + external Postgres/Prisma & Redis round-trips |
 | **Local Models** | Zero-config auto-discovery of `llama-server`, Ollama, LM Studio, MLX, and vLLM with live VRAM/slot awareness | Local providers configured via YAML or API |
 | **Subscription + Cloud Routing** | Multi-seat OAuth pooling with sticky `fill_first` cache affinity + optional 1-click OpenRouter PKCE burst | Provider/model routing and fallbacks; behavior depends on configuration and license |
 | **Coding-CLI Launching** | `quixigate run` injects environment in-memory for `claude`, `codex`, `gemini`, `opencode`, and `ori` (zero dotfile mutation) | Clients pointed at the proxy via environment or config |
 | **Observability / MCP** | Built-in OpenInference OTLP (http/protobuf & gRPC) + free Streamable-HTTP `/mcp` | Callbacks and integrations; some admin/MCP features paywalled |
 | **LiteLLM API Compatibility** | **997 / 997** LiteLLM routes accounted for: live data/control-plane parity + actionable `400` DIY migration guidance on excluded SaaS/RAG routes | Reference surface |
-| **Source Scope** | **`~44K`** production Rust SLOC (+ optional UI) across 9 crates | Larger Python + TypeScript codebase with broader integration surface |
+| **Source Scope** | **`~50K`** production Rust SLOC (+ optional UI) across 9 crates | `~1.2M` Python + TypeScript LOC with broader SaaS/vendor integration surface |
 
-**Comparison notes:** Size and startup figures reflect release builds (`lto = "fat"`, `mimalloc`, stripped symbols). Startup time, RSS, and throughput vary by hardware, OS, and enabled features. Licensing notes reflect an audit of LiteLLM's repository snapshot and may evolve across releases. Independent benchmarks and verification are welcome.
+## Benchmarks at Scale
+
+Measured across **three isolated OS process tiers** (load generator -> gateway -> 8-shard mock OpenAI upstream with a verified `134K–137K req/s` ceiling) over loopback `HTTP/1.1` keep-alive on an Apple M5 Max (`18` CPU cores, `128 GB` RAM, `macOS arm64`). LiteLLM `v1.109.1` was tested with `uvloop` + `httptools` + `orjson`, access logs disabled, across `1`, `8`, and `18` workers (plus `Granian`), and backed by RAM-`tmpfs` **PostgreSQL 16** (`synchronous_commit=off`) + **Redis 7** for governance:
+
+| Workload | **QuixiGate `v0.2.1`**<br>*(1 binary, SQLite WAL)* | **LiteLLM `1w`**<br>*(default CLI)* | **LiteLLM Best (`8w` / `18w`)**<br>*(`uvloop` + Postgres + Redis)* | **QuixiGate vs. Best LiteLLM** |
+| :--- | :---: | :---: | :---: | :---: |
+| **Cold Start -> `/health/liveness`** | **`8.4 ms`** (stateless)<br>**`8.5 ms`** (governed) | `4,224 ms` | `6,009–7,960 ms` (no DB)<br>`11,262–16,759 ms` (DB) | **`503×–1,972×` faster** |
+| **Idle Memory (`RSS`)** | **`23.7 MiB`** (`1` proc) | `941 MiB` (`1` proc) | `5.17 GiB` (`8w`) – `11.66 GiB` (`18w`) | **`40×–504×` less RAM** |
+| **Stateless JSON (`c=64`)** | **`70,690 req/s`** · p50 `0.83 ms` | `296 req/s` · p50 `211 ms` | `2,412 req/s` (`18w`) · p50 `26.1 ms` | **`29.3×` req/s · `31×` lower p50** |
+| **Stateless SSE 300-Tok (`c=64`)** | **`2.94M tok/s`** (`9,806 req/s`)<br>TTFT p99 `8.46 ms` | `5,664 tok/s` (`19 req/s`)<br>TTFT p99 `1,747 ms` | `41,912 tok/s` (`18w`, `140 req/s`)<br>TTFT p99 `457 ms` | **`70.2×` tok/s · `54×` lower p99** |
+| **Governed Key + `$1M` Budget JSON (`c=64`)** | **`66,605 req/s`** · p50 `0.84 ms`<br>`98.4 MiB` RSS | — *(requires DB)* | `1,232 req/s` (`8w`) · p50 `45.8 ms`<br>`6.67 GiB` RSS | **`54.1×` req/s · `69×` less RAM** |
+| **Governed Key + `$1M` Budget SSE 300-Tok (`c=64`)** | **`3.09M tok/s`** (`10,309 req/s`)<br>TTFT p99 `8.45 ms` · `104 MiB` | — *(requires DB)* | `30,066 tok/s` (`8w`, `100 req/s`)<br>TTFT p99 `565 ms` · `7.31 GiB` | **`102.9×` tok/s · `72×` less RAM** |
+| **Governed `1,000` Live GPU Streams** *(20ms prefill + 80ms decode)* | **`974,742 tok/s`** (`4,874 req/s`)<br>TTFT p50 `38.8 ms` · `0` errs · **`156.9 MiB`** | `4,740 tok/s` *(no DB)*<br>**`70%` errors** (`2,102/3,000`) | `23,418 tok/s` (`8w`, `117 req/s`)<br>TTFT p50 `3,210 ms` · **`8.09 GiB`** | **`41.6×` tok/s · `83×` lower TTFT**<br>**`53×` less RAM** |
+
+Reproduce every number locally from [`crates/quixigate-proxy/examples/`](crates/quixigate-proxy/examples):
+
+```bash
+# Build release gateway binary (lto = "fat", mimalloc, stripped)
+cargo build --release
+
+# 1. End-to-end 3-process scale benchmark (QuixiGate-only or side-by-side with LiteLLM):
+QUIXIGATE_ONLY=1 cargo run --release -p quixigate-proxy --example litellm_vs_quixigate_bench
+LITELLM_BIN=/path/to/venv/bin/litellm cargo run --release -p quixigate-proxy --example litellm_vs_quixigate_bench
+
+# 2. Sub-millisecond gateway routing & SSE framing micro-benchmark:
+cargo run --release -p quixigate-proxy --example router_bench
+```
+
+> **Comparison notes:** Startup time, RSS, and throughput vary by hardware, OS, and enabled features. Licensing notes reflect an audit of LiteLLM's repository snapshot and may evolve across releases. Independent benchmarks and verification are welcome.
 
 ## Screenshots
 
@@ -133,7 +161,7 @@ flowchart LR
 | :--- | :--- | :--- |
 | **OpenAI Chat & Legacy Completions** | `POST /v1/chat/completions`, `POST /v1/completions` | Streaming SSE, tools, `:online` search, JSON schema, Azure `/openai/deployments/{model}/*`, Cursor `/cursor/*` |
 | **OpenAI Responses** | `POST /v1/responses` + **WebSocket** | Native Codex CLI WebSocket & SSE streaming + `/input_tokens` & `/compact` |
-| **Multimodal, Rerank & Search** | `/v1/embeddings`, `/v1/images/*`, `/v1/audio/*`, `/v1/moderations`, `/v1/rerank`, `/v1/search*` | Image gen/edits, TTS & Whisper STT, local+upstream moderation, Cohere/Jina rerank, 6-engine web search |
+| **Multimodal, Rerank & Search** | `/v1/embeddings`, `/v1/images/*`, `/v1/audio/*`, `/v1/moderations`, `/v1/rerank`, `/v1/search*` | Image gen/edits, TTS & Whisper STT, local+upstream moderation, Cohere/Jina rerank, 10-backend web search |
 | **Anthropic Messages** | `POST /v1/messages`, `/count_tokens` | Native Claude Code thinking & tool blocks (+ unprefixed `/messages`) |
 | **Google Gemini** | `POST /v1beta/models/{model}:{action}` | `generateContent`, `streamGenerateContent` & `countTokens` |
 | **OpenRouter API Surface** | `/api/v1/{models,presets,credits,key,...}` | Drop-in compatibility for `ori` & OpenRouter SDKs |
@@ -149,7 +177,7 @@ Authentication, auditability, cost attribution, and basic security controls ship
 | **OIDC / JWKS SSO** | Native OIDC Discovery + JWKS (RS*, PS*, ES256/ES384, EdDSA), live `kid` rotation, unlimited JIT users/teams |
 | **Audit Logs** | Immutable SQLite log of every key, credential, route, user, team, and settings change + `GET /audit/logs` |
 | **Tags & Tag Budgets** | Tags on keys/teams/requests + exact NanoUsd per-tag budgets + `GET /spend/report` |
-| **Per-Model Budgets** | Atomic SQLite pre-flight NanoUsd reservations on virtual keys and teams |
+| **Per-Model Budgets** | Lock-free `AtomicI64` NanoUsd reservations backed by batched SQLite WAL persistence on keys and teams |
 | **Hosted `/mcp`** | Streamable-HTTP MCP exposing web search, web fetch, model catalog, spend, and admin inspection |
 | **Key Rotation** | Self-service and admin regeneration with configurable grace windows |
 | **Wildcard Model ACLs** | Glob matching (`ollama/*`, `anthropic/*`, `@preset/*`) on keys and teams |
@@ -161,7 +189,7 @@ Authentication, auditability, cost attribution, and basic security controls ship
 
 ## Why the Codebase Stays Smaller
 
-QuixiGate comprises ~44K production Rust SLOC across 9 crates. It stays compact by refusing several patterns common in larger Python gateways:
+QuixiGate comprises `~50K` production Rust SLOC across 9 crates. It stays compact by refusing several patterns common in larger Python gateways:
 
 1. **No in-process vendor logger and cloud SDK soup.** Emits vendor-neutral OpenTelemetry / OpenInference OTLP once. An external collector fans out to any sink.
 2. **No 4-tier multi-tenant ORM.** Embedded SQLite (WAL) with Team + User + VirtualKey + EndUser + Budgets + Tags + AccessGroups + OIDC claim mapping covers governance without external databases.
@@ -182,4 +210,3 @@ Requires a recent Rust toolchain (edition 2024).
 ## License & Status
 
 Licensed under the [MIT License](LICENSE).
-

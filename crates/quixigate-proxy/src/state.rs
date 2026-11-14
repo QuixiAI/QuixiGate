@@ -116,14 +116,12 @@ impl AppState {
         self
     }
 
-    /// Creates a core-local `AppState` clone with a dedicated outbound `reqwest::Client` connection
-    /// pool pinned to the calling worker thread's Tokio reactor, while sharing `Database`,
+    /// Creates a core-local `AppState` clone with a lazy outbound `reqwest::Client` connection
+    /// pool slot pinned to the calling worker thread's Tokio reactor, while sharing `Database`,
     /// `ModelCatalog`, `PoolSelector`, and `TelemetryHub`.
     pub fn fork_for_worker_core(&self) -> Self {
         let mut forked = self.clone();
-        forked.router = self
-            .router
-            .fork_with_http(quixigate_providers::build_inference_http_client());
+        forked.router = forked.router.with_sharded_http_pool(1);
         forked
     }
 

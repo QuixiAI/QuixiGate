@@ -51,7 +51,7 @@ impl Default for RefreshEndpoints {
 #[derive(Clone)]
 pub struct CredentialRefresher {
     db: Database,
-    http: reqwest::Client,
+    http: Arc<std::sync::OnceLock<reqwest::Client>>,
     flights: Arc<DashMap<String, Arc<AsyncMutex<()>>>>,
     replay_cache: Arc<DashMap<String, (Instant, CredentialRecord, CredentialSecret)>>,
     endpoints: RefreshEndpoints,
@@ -65,10 +65,7 @@ impl CredentialRefresher {
     pub fn with_endpoints(db: Database, endpoints: RefreshEndpoints) -> Self {
         Self {
             db,
-            http: reqwest::Client::builder()
-                .timeout(Duration::from_secs(30))
-                .build()
-                .unwrap_or_default(),
+            http: Arc::new(std::sync::OnceLock::new()),
             flights: Arc::new(DashMap::new()),
             replay_cache: Arc::new(DashMap::new()),
             endpoints,
@@ -76,7 +73,12 @@ impl CredentialRefresher {
     }
 
     pub fn http(&self) -> &reqwest::Client {
-        &self.http
+        self.http.get_or_init(|| {
+            reqwest::Client::builder()
+                .timeout(Duration::from_secs(30))
+                .build()
+                .unwrap_or_default()
+        })
     }
 
     /// Zero-clone fast path returning `(CredentialRecord, Arc<CredentialSecret>)` when the
@@ -174,7 +176,7 @@ impl CredentialRefresher {
                 ..
             } => {
                 let renewed = providers::refresh_codex_token(
-                    &self.http,
+                    self.http(),
                     &self.endpoints.codex_token_url,
                     refresh,
                     account_id,
@@ -188,7 +190,7 @@ impl CredentialRefresher {
                 ..
             } => {
                 let renewed = providers::refresh_xai_token(
-                    &self.http,
+                    self.http(),
                     token_endpoint,
                     refresh,
                     self.endpoints.allow_loopback_xai,
@@ -205,7 +207,7 @@ impl CredentialRefresher {
                 ..
             } => {
                 let renewed = providers::refresh_gemini_token(
-                    &self.http,
+                    self.http(),
                     &self.endpoints.google_token_url,
                     refresh,
                     project_id,
@@ -232,7 +234,7 @@ impl CredentialRefresher {
                         format!("https://api.{dom}/copilot_internal/v2/token")
                     };
                 let renewed = providers::exchange_github_for_copilot(
-                    &self.http,
+                    self.http(),
                     &exchange_url,
                     github_token,
                     enterprise_domain.as_deref(),
@@ -250,7 +252,7 @@ impl CredentialRefresher {
                 ..
             } => {
                 let renewed = providers::refresh_qwen_token(
-                    &self.http,
+                    self.http(),
                     &self.endpoints.qwen_token_url,
                     refresh,
                     resource_url.as_deref(),
@@ -271,7 +273,7 @@ impl CredentialRefresher {
                 ..
             } => {
                 let renewed = providers::refresh_chutes_token(
-                    &self.http,
+                    self.http(),
                     &self.endpoints.chutes_token_url,
                     refresh,
                     email.as_deref(),
@@ -300,7 +302,7 @@ impl CredentialRefresher {
                         )
                     })?;
                 let renewed = providers::exchange_openrouter_oidc_token(
-                    &self.http,
+                    self.http(),
                     token_endpoint,
                     &fresh_subject,
                     federation_policy_id.as_deref(),

@@ -7,7 +7,7 @@ use std::io::Read;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use arc_swap::ArcSwap;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use flate2::read::GzDecoder;
 use quixigate_core::{AuthKind, LocalRuntimeStatus, ModelRoute, NanoUsd, OpenRouterPreset};
 use serde::{Deserialize, Serialize};
@@ -57,31 +57,54 @@ struct CatalogSnapshot {
     bare_to_canonical: HashMap<String, String>,
 }
 
+fn embedded_seed_snapshot() -> Arc<CatalogSnapshot> {
+    static EMBEDDED_SNAP: std::sync::OnceLock<Arc<CatalogSnapshot>> = std::sync::OnceLock::new();
+    EMBEDDED_SNAP
+        .get_or_init(|| {
+            let mut decoder = GzDecoder::new(EMBEDDED_MODELS_DEV_GZ);
+            let mut json_bytes = Vec::new();
+            let mut snap = if decoder.read_to_end(&mut json_bytes).is_ok()
+                && let Ok(val) = serde_json::from_slice::<Value>(&json_bytes)
+            {
+                parse_models_dev_json(&val)
+            } else {
+                CatalogSnapshot::default()
+            };
+            insert_openrouter_meta_models(&mut snap.by_canonical, true);
+            Arc::new(snap)
+        })
+        .clone()
+}
+
 #[derive(Clone)]
 pub struct ModelCatalog {
-    snapshot: Arc<ArcSwap<CatalogSnapshot>>,
+    snapshot: Arc<ArcSwapOption<CatalogSnapshot>>,
     presets: Arc<ArcSwap<Vec<OpenRouterPreset>>>,
     generation: Arc<AtomicU64>,
 }
 
 impl ModelCatalog {
-    /// Loads and indexes the embedded `assets/models.dev.json.gz` snapshot in ~5ms.
+    /// Creates a lazy catalog handle (`0 ns`, `0` heap bytes at boot); the embedded
+    /// `assets/models.dev.json.gz` snapshot is gunzipped & indexed on first query if no live sync
+    /// has already populated the catalog.
     pub fn embedded() -> Self {
-        let mut decoder = GzDecoder::new(EMBEDDED_MODELS_DEV_GZ);
-        let mut json_bytes = Vec::new();
-        let mut snap = if decoder.read_to_end(&mut json_bytes).is_ok()
-            && let Ok(val) = serde_json::from_slice::<Value>(&json_bytes)
-        {
-            parse_models_dev_json(&val)
-        } else {
-            CatalogSnapshot::default()
-        };
-        insert_openrouter_meta_models(&mut snap.by_canonical, true);
         Self {
-            snapshot: Arc::new(ArcSwap::from_pointee(snap)),
+            snapshot: Arc::new(ArcSwapOption::empty()),
             presets: Arc::new(ArcSwap::from_pointee(Vec::new())),
             generation: Arc::new(AtomicU64::new(1)),
         }
+    }
+
+    #[inline]
+    fn load_snapshot(&self) -> Arc<CatalogSnapshot> {
+        if let Some(snap) = self.snapshot.load_full() {
+            return snap;
+        }
+        let seed = embedded_seed_snapshot();
+        let _ = self
+            .snapshot
+            .compare_and_swap(&None::<Arc<CatalogSnapshot>>, Some(seed.clone()));
+        self.snapshot.load_full().unwrap_or(seed)
     }
 
     #[inline]
@@ -102,7 +125,7 @@ impl ModelCatalog {
         insert_openrouter_meta_models(&mut snap.by_canonical, true);
         let count = snap.by_canonical.len();
         if count > 0 {
-            self.snapshot.store(Arc::new(snap));
+            self.snapshot.store(Some(Arc::new(snap)));
             self.generation.fetch_add(1, Ordering::AcqRel);
         }
         Ok(count)
@@ -158,7 +181,7 @@ impl ModelCatalog {
             models_resp.json().await?
         };
 
-        let mut next_snap = (**self.snapshot.load()).clone();
+        let mut next_snap = (*self.load_snapshot()).clone();
         if models_val["data"].is_array() {
             for model in next_snap.by_canonical.values_mut() {
                 model.providers.remove("openrouter");
@@ -285,7 +308,7 @@ impl ModelCatalog {
 
         let include_free_router = !used_user_filtered || any_free_model;
         insert_openrouter_meta_models(&mut next_snap.by_canonical, include_free_router);
-        self.snapshot.store(Arc::new(next_snap));
+        self.snapshot.store(Some(Arc::new(next_snap)));
 
         let mut synced_presets = Vec::new();
         if let Some(tok) = bearer_token.filter(|t| !t.trim().is_empty())
@@ -350,8 +373,7 @@ impl ModelCatalog {
 
     /// Returns the total number of models currently routable through OpenRouter in the catalog.
     pub fn openrouter_model_count(&self) -> usize {
-        self.snapshot
-            .load()
+        self.load_snapshot()
             .by_canonical
             .values()
             .filter(|m| m.providers.contains_key("openrouter"))
@@ -410,7 +432,7 @@ impl ModelCatalog {
     /// directly from the lock-free `ArcSwap<CatalogSnapshot>` without cloning `CatalogModel` strings or maps.
     #[inline]
     pub fn lookup_pricing(&self, model: &str) -> Option<(NanoUsd, NanoUsd, NanoUsd)> {
-        let snap = self.snapshot.load();
+        let snap = self.load_snapshot();
         let trimmed = model.trim();
         if let Some(slug) = trimmed.strip_prefix("@preset/") {
             let presets = self.presets.load();
@@ -439,7 +461,7 @@ impl ModelCatalog {
     /// Looks up a catalog model by canonical `author/model`, `@preset/<slug>`, `~author/*-latest`,
     /// `provider/model`, or bare `model` name.
     pub fn lookup(&self, model: &str) -> Option<CatalogModel> {
-        let snap = self.snapshot.load();
+        let snap = self.load_snapshot();
         let trimmed = model.trim();
         if let Some(slug) = trimmed.strip_prefix("@preset/") {
             let presets = self.presets.load();
@@ -521,7 +543,7 @@ impl ModelCatalog {
         local_runtimes: &[LocalRuntimeStatus],
         openrouter_connected: bool,
     ) -> Vec<CatalogModel> {
-        let snap = self.snapshot.load();
+        let snap = self.load_snapshot();
         let mut out: Vec<CatalogModel> = snap.by_canonical.values().cloned().collect();
 
         if openrouter_connected {

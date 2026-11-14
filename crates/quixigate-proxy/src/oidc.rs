@@ -53,7 +53,7 @@ pub struct OidcVerifier {
 }
 
 struct OidcInner {
-    http: reqwest::Client,
+    http: std::sync::OnceLock<reqwest::Client>,
     snapshot: RwLock<JwksSnapshot>,
     refresh_lock: tokio::sync::Mutex<()>,
 }
@@ -66,23 +66,28 @@ impl Default for OidcVerifier {
 
 impl OidcVerifier {
     pub fn new() -> Self {
-        let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(5))
-            .connect_timeout(Duration::from_secs(3))
-            .user_agent(format!(
-                "{}/{}",
-                quixigate_core::brand::BRAND_SLUG,
-                env!("CARGO_PKG_VERSION")
-            ))
-            .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
         Self {
             inner: Arc::new(OidcInner {
-                http,
+                http: std::sync::OnceLock::new(),
                 snapshot: RwLock::new(JwksSnapshot::default()),
                 refresh_lock: tokio::sync::Mutex::new(()),
             }),
         }
+    }
+
+    fn http_client(&self) -> &reqwest::Client {
+        self.inner.http.get_or_init(|| {
+            quixigate_providers::shared_tls_client_builder()
+                .timeout(Duration::from_secs(5))
+                .connect_timeout(Duration::from_secs(3))
+                .user_agent(format!(
+                    "{}/{}",
+                    quixigate_core::brand::BRAND_SLUG,
+                    env!("CARGO_PKG_VERSION")
+                ))
+                .build()
+                .unwrap_or_default()
+        })
     }
 
     pub fn is_configured(settings: &GatewaySettings) -> bool {
@@ -154,7 +159,7 @@ impl OidcVerifier {
             }
         }
 
-        match fetch_jwks_snapshot(&self.inner.http, settings, &fp).await {
+        match fetch_jwks_snapshot(self.http_client(), settings, &fp).await {
             Ok(new_snap) => {
                 *self.inner.snapshot.write() = new_snap;
             }

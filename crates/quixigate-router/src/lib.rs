@@ -219,13 +219,11 @@ impl GatewayRouter {
                     .collect()
             })
             .unwrap_or_default();
-        let web_search_engine = Arc::new(tools::WebSearchEngine::new(refresher.http().clone()));
+        let web_search_engine = Arc::new(tools::WebSearchEngine::new_lazy());
         Self {
             db,
             refresher,
-            inference_pool: quixigate_providers::ShardedHttpPool::from_single(
-                quixigate_providers::shared_inference_http_client(),
-            ),
+            inference_pool: quixigate_providers::ShardedHttpPool::new(64),
             catalog,
             pool: Arc::new(PoolSelector::new()),
             plan_cache: Arc::new(dashmap::DashMap::new()),

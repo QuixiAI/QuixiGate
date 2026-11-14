@@ -119,8 +119,8 @@ struct RollingPerf {
 
 #[derive(Clone)]
 pub struct LocalRuntimeScanner {
-    http: reqwest::Client,
-    control_http: reqwest::Client,
+    http: Arc<std::sync::OnceLock<reqwest::Client>>,
+    control_http: Arc<std::sync::OnceLock<reqwest::Client>>,
     endpoints: Arc<RwLock<Vec<LocalEndpointSpec>>>,
     api_keys: Arc<DashMap<String, String>>,
     statuses: Arc<DashMap<String, LocalRuntimeStatus>>,
@@ -130,14 +130,6 @@ pub struct LocalRuntimeScanner {
 
 impl LocalRuntimeScanner {
     pub fn new() -> Self {
-        let http = reqwest::Client::builder()
-            .timeout(Duration::from_millis(850))
-            .build()
-            .unwrap_or_default();
-        let control_http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(15))
-            .build()
-            .unwrap_or_default();
         let endpoints = LocalEndpointSpec::defaults();
         let api_keys = DashMap::new();
         if let Ok(k) =
@@ -155,14 +147,34 @@ impl LocalRuntimeScanner {
             );
         }
         Self {
-            http,
-            control_http,
+            http: Arc::new(std::sync::OnceLock::new()),
+            control_http: Arc::new(std::sync::OnceLock::new()),
             endpoints: Arc::new(RwLock::new(endpoints)),
             api_keys: Arc::new(api_keys),
             statuses: Arc::new(statuses),
             perf: Arc::new(DashMap::new()),
             generation: Arc::new(std::sync::atomic::AtomicU64::new(1)),
         }
+    }
+
+    #[inline]
+    fn http(&self) -> &reqwest::Client {
+        self.http.get_or_init(|| {
+            crate::shared_tls_client_builder()
+                .timeout(Duration::from_millis(850))
+                .build()
+                .unwrap_or_default()
+        })
+    }
+
+    #[inline]
+    fn control_http(&self) -> &reqwest::Client {
+        self.control_http.get_or_init(|| {
+            crate::shared_tls_client_builder()
+                .timeout(Duration::from_secs(15))
+                .build()
+                .unwrap_or_default()
+        })
     }
 
     #[inline]
@@ -348,7 +360,7 @@ impl LocalRuntimeScanner {
         let action = if load { "load" } else { "unload" };
         let url = format!("{root}/models/{action}");
         let mut req = self
-            .control_http
+            .control_http()
             .post(&url)
             .json(&json!({ "model": model }));
         if let Some(key) = self.api_key_for(&id) {
@@ -431,7 +443,7 @@ impl LocalRuntimeScanner {
         let root = server_root(&ep.base_url);
         let tags_url = format!("{root}/api/tags");
         let ps_url = format!("{root}/api/ps");
-        let mut req = self.http.get(&tags_url);
+        let mut req = self.http().get(&tags_url);
         if let Some(k) = api_key {
             req = req.bearer_auth(k);
         }
@@ -449,7 +461,7 @@ impl LocalRuntimeScanner {
             .collect();
 
         let mut loaded_models = Vec::new();
-        let mut ps_req = self.http.get(&ps_url);
+        let mut ps_req = self.http().get(&ps_url);
         if let Some(k) = api_key {
             ps_req = ps_req.bearer_auth(k);
         }
@@ -509,7 +521,7 @@ impl LocalRuntimeScanner {
     ) -> Option<LocalRuntimeStatus> {
         let root = server_root(&ep.base_url);
         let native_url = format!("{root}/api/v0/models");
-        let mut req = self.http.get(&native_url);
+        let mut req = self.http().get(&native_url);
         if let Some(k) = api_key {
             req = req.bearer_auth(k);
         }
@@ -589,15 +601,15 @@ impl LocalRuntimeScanner {
         let models_url = models_endpoint(&ep.base_url);
 
         let health_status = self
-            .http
+            .http()
             .get(&health_url)
             .send()
             .await
             .ok()
             .map(|r| r.status().as_u16());
 
-        let mut models_req = self.http.get(&models_url);
-        let mut props_req = self.http.get(&props_url);
+        let mut models_req = self.http().get(&models_url);
+        let mut props_req = self.http().get(&props_url);
         if let Some(k) = api_key {
             models_req = models_req.bearer_auth(k);
             props_req = props_req.bearer_auth(k);
@@ -802,7 +814,7 @@ impl LocalRuntimeScanner {
         now_ms: i64,
     ) -> LocalRuntimeStatus {
         let models_url = models_endpoint(&ep.base_url);
-        let mut req = self.http.get(&models_url);
+        let mut req = self.http().get(&models_url);
         if let Some(k) = api_key {
             req = req.bearer_auth(k);
         }

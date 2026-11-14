@@ -35,7 +35,11 @@ const DEFAULT_EXA_MCP_URL: &str = "https://mcp.exa.ai/mcp";
 const DEFAULT_PARALLEL_MCP_URL: &str = "https://search.parallel.ai/mcp";
 const DEFAULT_BING_RSS_URL: &str = "https://www.bing.com/search";
 const DEFAULT_DDG_LITE_URL: &str = "https://lite.duckduckgo.com/lite/";
-const SEARCH_USER_AGENT: &str = "QuixiGate/0.1 (+https://quixi.ai)";
+const SEARCH_USER_AGENT: &str = concat!(
+    "QuixiGate/",
+    env!("CARGO_PKG_VERSION"),
+    " (+https://quixi.ai)"
+);
 const SEARCH_CACHE_TTL: Duration = Duration::from_secs(600);
 const MAX_SNIPPET_CHARS: usize = 600;
 const DEFAULT_FETCH_MAX_CHARS: usize = 12_000;
@@ -172,8 +176,8 @@ impl Default for KeylessEndpoints {
 
 /// Shared stateful web search & fetch engine (TTL memo cache + keyless round-robin cursor).
 pub struct WebSearchEngine {
-    http: reqwest::Client,
-    no_redirect_http: reqwest::Client,
+    http: std::sync::OnceLock<reqwest::Client>,
+    no_redirect_http: std::sync::OnceLock<reqwest::Client>,
     cache: Cache<String, Value>,
     ring_cursor: AtomicUsize,
     session_id: String,
@@ -182,6 +186,23 @@ pub struct WebSearchEngine {
 }
 
 impl WebSearchEngine {
+    pub fn new_lazy() -> Self {
+        let uuid = Uuid::new_v4();
+        let seed = uuid.as_u128() as usize;
+        Self {
+            http: std::sync::OnceLock::new(),
+            no_redirect_http: std::sync::OnceLock::new(),
+            cache: Cache::builder()
+                .max_capacity(512)
+                .time_to_live(SEARCH_CACHE_TTL)
+                .build(),
+            ring_cursor: AtomicUsize::new(seed),
+            session_id: uuid.simple().to_string(),
+            keyless_endpoints: KeylessEndpoints::default(),
+            allow_private_fetch_for_tests: false,
+        }
+    }
+
     pub fn new(http: reqwest::Client) -> Self {
         Self::with_endpoints(http, KeylessEndpoints::default(), false)
     }
@@ -191,18 +212,13 @@ impl WebSearchEngine {
         keyless_endpoints: KeylessEndpoints,
         allow_private_fetch_for_tests: bool,
     ) -> Self {
-        let no_redirect_http = reqwest::Client::builder()
-            .redirect(Policy::none())
-            .connect_timeout(Duration::from_secs(8))
-            .timeout(Duration::from_secs(15))
-            .user_agent(SEARCH_USER_AGENT)
-            .build()
-            .unwrap_or_else(|_| http.clone());
+        let http_cell = std::sync::OnceLock::new();
+        let _ = http_cell.set(http);
         let uuid = Uuid::new_v4();
         let seed = uuid.as_u128() as usize;
         Self {
-            http,
-            no_redirect_http,
+            http: http_cell,
+            no_redirect_http: std::sync::OnceLock::new(),
             cache: Cache::builder()
                 .max_capacity(512)
                 .time_to_live(SEARCH_CACHE_TTL)
@@ -212,6 +228,29 @@ impl WebSearchEngine {
             keyless_endpoints,
             allow_private_fetch_for_tests,
         }
+    }
+
+    #[inline]
+    fn http(&self) -> &reqwest::Client {
+        self.http.get_or_init(|| {
+            quixigate_providers::shared_tls_client_builder()
+                .timeout(Duration::from_secs(30))
+                .build()
+                .unwrap_or_default()
+        })
+    }
+
+    #[inline]
+    fn no_redirect_http(&self) -> &reqwest::Client {
+        self.no_redirect_http.get_or_init(|| {
+            quixigate_providers::shared_tls_client_builder()
+                .redirect(Policy::none())
+                .connect_timeout(Duration::from_secs(8))
+                .timeout(Duration::from_secs(15))
+                .user_agent(SEARCH_USER_AGENT)
+                .build()
+                .unwrap_or_else(|_| self.http().clone())
+        })
     }
 
     pub async fn search(
@@ -537,7 +576,7 @@ impl WebSearchEngine {
     ) -> Result<Value, String> {
         let started = Instant::now();
         let resp = self
-            .http
+            .http()
             .get(endpoint)
             .query(&[
                 ("q", query),
@@ -608,7 +647,7 @@ impl WebSearchEngine {
         limit: usize,
     ) -> Result<Vec<NormalizedSearchHit>, String> {
         let resp = self
-            .http
+            .http()
             .post("https://api.tavily.com/search")
             .timeout(Duration::from_secs(15))
             .json(&json!({
@@ -656,7 +695,7 @@ impl WebSearchEngine {
         limit: usize,
     ) -> Result<Vec<NormalizedSearchHit>, String> {
         let resp = self
-            .http
+            .http()
             .post("https://api.exa.ai/search")
             .header("x-api-key", api_key)
             .timeout(Duration::from_secs(15))
@@ -714,7 +753,7 @@ impl WebSearchEngine {
         limit: usize,
     ) -> Result<Vec<NormalizedSearchHit>, String> {
         let resp = self
-            .http
+            .http()
             .get("https://api.search.brave.com/res/v1/web/search")
             .header("X-Subscription-Token", api_key)
             .header("Accept", "application/json")
@@ -762,7 +801,7 @@ impl WebSearchEngine {
         limit: usize,
     ) -> Result<Vec<NormalizedSearchHit>, String> {
         let resp = self
-            .http
+            .http()
             .post("https://api.perplexity.ai/search")
             .bearer_auth(api_key)
             .timeout(Duration::from_secs(15))
@@ -806,7 +845,7 @@ impl WebSearchEngine {
     ) -> Result<Vec<NormalizedSearchHit>, String> {
         let url = format!("{}/search", base_url.trim_end_matches('/'));
         let resp = self
-            .http
+            .http()
             .get(&url)
             .header("User-Agent", SEARCH_USER_AGENT)
             .query(&[("q", query), ("format", "json")])
@@ -857,7 +896,7 @@ impl WebSearchEngine {
             ("http://127.0.0.1:11434/api/experimental/web_search", None)
         };
         let mut req = self
-            .http
+            .http()
             .post(url)
             .timeout(Duration::from_secs(15))
             .json(&json!({ "query": query, "max_results": limit }));
@@ -900,7 +939,7 @@ impl WebSearchEngine {
         args: Value,
     ) -> Result<String, String> {
         let resp = self
-            .http
+            .http()
             .post(mcp_url)
             .header("Content-Type", "application/json")
             .header("Accept", "application/json, text/event-stream")
@@ -1027,7 +1066,7 @@ impl WebSearchEngine {
         limit: usize,
     ) -> Result<Vec<NormalizedSearchHit>, String> {
         let resp = self
-            .http
+            .http()
             .get(&self.keyless_endpoints.bing_rss_url)
             .header("User-Agent", SEARCH_USER_AGENT)
             .query(&[("q", query), ("format", "rss")])
@@ -1048,7 +1087,7 @@ impl WebSearchEngine {
         limit: usize,
     ) -> Result<Vec<NormalizedSearchHit>, String> {
         let resp = self
-            .http
+            .http()
             .get(&self.keyless_endpoints.ddg_lite_url)
             .header("User-Agent", SEARCH_USER_AGENT)
             .query(&[("q", query)])
@@ -1069,7 +1108,7 @@ impl WebSearchEngine {
     ) -> Result<(String, String, String), String> {
         for _ in 0..=MAX_REDIRECT_HOPS {
             let resp = self
-                .no_redirect_http
+                .no_redirect_http()
                 .get(current.clone())
                 .header(
                     "Accept",

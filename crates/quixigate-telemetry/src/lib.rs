@@ -127,8 +127,8 @@ struct MetricsRegistry {
 
 #[derive(Clone)]
 pub struct TelemetryHub {
-    http: reqwest::Client,
-    http_grpc: reqwest::Client,
+    http: Arc<std::sync::OnceLock<reqwest::Client>>,
+    http_grpc: Arc<std::sync::OnceLock<reqwest::Client>>,
     trace_tx: broadcast::Sender<RequestLog>,
     metrics: Arc<MetricsRegistry>,
 }
@@ -136,21 +136,31 @@ pub struct TelemetryHub {
 impl TelemetryHub {
     pub fn new() -> Self {
         let (trace_tx, _) = broadcast::channel(512);
-        let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(10))
-            .build()
-            .unwrap_or_default();
-        let http_grpc = reqwest::Client::builder()
-            .http2_prior_knowledge()
-            .timeout(Duration::from_secs(10))
-            .build()
-            .unwrap_or_else(|_| http.clone());
         Self {
-            http,
-            http_grpc,
+            http: Arc::new(std::sync::OnceLock::new()),
+            http_grpc: Arc::new(std::sync::OnceLock::new()),
             trace_tx,
             metrics: Arc::new(MetricsRegistry::default()),
         }
+    }
+
+    fn http_client(&self) -> &reqwest::Client {
+        self.http.get_or_init(|| {
+            reqwest::Client::builder()
+                .timeout(Duration::from_secs(10))
+                .build()
+                .unwrap_or_default()
+        })
+    }
+
+    fn http_grpc_client(&self) -> &reqwest::Client {
+        self.http_grpc.get_or_init(|| {
+            reqwest::Client::builder()
+                .http2_prior_knowledge()
+                .timeout(Duration::from_secs(10))
+                .build()
+                .unwrap_or_else(|_| self.http_client().clone())
+        })
     }
 
     pub fn subscribe_traces(&self) -> broadcast::Receiver<RequestLog> {
@@ -274,8 +284,8 @@ impl TelemetryHub {
         if settings.otlp_enabled && !settings.otlp_endpoint.trim().is_empty() {
             let export_req =
                 build_openinference_export_request(log, settings, capture_payloads, oi.as_ref());
-            let client = self.http.clone();
-            let grpc_client = self.http_grpc.clone();
+            let client = self.http_client().clone();
+            let grpc_client = self.http_grpc_client().clone();
             let settings_cloned = settings.clone();
             tokio::spawn(async move {
                 if let Err(err) =
@@ -350,7 +360,13 @@ impl TelemetryHub {
 
         let export_req =
             build_openinference_export_request(&synthetic_log, settings, true, Some(&oi));
-        let status = send_otlp_request(&self.http, &self.http_grpc, settings, &export_req).await?;
+        let status = send_otlp_request(
+            self.http_client(),
+            self.http_grpc_client(),
+            settings,
+            &export_req,
+        )
+        .await?;
         let phoenix_base = settings.phoenix_ui_url.trim_end_matches('/');
         Ok(TestSpanResult {
             ok: (200..300).contains(&status),

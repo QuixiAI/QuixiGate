@@ -28,6 +28,43 @@ pub use google_code_assist::GoogleCodeAssistModel;
 pub use local_discovery::{LocalEndpointSpec, LocalRuntimeScanner, normalize_local_runtime_id};
 pub use sse::{FrameTooLarge, SseDecoder, SseFrame};
 
+/// Returns a process-wide shared `rustls::ClientConfig` (`Arc<RootCertStore>` + `ring` crypto +
+/// HTTP/2 & HTTP/1.1 ALPN) so all `reqwest::Client` instances across worker shards and background
+/// services share a single ~2.5 MiB TLS root store instead of duplicating it per client.
+pub fn shared_rustls_client_config() -> rustls::ClientConfig {
+    static TLS_CFG: std::sync::OnceLock<rustls::ClientConfig> = std::sync::OnceLock::new();
+    TLS_CFG
+        .get_or_init(|| {
+            let mut roots = rustls::RootCertStore::empty();
+            roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+            let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+            let mut cfg = rustls::ClientConfig::builder_with_provider(provider)
+                .with_safe_default_protocol_versions()
+                .expect("valid TLS protocol versions")
+                .with_root_certificates(roots)
+                .with_no_client_auth();
+            cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+            cfg
+        })
+        .clone()
+}
+
+/// Returns a `reqwest::ClientBuilder` preconfigured with the shared `rustls::ClientConfig`.
+#[inline]
+pub fn shared_tls_client_builder() -> reqwest::ClientBuilder {
+    reqwest::Client::builder().use_preconfigured_tls(shared_rustls_client_config())
+}
+
+thread_local! {
+    static WORKER_CORE_INDEX: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// Marks the calling OS thread (`quixigate-worker-{idx}`) with its deterministic core index so
+/// [`ShardedHttpPool::get`] binds a dedicated 1:1 lazy `reqwest::Client` to this worker's reactor.
+pub fn set_current_worker_core_index(idx: usize) {
+    WORKER_CORE_INDEX.with(|c| c.set(Some(idx)));
+}
+
 /// Builds a `reqwest::Client` tuned for ultra-low-latency streaming (`TCP_NODELAY`, high idle pool
 /// capacity, HTTP/2 adaptive window) as well as long-running local (`ollama`, `llama.cpp`, `lmstudio`,
 /// `vllm`) and cloud reasoning inference:
@@ -42,7 +79,7 @@ pub fn build_inference_http_client() -> reqwest::Client {
         .and_then(|v| v.parse::<u64>().ok())
         .filter(|&s| s > 0)
         .unwrap_or(1_800);
-    reqwest::Client::builder()
+    shared_tls_client_builder()
         .tcp_nodelay(true)
         .pool_max_idle_per_host(2_048)
         .http2_adaptive_window(true)
@@ -64,44 +101,51 @@ pub fn shared_inference_http_client() -> reqwest::Client {
         .clone()
 }
 
-/// Sharded pool of `reqwest::Client` instances indexed by caller thread, eliminating cross-core
-/// Hyper `PoolInner` mutex contention under high multi-threaded concurrency while also supporting
-/// dedicated pinned 1-client-per-core workers.
+/// Lazy sharded pool of `reqwest::Client` instances indexed by worker core (or caller `ThreadId`),
+/// eliminating cross-core Hyper `PoolInner` mutex contention under multi-threaded concurrency while
+/// allocating zero HTTP pools or TLS state at startup until traffic actually arrives on a shard.
 #[derive(Clone)]
 pub struct ShardedHttpPool {
-    shards: std::sync::Arc<Vec<reqwest::Client>>,
+    shards: std::sync::Arc<Vec<std::sync::OnceLock<reqwest::Client>>>,
 }
 
 impl ShardedHttpPool {
     pub fn new(shard_count: usize) -> Self {
         let count = shard_count.clamp(1, 128);
-        let shards = (0..count).map(|_| build_inference_http_client()).collect();
+        let shards = (0..count).map(|_| std::sync::OnceLock::new()).collect();
         Self {
             shards: std::sync::Arc::new(shards),
         }
     }
 
     pub fn from_single(client: reqwest::Client) -> Self {
+        let cell = std::sync::OnceLock::new();
+        let _ = cell.set(client);
         Self {
-            shards: std::sync::Arc::new(vec![client]),
+            shards: std::sync::Arc::new(vec![cell]),
         }
     }
 
     #[inline]
     pub fn get(&self) -> &reqwest::Client {
         if self.shards.len() == 1 {
-            return &self.shards[0];
+            return self.shards[0].get_or_init(build_inference_http_client);
         }
-        thread_local! {
-            static THREAD_SHARD_HASH: usize = {
-                use std::hash::{Hash, Hasher};
-                let mut h = std::collections::hash_map::DefaultHasher::new();
-                std::thread::current().id().hash(&mut h);
-                h.finish() as usize
-            };
-        }
-        let idx = THREAD_SHARD_HASH.with(|&h| h % self.shards.len());
-        &self.shards[idx]
+        let idx = match WORKER_CORE_INDEX.with(|c| c.get()) {
+            Some(worker_idx) => worker_idx % self.shards.len(),
+            None => {
+                thread_local! {
+                    static THREAD_SHARD_HASH: usize = {
+                        use std::hash::{Hash, Hasher};
+                        let mut h = std::collections::hash_map::DefaultHasher::new();
+                        std::thread::current().id().hash(&mut h);
+                        h.finish() as usize
+                    };
+                }
+                THREAD_SHARD_HASH.with(|&h| h % self.shards.len())
+            }
+        };
+        self.shards[idx].get_or_init(build_inference_http_client)
     }
 }
 

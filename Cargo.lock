@@ -1959,7 +1959,7 @@ dependencies = [
 
 [[package]]
 name = "quixigate"
-version = "0.1.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -1994,7 +1994,7 @@ dependencies = [
 
 [[package]]
 name = "quixigate-auth"
-version = "0.1.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -2021,7 +2021,7 @@ dependencies = [
 
 [[package]]
 name = "quixigate-core"
-version = "0.1.0"
+version = "0.2.1"
 dependencies = [
  "chrono",
  "serde",
@@ -2032,7 +2032,7 @@ dependencies = [
 
 [[package]]
 name = "quixigate-db"
-version = "0.1.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -2060,7 +2060,7 @@ dependencies = [
 
 [[package]]
 name = "quixigate-providers"
-version = "0.1.0"
+version = "0.2.1"
 dependencies = [
  "aisdk",
  "async-trait",
@@ -2074,6 +2074,7 @@ dependencies = [
  "parking_lot",
  "quixigate-core",
  "reqwest",
+ "rustls",
  "schemars",
  "serde",
  "serde_json",
@@ -2081,11 +2082,12 @@ dependencies = [
  "tracing",
  "url",
  "uuid",
+ "webpki-roots 1.0.12",
 ]
 
 [[package]]
 name = "quixigate-proxy"
-version = "0.1.0"
+version = "0.2.1"
 dependencies = [
  "aisdk",
  "anyhow",
@@ -2137,7 +2139,7 @@ dependencies = [
 
 [[package]]
 name = "quixigate-router"
-version = "0.1.0"
+version = "0.2.1"
 dependencies = [
  "aisdk",
  "anyhow",
@@ -2171,7 +2173,7 @@ dependencies = [
 
 [[package]]
 name = "quixigate-telemetry"
-version = "0.1.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -2192,7 +2194,7 @@ dependencies = [
 
 [[package]]
 name = "quixigate-vault"
-version = "0.1.0"
+version = "0.2.1"
 dependencies = [
  "aes-gcm",
  "base64 0.22.1",

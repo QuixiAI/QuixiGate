@@ -643,6 +643,7 @@ pub async fn peer_trust_middleware(
 fn payload_too_large_response(max_mb: usize) -> Response {
     (
         StatusCode::PAYLOAD_TOO_LARGE,
+        [(header::CONNECTION, "close")],
         Json(json!({
             "type": "error",
             "error": {

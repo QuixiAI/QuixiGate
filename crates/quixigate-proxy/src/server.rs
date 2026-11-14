@@ -117,12 +117,12 @@ fn spawn_hyper_connection(
 }
 
 async fn run_worker_event_loop(
+    worker_idx: usize,
     ingress: WorkerIngress,
-    worker_state: AppState,
+    app: PeerTrustService<axum::Router>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> std::io::Result<()> {
-    let core_state = worker_state.fork_for_worker_core();
-    let app = build_worker_service(core_state);
+    quixigate_providers::set_current_worker_core_index(worker_idx);
     let conn_builder = build_tuned_conn_builder();
     let in_flight = Arc::new(AtomicUsize::new(0));
     let drained_notify = Arc::new(Notify::new());
@@ -234,6 +234,7 @@ where
     let local_addr = listener.local_addr()?;
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let shared_app = build_worker_service(state);
     let mut handles = Vec::with_capacity(workers);
 
     // On Linux, probe whether `listener` was bound with `SO_REUSEPORT` so each worker core can own
@@ -266,7 +267,7 @@ where
         all_listeners.append(&mut extras);
 
         for (idx, std_l) in all_listeners.into_iter().enumerate() {
-            let worker_state = state.clone();
+            let worker_app = shared_app.clone();
             let s_rx = shutdown_rx.clone();
             let handle = std::thread::Builder::new()
                 .name(format!("quixigate-worker-{idx}"))
@@ -275,8 +276,9 @@ where
                         .enable_all()
                         .build()?;
                     rt.block_on(run_worker_event_loop(
+                        idx,
                         WorkerIngress::ReusePort(std_l),
-                        worker_state,
+                        worker_app,
                         s_rx,
                     ))
                 })?;
@@ -293,7 +295,7 @@ where
         let (tx, rx) = mpsc::unbounded_channel::<(std::net::TcpStream, SocketAddr)>();
         worker_txs.push(tx);
 
-        let worker_state = state.clone();
+        let worker_app = shared_app.clone();
         let s_rx = shutdown_rx.clone();
 
         let handle = std::thread::Builder::new()
@@ -303,8 +305,9 @@ where
                     .enable_all()
                     .build()?;
                 rt.block_on(run_worker_event_loop(
+                    idx,
                     WorkerIngress::Channel(rx),
-                    worker_state,
+                    worker_app,
                     s_rx,
                 ))
             })?;

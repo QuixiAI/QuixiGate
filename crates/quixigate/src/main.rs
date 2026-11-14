@@ -367,7 +367,7 @@ fn assemble_gateway_state(
         .with_quota_endpoints(quota_endpoints)
 }
 
-#[tokio::main]
+#[tokio::main(worker_threads = 2)]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -622,10 +622,6 @@ async fn cmd_serve(
     .with_master_key(&master_key)
     .with_ui_override(ui_override);
 
-    if db.get_settings()?.local_discovery_enabled {
-        state.router.local_scanner().scan_all().await;
-    }
-
     // If OpenRouter is connected, hydrate live `/models` pricing & `@preset/*` presets on boot.
     if db
         .list_credentials()
@@ -641,10 +637,20 @@ async fn cmd_serve(
         });
     }
 
-    // Periodic local runtime discovery (every 30s).
+    // Initial + periodic local runtime discovery (runs asynchronously after listener bind so
+    // `/health/liveness` responds immediately without waiting on local port probes).
     {
         let bg_state = state.clone();
         tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            if bg_state
+                .db
+                .get_settings()
+                .map(|s| s.local_discovery_enabled)
+                .unwrap_or(true)
+            {
+                bg_state.router.local_scanner().scan_all().await;
+            }
             let mut ticker = tokio::time::interval(Duration::from_secs(30));
             ticker.tick().await;
             loop {
