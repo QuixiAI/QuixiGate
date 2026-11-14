@@ -181,14 +181,22 @@ fn skip_json_value(bytes: &[u8], start_idx: usize) -> Option<usize> {
         b'{' | b'[' => {
             let mut depth = 1usize;
             let mut pos = i + 1;
+            let mut next_qb: Option<usize> = None;
             while pos < bytes.len() {
-                let rest = &bytes[pos..];
-                let off = memchr::memchr3(b'"', b'{', b'}', rest)
-                    .into_iter()
-                    .chain(memchr::memchr2(b'[', b']', rest))
-                    .min();
-                let min_off = off?;
-                let idx = pos + min_off;
+                let qb = match next_qb {
+                    Some(q) if q >= pos => q,
+                    _ => {
+                        let q = memchr::memchr3(b'"', b'{', b'}', &bytes[pos..])
+                            .map_or(bytes.len(), |off| pos + off);
+                        next_qb = Some(q);
+                        q
+                    }
+                };
+                let idx = match memchr::memchr2(b'[', b']', &bytes[pos..qb]) {
+                    Some(off) => pos + off,
+                    None if qb < bytes.len() => qb,
+                    None => return None,
+                };
                 match bytes[idx] {
                     b'"' => {
                         let (close, _) = skip_json_string(bytes, idx)?;
@@ -2537,5 +2545,88 @@ data: {"type":"message_stop"}
         assert_eq!(au.input_tokens, 26);
         assert_eq!(au.cached_input_tokens, 7);
         assert_eq!(au.output_tokens, 300);
+    }
+
+    #[test]
+    fn skip_json_value_remains_linear_on_large_bracket_sparse_and_brace_sparse_arrays() {
+        // 1. Bracket-sparse payload: thousands of message objects inside `messages: [...]`
+        //    with no nested `[` or `]` until the closing bracket of `messages`.
+        //    Previously `memchr2(b'[', b']', rest)` scanned to the end of `messages` on every
+        //    quote and brace (~64s in debug / ~1.2s in release at 16k turns).
+        let mut chat = String::with_capacity(16_000 * 96 + 128);
+        chat.push_str(r#"{"messages":["#);
+        for idx in 0..16_000usize {
+            if idx > 0 {
+                chat.push(',');
+            }
+            chat.push_str(
+                r#"{"role":"user","content":"turn payload without square brackets inside message body"}"#,
+            );
+        }
+        chat.push_str(r#"],"model":"gpt-4o","stream":true}"#);
+        let chat_bytes = Bytes::from(chat.into_bytes());
+
+        let t0 = Instant::now();
+        let out_chat =
+            splice_openai_chat_request(&chat_bytes, "gpt-4o", "openai/gpt-4o", true, false, false)
+                .unwrap();
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(2),
+            "expected linear scan (<2s even in debug), took {:?}",
+            t0.elapsed()
+        );
+        assert!(out_chat.ends_with(br#""stream_options":{"include_usage":true}}"#));
+
+        // 2. Brace-sparse payload: thousands of nested numeric sub-arrays `[[1,2],[3,4],...]`
+        //    with no quotes or braces until the trailing `"model"` field.
+        let mut matrix = String::with_capacity(16_000 * 8 + 64);
+        matrix.push_str(r#"{"embedding_matrix":["#);
+        for idx in 0..16_000usize {
+            if idx > 0 {
+                matrix.push(',');
+            }
+            matrix.push_str("[1,2]");
+        }
+        matrix.push_str(r#"],"model":"gpt-4o","messages":[]}"#);
+        let matrix_bytes = Bytes::from(matrix.into_bytes());
+
+        let t1 = Instant::now();
+        let out_matrix = splice_openai_chat_request(
+            &matrix_bytes,
+            "gpt-4o",
+            "openai/gpt-4o",
+            true,
+            false,
+            false,
+        )
+        .unwrap();
+        assert!(
+            t1.elapsed() < std::time::Duration::from_secs(2),
+            "expected linear scan on brace-sparse array, took {:?}",
+            t1.elapsed()
+        );
+        let parsed_matrix: serde_json::Value = serde_json::from_slice(&out_matrix).unwrap();
+        assert_eq!(parsed_matrix["model"], "openai/gpt-4o");
+        assert_eq!(parsed_matrix["stream_options"]["include_usage"], true);
+
+        // 3. Strings containing brackets/braces/escapes and unclosed structures.
+        let nested_tricky = Bytes::from_static(
+            br#"{"messages":[{"role":"user","content":"[1, 2, {\"k\": \"]\"}]"}],"model":"m1"}"#,
+        );
+        let out_tricky =
+            splice_openai_chat_request(&nested_tricky, "m1", "m2", false, false, false).unwrap();
+        let parsed_tricky: serde_json::Value = serde_json::from_slice(&out_tricky).unwrap();
+        assert_eq!(parsed_tricky["model"], "m2");
+        assert!(
+            splice_openai_chat_request(
+                &Bytes::from_static(br#"{"messages":[1, 2, 3"#),
+                "m1",
+                "m2",
+                false,
+                false,
+                false
+            )
+            .is_none()
+        );
     }
 }
