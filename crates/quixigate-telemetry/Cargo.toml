@@ -9,7 +9,6 @@ description = "OpenInference / OpenTelemetry OTLP exporter and live SSE trace ri
 
 [dependencies]
 quixigate-core.workspace = true
-anyhow.workspace = true
 dashmap.workspace = true
 fastrand.workspace = true
 hex.workspace = true
@@ -21,7 +20,6 @@ serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
-uuid.workspace = true
 
 [dev-dependencies]
 axum.workspace = true

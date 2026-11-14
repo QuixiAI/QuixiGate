@@ -1211,8 +1211,8 @@ fn print_summary_table(title: &str, reports: &[TargetReport]) {
         "========================================================================================================================"
     );
     println!(
-        "{:<42} | {:>11} | {:>13} | {:>6} | {}",
-        "Gateway Configuration", "Cold Start", "Idle RSS", "Procs", "Infrastructure"
+        "{:<42} | {:>11} | {:>13} | {:>6} | Infrastructure",
+        "Gateway Configuration", "Cold Start", "Idle RSS", "Procs"
     );
     println!(
         "------------------------------------------------------------------------------------------------------------------------"

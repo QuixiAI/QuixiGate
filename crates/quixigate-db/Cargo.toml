@@ -10,7 +10,6 @@ description = "Embedded SQLite (WAL) state store, NanoUsd budget ledger, and aud
 [dependencies]
 quixigate-core.workspace = true
 quixigate-vault.workspace = true
-anyhow.workspace = true
 arc-swap.workspace = true
 argon2.workspace = true
 base64.workspace = true
